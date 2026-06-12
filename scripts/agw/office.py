@@ -69,28 +69,35 @@ def _snapshot(path: str, op: str) -> dict:
                               reason=f"pre-image before agw office {op}")
 
 
-def _iter_pptx_text_frames(prs):
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                yield slide, shape.text_frame
+def _collect_paragraphs(path: str):
+    """Return (document_object, [(location_label, paragraph), ...]) in
+    document order. Paragraph text is run-joined, so matches that span runs
+    are visible (Office splits runs at arbitrary points: formatting,
+    spellcheck history)."""
+    ext = _ext(path)
+    if ext == ".docx":
+        doc = _docx().Document(path)
+        items = [(f"paragraph {i}", p) for i, p in enumerate(doc.paragraphs, 1)]
+        for t, table in enumerate(doc.tables, 1):
+            for row in table.rows:
+                for cell in row.cells:
+                    items.extend((f"table {t}", p) for p in cell.paragraphs)
+        return doc, items
+    if ext == ".pptx":
+        prs = _pptx().Presentation(path)
+        items = []
+        for s, slide in enumerate(prs.slides, 1):
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    items.extend((f"slide {s}", p)
+                                 for p in shape.text_frame.paragraphs)
+        return prs, items
+    raise OfficeError(f"replace-text supports .docx and .pptx, not {ext or 'this file'}")
 
 
-def _replace_in_paragraph(paragraph, find: str, replace: str) -> int:
-    """Replace within one paragraph, surviving matches that span runs.
-
-    Office splits text into runs at arbitrary points (formatting, spellcheck
-    history), so naive per-run replace misses matches. When a match spans
-    runs we rewrite the affected runs' text; the first run's formatting wins
-    for the replacement text — acceptable for v1, and the pre-image snapshot
-    covers regressions.
-    """
-    full = "".join(run.text for run in paragraph.runs)
-    if find not in full:
-        return 0
-    count = full.count(find)
-    new_full = full.replace(find, replace)
-    # Re-pack the new text into the existing runs, left to right.
+def _repack_runs(paragraph, new_full: str):
+    """Distribute new paragraph text into the existing runs, left to right.
+    The first affected run's formatting wins for replacement text."""
     remaining = new_full
     runs = list(paragraph.runs)
     for i, run in enumerate(runs):
@@ -100,7 +107,27 @@ def _replace_in_paragraph(paragraph, find: str, replace: str) -> int:
         else:
             keep = len(run.text)
             run.text, remaining = remaining[:keep], remaining[keep:]
-    return count
+
+
+def find_matches(path: str, find: str) -> list:
+    """List every occurrence with a 1-based index, location, and context —
+    what an agent uses to choose --nth or confirm --all."""
+    if not find:
+        raise OfficeError("--find must not be empty")
+    _, items = _collect_paragraphs(path)
+    matches = []
+    for loc, p in items:
+        full = "".join(run.text for run in p.runs)
+        start = 0
+        while True:
+            idx = full.find(find, start)
+            if idx < 0:
+                break
+            ctx = full[max(0, idx - 40): idx + len(find) + 40]
+            matches.append({"n": len(matches) + 1, "where": loc,
+                            "context": ctx})
+            start = idx + len(find)
+    return matches
 
 
 # --- read operations (no snapshot needed) -------------------------------------
@@ -153,37 +180,60 @@ def info(path: str) -> dict:
 
 # --- write operations (snapshot first, always) ---------------------------------
 
-def replace_text(path: str, find: str, replace: str) -> dict:
+def replace_text(path: str, find: str, replace: str,
+                 all_matches: bool = False, nth: int = 0) -> dict:
+    """Replace occurrences of `find`. Same contract as a code editor's
+    find/replace tool: a non-unique match without explicit targeting is an
+    error, not a mass edit.
+
+    - unique match           -> replaced
+    - multiple matches       -> OfficeError unless all_matches or nth is given
+    - nth=N (1-based, doc order) -> replace only that occurrence
+    """
     if not find:
         raise OfficeError("--find must not be empty")
-    ext = _ext(path)
-    if ext == ".docx":
-        docx = _docx()
-        doc = docx.Document(path)
-        snap = _snapshot(path, "replace-text")
-        n = 0
-        paragraphs = list(doc.paragraphs)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    paragraphs.extend(cell.paragraphs)
-        for p in paragraphs:
-            n += _replace_in_paragraph(p, find, replace)
-        if n:
-            doc.save(path)
-        return {"replacements": n, "snapshot_version": snap.get("version")}
-    if ext == ".pptx":
-        pptx = _pptx()
-        prs = pptx.Presentation(path)
-        snap = _snapshot(path, "replace-text")
-        n = 0
-        for _, tf in _iter_pptx_text_frames(prs):
-            for p in tf.paragraphs:
-                n += _replace_in_paragraph(p, find, replace)
-        if n:
-            prs.save(path)
-        return {"replacements": n, "snapshot_version": snap.get("version")}
-    raise OfficeError(f"replace-text supports .docx and .pptx, not {ext or 'this file'}")
+    if all_matches and nth:
+        raise OfficeError("--all and --nth are mutually exclusive")
+    doc, items = _collect_paragraphs(path)
+    total = sum("".join(r.text for r in p.runs).count(find) for _, p in items)
+    if total == 0:
+        return {"replacements": 0, "matches": 0}
+    if nth:
+        if not 1 <= nth <= total:
+            raise OfficeError(f"--nth {nth} out of range: {total} match(es)")
+        targets = {nth}
+    elif total > 1 and not all_matches:
+        preview = "; ".join(f"#{m['n']} ({m['where']}) ...{m['context']}..."
+                            for m in find_matches(path, find)[:5])
+        raise OfficeError(
+            f"{total} matches for {find!r} — refusing an ambiguous replace. "
+            f"Use --all for every occurrence, --nth N for one, or a longer "
+            f"--find that is unique. First matches: {preview}")
+    else:
+        targets = None  # all
+    snap = _snapshot(path, "replace-text")
+    occurrence, replaced = 0, 0
+    for _, p in items:
+        full = "".join(run.text for run in p.runs)
+        if find not in full:
+            continue
+        parts = full.split(find)
+        out, hit = parts[0], 0
+        for part in parts[1:]:
+            occurrence += 1
+            if targets is None or occurrence in targets:
+                out += replace
+                hit += 1
+            else:
+                out += find
+            out += part
+        if hit:
+            _repack_runs(p, out)
+            replaced += hit
+    if replaced:
+        doc.save(path)
+    return {"replacements": replaced, "matches": total,
+            "snapshot_version": snap.get("version")}
 
 
 def _coerce(value: str, force_text: bool):

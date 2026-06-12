@@ -302,9 +302,22 @@ def cmd_office(args):
             text = office.get_text(path)
             data, human = {"path": path, "text": text}, text
         elif args.op == "replace-text":
-            data = office.replace_text(path, args.find, args.replace)
-            human = (f"replaced {data['replacements']} occurrence(s) in {path} "
-                     f"(pre-image archived as v{data['snapshot_version']})")
+            if args.dry_run:
+                matches = office.find_matches(path, args.find)
+                data = {"matches": matches, "count": len(matches)}
+                human = "\n".join(
+                    [f"{len(matches)} match(es) for {args.find!r}:"] +
+                    [f"  #{m['n']} ({m['where']}) ...{m['context']}..."
+                     for m in matches]) if matches else f"no matches for {args.find!r}"
+            else:
+                data = office.replace_text(path, args.find, args.replace,
+                                           all_matches=args.all, nth=args.nth)
+                if data["replacements"]:
+                    human = (f"replaced {data['replacements']} of {data['matches']} "
+                             f"occurrence(s) in {path} (pre-image archived as "
+                             f"v{data['snapshot_version']})")
+                else:
+                    human = f"no matches for {args.find!r}; file untouched"
         elif args.op == "set-cell":
             if not (args.sheet and args.cell):
                 _err("set-cell needs --sheet and --cell")
@@ -389,6 +402,12 @@ def main(argv=None):
                               "set-cell", "append-rows"]}),
         (["path"], {}),
         (["--find"], {"default": ""}), (["--replace"], {"default": ""}),
+        (["--all"], {"action": "store_true",
+                     "help": "replace every occurrence (default refuses if not unique)"}),
+        (["--nth"], {"type": int, "default": 0,
+                     "help": "replace only the Nth occurrence (1-based, document order)"}),
+        (["--dry-run"], {"action": "store_true",
+                         "help": "list matches with location/context; change nothing"}),
         (["--sheet"], {"default": ""}), (["--cell"], {"default": ""}),
         (["--value"], {"default": ""}),
         (["--rows"], {"default": ""}), (["--from-csv"], {"default": ""}),

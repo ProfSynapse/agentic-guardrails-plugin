@@ -130,11 +130,49 @@ def test_replace_text_spanning_runs(document):
 
 
 def test_replace_text_in_tables_and_snapshot(document):
-    result = office.replace_text(document, "ACME Corp", "Initech")
+    result = office.replace_text(document, "ACME Corp", "Initech", all_matches=True)
     assert result["replacements"] == 2  # paragraph + table cell
     versions = store.list_versions(document)
     assert len(versions) == 1
     assert "ACME Corp" in office.get_text(versions[0]["dest"])  # pre-image intact
+
+
+def test_replace_ambiguous_refuses_without_all(document):
+    with pytest.raises(office.OfficeError, match="2 matches.*ambiguous"):
+        office.replace_text(document, "ACME Corp", "Initech")
+    assert store.list_versions(document) == []  # refused before snapshotting
+    assert office.get_text(document).count("ACME Corp") == 2  # untouched
+
+
+def test_replace_nth_targets_one_occurrence(document):
+    result = office.replace_text(document, "ACME Corp", "Initech", nth=2)
+    assert result["replacements"] == 1 and result["matches"] == 2
+    text = office.get_text(document)
+    # document order: #1 is the body paragraph (kept), #2 the table cell (replaced)
+    assert "for ACME Corp." in text
+    assert "Initech budget" in text
+
+
+def test_replace_nth_out_of_range(document):
+    with pytest.raises(office.OfficeError, match="out of range"):
+        office.replace_text(document, "ACME Corp", "x", nth=3)
+
+
+def test_find_matches_lists_locations(document):
+    matches = office.find_matches(document, "ACME Corp")
+    assert [m["n"] for m in matches] == [1, 2]
+    assert matches[0]["where"].startswith("paragraph")
+    assert matches[1]["where"].startswith("table")
+    assert "ACME Corp" in matches[0]["context"]
+
+
+def test_cli_dry_run_changes_nothing(document, agw_home):
+    result = run_agw("office", "replace-text", document,
+                     "--find", "ACME Corp", "--dry-run", "--json")
+    data = json.loads(result.stdout)
+    assert data["count"] == 2
+    assert office.get_text(document).count("ACME Corp") == 2
+    assert store.list_versions(document) == []
 
 
 def test_replace_text_no_match_no_resave(document):

@@ -61,9 +61,17 @@ reversible as everything else:
 agw office info <file>                       # structure: sheets, headings, slides
 agw office get-text <file>                   # plain-text extract (docx/pptx)
 agw office replace-text <file> --find "Old Name" --replace "New Name"
+agw office replace-text <file> --find "Q3" --dry-run    # list matches first
+agw office replace-text <file> --find "Q3" --replace "Q4" --all     # every one
+agw office replace-text <file> --find "Q3" --replace "Q4" --nth 2   # just one
 agw office set-cell <file.xlsx> --sheet Q3 --cell B2 --value 55
 agw office append-rows <file.xlsx> --sheet Q3 --from-csv new-rows.csv
 ```
+
+`replace-text` works like the Edit tool: if `--find` matches more than once
+it refuses rather than mass-editing. Either make `--find` longer and unique,
+or run `--dry-run` to see every match (numbered, with location and context)
+and then target with `--nth N` or replace everywhere with `--all`.
 
 Values auto-coerce to numbers/booleans/formulas (`=SUM(...)`); add `--text`
 to keep them as literal text. Use `agw office` for point edits; use
