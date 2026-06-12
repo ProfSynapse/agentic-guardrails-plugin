@@ -36,7 +36,7 @@ are checked out in plain-copy mode. Fleet rollout: see
 | `hooks/` | PreToolUse/PostToolUse/SessionStart wiring, the enforcement surface (works in Claude Code and Cowork) |
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, audit log with secret redaction |
-| `scripts/agw/` + `bin/agw` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor` |
+| `scripts/agw/` + `bin/agw` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/` | Teach the agent the workflows: agent-workspace, synced-folders, gdocs-bridge, restore |
 | `commands/` | `/agw-status`, `/agw-publish`, `/agw-restore`, `/guardrails-report` |
@@ -51,6 +51,7 @@ so the agent self-corrects instead of fighting the rails:
 |---|---|
 | `rm file` | `agw archive file` (reversible) |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
+| `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | `mv` (untracked) | `agw move` (logged, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 

@@ -65,6 +65,9 @@ the hook answers "ask" on any internal error, never silent-allow).
 - Python 3.9+ on PATH as `python3` (no third-party packages required;
   PyYAML and pandoc/openpyxl are used when present and improve conversion
   fidelity — install them for the full docx/xlsx checkout experience).
+- For the `agw office` in-place editing verbs, install the libraries for the
+  formats your users touch: `openpyxl` (xlsx), `python-docx` (docx),
+  `python-pptx` (pptx). `agw doctor` reports which are available.
 - `bin/agw` on PATH is convenient but optional; the hook teaches the agent the
   full path via session context regardless.
 

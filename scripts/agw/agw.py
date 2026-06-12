@@ -4,7 +4,7 @@ destructive primitives. Every verb is reversible by construction, dual-output
 (human line + JSON via --json), and self-logging.
 
 Verbs: init scan checkout convert diff publish archive move rename snapshot
-       restore undo status log doctor prune
+       restore undo status log doctor prune office
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(_HERE))  # scripts/ → core importable
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 import converters                           # noqa: E402
+import office                               # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
 
@@ -281,6 +282,7 @@ def cmd_doctor(args):
         "agw_home": home, "agw_home_writable": writable,
         "python": sys.version.split()[0], "cwd_profile": profile.name,
         **{f"converter_{k}": v for k, v in caps.items()},
+        **{f"office_{k}": v for k, v in office.capabilities().items()},
     }
     lines = [f"{'OK ' if v not in (False, None) else 'MISSING '} {k}: {v}"
              for k, v in checks.items()]
@@ -288,6 +290,52 @@ def cmd_doctor(args):
         lines.append("note: pandoc not found — Office checkouts degrade to copy-only "
                      "(archive safety unaffected). Install: https://pandoc.org")
     _out(args, "\n".join(lines), checks)
+
+
+def cmd_office(args):
+    path = _resolve(args.path)
+    try:
+        if args.op == "info":
+            data = office.info(path)
+            human = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        elif args.op == "get-text":
+            text = office.get_text(path)
+            data, human = {"path": path, "text": text}, text
+        elif args.op == "replace-text":
+            data = office.replace_text(path, args.find, args.replace)
+            human = (f"replaced {data['replacements']} occurrence(s) in {path} "
+                     f"(pre-image archived as v{data['snapshot_version']})")
+        elif args.op == "set-cell":
+            if not (args.sheet and args.cell):
+                _err("set-cell needs --sheet and --cell")
+            data = office.set_cell(path, args.sheet, args.cell, args.value,
+                                   force_text=args.text)
+            human = (f"{args.sheet}!{args.cell}: {data['old']!r} -> {data['new']!r} "
+                     f"(pre-image archived as v{data['snapshot_version']})")
+        elif args.op == "append-rows":
+            if not args.sheet:
+                _err("append-rows needs --sheet")
+            if args.from_csv:
+                import csv
+                with open(_resolve(args.from_csv), newline="", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+            else:
+                rows = json.loads(args.rows or "[]")
+                if not (isinstance(rows, list) and
+                        all(isinstance(r, list) for r in rows)):
+                    _err("--rows must be a JSON array of arrays")
+            if not rows:
+                _err("no rows given: use --from-csv FILE or --rows '[[...],...]'")
+            data = office.append_rows(path, args.sheet, rows, force_text=args.text)
+            human = (f"appended {data['appended']} row(s) to {args.sheet} in {path} "
+                     f"(pre-image archived as v{data['snapshot_version']})")
+        else:  # pragma: no cover — argparse restricts choices
+            _err(f"unknown office op: {args.op}")
+    except office.MissingLibrary as exc:
+        _err(str(exc), code=2)
+    except office.OfficeError as exc:
+        _err(str(exc))
+    _out(args, human, data)
 
 
 def cmd_prune(args):
@@ -336,6 +384,17 @@ def main(argv=None):
     add("status", cmd_status)
     add("log", cmd_log, (["-n"], {"type": int, "default": 20}))
     add("doctor", cmd_doctor)
+    add("office", cmd_office,
+        (["op"], {"choices": ["info", "get-text", "replace-text",
+                              "set-cell", "append-rows"]}),
+        (["path"], {}),
+        (["--find"], {"default": ""}), (["--replace"], {"default": ""}),
+        (["--sheet"], {"default": ""}), (["--cell"], {"default": ""}),
+        (["--value"], {"default": ""}),
+        (["--rows"], {"default": ""}), (["--from-csv"], {"default": ""}),
+        (["--text"], {"action": "store_true",
+                      "help": "store values as text, no number/formula coercion"}),
+        help="controlled in-place edits to docx/xlsx/pptx (pre-image archived first)")
     add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}))
 
     args = parser.parse_args(argv)

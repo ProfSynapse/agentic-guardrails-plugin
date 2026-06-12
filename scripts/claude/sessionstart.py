@@ -15,6 +15,10 @@ CONTEXT = """agentic-guardrails is active in this session. File-safety rules:
 - To modify Office/proprietary documents, use the CRUA flow: `agw checkout <file>` \
 (creates an editable markdown/csv working copy in _workspace/), edit the working \
 copy, then `agw publish <file>` (archives the old version and replaces the original).
+- For small targeted Office edits, skip the round-trip: `agw office set-cell`, \
+`agw office replace-text`, `agw office append-rows`, `agw office info/get-text` \
+(each archives a pre-image first). Do not edit Office files via python/node \
+one-liners.
 - Cloud-synced folders (OneDrive/SharePoint/Google Drive/Dropbox): run `agw scan \
 <folder>` before bulk work; never edit cloud-only placeholder files or .gdoc stubs.
 - `agw status` shows open checkouts; `agw doctor` checks the environment.

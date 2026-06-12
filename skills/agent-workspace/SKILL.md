@@ -47,8 +47,30 @@ never delete, never overwrite without a recoverable prior version.
 | `agw snapshot <folder>` | Whole-folder backup before bulk work |
 | `agw log [path]` | Show the operation log |
 | `agw doctor` | Environment self-check (converters, store writability) |
+| `agw office <op> <file>` | Targeted in-place Office edits (see below) |
 
 All verbs accept `--json` for machine-readable output.
+
+## Small Office edits: `agw office`
+
+For a targeted change to a docx/xlsx/pptx file, skip the checkout round-trip —
+these edit in place and archive a pre-image snapshot first, so they are as
+reversible as everything else:
+
+```
+agw office info <file>                       # structure: sheets, headings, slides
+agw office get-text <file>                   # plain-text extract (docx/pptx)
+agw office replace-text <file> --find "Old Name" --replace "New Name"
+agw office set-cell <file.xlsx> --sheet Q3 --cell B2 --value 55
+agw office append-rows <file.xlsx> --sheet Q3 --from-csv new-rows.csv
+```
+
+Values auto-coerce to numbers/booleans/formulas (`=SUM(...)`); add `--text`
+to keep them as literal text. Use `agw office` for point edits; use
+checkout/publish when restructuring a document or doing heavy rewriting.
+Never edit Office files with ad-hoc interpreter one-liners (python -c with
+openpyxl etc.) — those bypass the snapshot contract and will be blocked
+or escalated.
 
 ## Rules
 
