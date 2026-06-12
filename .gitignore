@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# local agw store should never be committed (tests use AGW_HOME=tmp anyway)
+.agw/
+
+# editor/OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

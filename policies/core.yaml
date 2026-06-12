@@ -1,0 +1,47 @@
+# Core command policy. Note: the non-negotiable accident guards (rm, sudo,
+# git --force, placeholder/stub protection, etc.) are BUILT INTO the engine
+# and survive even if this file is deleted or corrupted. This pack adds
+# pattern rules on top and is the template for company customization.
+#
+# Actions: deny | ask | allow.  deny > ask > allow when rules overlap.
+# Quote any pattern containing '#' or ': '.
+
+commands:
+  - pattern: "terraform destroy*"
+    action: deny
+    reason: "Infrastructure destruction is not permitted from agent sessions."
+  - pattern: "kubectl delete*"
+    action: ask
+    reason: "Deleting Kubernetes resources — verify the target and namespace."
+  - pattern: "aws s3 rb*"
+    action: deny
+    reason: "Bucket removal is not permitted from agent sessions."
+  - pattern: "aws * delete*"
+    action: ask
+    reason: "AWS deletion operation — verify the target."
+  - pattern: "docker system prune*"
+    action: ask
+    reason: "Prune removes all unused containers/images/volumes."
+  - pattern: "docker volume rm*"
+    action: ask
+    reason: "Removing volumes destroys their data."
+  - pattern: "npm publish*"
+    action: ask
+    reason: "Publishing to a registry is outward-facing."
+  - pattern: "pip install*"
+    action: ask
+    reason: "Installing packages changes the environment."
+  - pattern: "npm install -g*"
+    action: ask
+    reason: "Global installs change the machine."
+
+mcp_tools:
+  - matcher: "mcp__*__delete_*"
+    action: deny
+    reason: "Connector deletes are blocked (CRUA: archive instead)."
+  - matcher: "mcp__*__trash_*"
+    action: deny
+    reason: "Connector trash operations are blocked (CRUA: archive instead)."
+
+settings:
+  archive_max_warn_gb: 20

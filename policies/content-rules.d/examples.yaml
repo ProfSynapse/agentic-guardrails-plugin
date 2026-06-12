@@ -1,0 +1,26 @@
+# Example content (snippet) rules — patterns matched against content the agent
+# WRITES (Write/Edit calls, heredocs, echo/tee payloads). Companies drop their
+# own packs into this directory (or ~/.agw/policies.d/ per machine).
+#
+# `pattern` is a Python regex (quote it). `applies_to` are filename globs.
+
+snippets:
+  - pattern: "AKIA[0-9A-Z]{16}"
+    action: deny
+    reason: "Looks like an AWS access key — credentials must not be written to files."
+  - pattern: "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    action: deny
+    reason: "Private key material must not be written to files."
+  - pattern: "(?i)password\\s*=\\s*['\"][^'\"]{4,}['\"]"
+    action: ask
+    applies_to: ["*.py", "*.js", "*.ts", "*.java", "*.cs", "*.go", "*.rb"]
+    reason: "Hardcoded password in source code."
+
+paths:
+  # Example zone rules (machine-wide). Uncomment and adapt:
+  # - glob: "~/Pictures/**"
+  #   zone: no-access
+  # - glob: "~/Documents/Legal/**"
+  #   zone: read-only
+  # - glob: "~/Documents/Reports/**"
+  #   zone: workspace

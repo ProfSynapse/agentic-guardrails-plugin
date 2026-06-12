@@ -1,0 +1,22 @@
+{
+  "$comment": "Managed settings template for fleet deployment. Place at: /Library/Application Support/ClaudeCode/managed-settings.json (macOS), /etc/claude-code/managed-settings.json (Linux/WSL), or C:\\Program Files\\ClaudeCode\\managed-settings.json (Windows). Managed settings cannot be overridden by users or projects. Replace <ORG-MARKETPLACE-URL> with your internal marketplace git URL or path.",
+
+  "extraKnownMarketplaces": {
+    "synaptic-guardrails": {
+      "source": {
+        "source": "git",
+        "url": "<ORG-MARKETPLACE-URL>"
+      }
+    }
+  },
+
+  "enabledPlugins": {
+    "agentic-guardrails@synaptic-guardrails": true
+  },
+
+  "allowManagedHooksOnly": false,
+
+  "$comment_allowManagedHooksOnly": "Set allowManagedHooksOnly to true for maximum lockdown: only hooks from managed settings and managed plugins run, so users cannot add hooks that interfere with the guardrails. Test with your developers' existing hooks first.",
+
+  "$comment_optional_hardening": "Optionally also pin permissions at the managed level, e.g.: \"permissions\": { \"deny\": [\"Bash(rm:*)\", \"Bash(sudo:*)\"] } — the plugin's hooks already cover these with better redirects, but managed permission rules add defense in depth that survives even plugin removal."
+}

@@ -1,0 +1,21 @@
+{
+  "name": "synaptic-guardrails",
+  "owner": {
+    "name": "Synaptic Labs",
+    "email": "joseph@synapticlabs.ai"
+  },
+  "metadata": {
+    "description": "Enterprise guardrails for agentic tools (Claude Code, Cowork): CRUA file safety, agent workspace, sync-aware protection for OneDrive/Drive/Dropbox.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agentic-guardrails",
+      "source": ".",
+      "description": "Nothing is ever destroyed: deletion redirected to a reversible archive, pre-image snapshots on every write, checkout/publish workflow for Office documents, placeholder/stub protection in cloud-synced folders, and policy-driven command and content blocking.",
+      "category": "security",
+      "installationPreference": "required",
+      "strict": true
+    }
+  ]
+}

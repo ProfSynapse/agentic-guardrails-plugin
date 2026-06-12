@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# PATH shim for the agent workspace CLI (part of the agentic-guardrails plugin)
+exec python3 "$(dirname "$(readlink -f "$0")")/../scripts/agw/agw.py" "$@"
