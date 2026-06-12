@@ -60,7 +60,38 @@ A malformed pack never disables protection: it is skipped, reported by
 `agw doctor`, and the built-in guards keep running (fail-closed by design —
 the hook answers "ask" on any internal error, never silent-allow).
 
-## 4. Requirements per machine
+## 4. Choose an enforcement level
+
+The company picks one "level" and the individual knobs follow from it. Safe by
+default: omit everything and you get `standard`. Set `AGW_LEVEL` in the managed
+`env` block (fleet-wide) or per machine; individual `AGW_*` knobs override it.
+
+| Level | Blocks destruction/exfil | rm of build dirs (node_modules, dist) | Credential reads | Ask-once memory |
+|---|---|---|---|---|
+| `strict` | yes | archived, never rm'd | ask every time | off |
+| `standard` (default) | yes | allowed (pointless to archive) | ask, remembered per session | on |
+| `relaxed` | yes | allowed | allowed, audited only | on |
+| `observe` | **logs only, blocks nothing** | n/a | n/a | n/a |
+
+`observe` is the trial mode: deploy it first to see what the guardrails *would*
+do (everything lands in `~/.agw/audit.jsonl` with `"observe": true`) without
+disrupting anyone, then graduate to `standard`. Every level keeps taking
+pre-image snapshots, so "nothing is destroyed" holds even in `observe`.
+
+Override individual knobs when needed: `AGW_SESSION_MEMORY`,
+`AGW_REGENERABLE_RM`, `AGW_RELAXED_ACCESS`, `AGW_ENFORCEMENT`. A policy pack can
+also set these under a `settings:` block (`level`, `regenerable_globs` to extend
+the build-dir allowlist, `archive_max_bytes`).
+
+### Archive disk budget
+
+The store grows as it keeps pre-image snapshots. `AGW_ARCHIVE_MAX_BYTES` (or
+`settings.archive_max_bytes`) caps it; `0`/unset means unlimited (the safe
+default). When over budget, only the **oldest redundant pre-image copies** are
+evicted — never a move-archive (the sole copy of an rm'd file) and never the
+newest version of anything. `agw doctor` reports current size and budget.
+
+## 5. Requirements per machine
 
 - Python 3.9+ on PATH as `python3` (no third-party packages required;
   PyYAML and pandoc/openpyxl are used when present and improve conversion
@@ -70,8 +101,13 @@ the hook answers "ask" on any internal error, never silent-allow).
   `python-pptx` (pptx). `agw doctor` reports which are available.
 - `bin/agw` on PATH is convenient but optional; the hook teaches the agent the
   full path via session context regardless.
+- **Persistent store location.** The archive/session store defaults to `~/.agw`.
+  Set `AGW_HOME` to a persistent, **non-cloud-synced** path. This matters most in
+  **Cowork**: hooks there run inside a per-session Linux VM whose home (`~`) is
+  wiped on teardown, so `~/.agw` would not survive the session — point `AGW_HOME`
+  at a mounted persistent volume so archives and approvals persist.
 
-## 5. Verify a deployment
+## 6. Verify a deployment
 
 On a target machine:
 
@@ -84,7 +120,7 @@ Expected: the delete is denied with a message redirecting to `agw archive`,
 and the attempt appears in `~/.agw/audit.jsonl`. Run `/guardrails-report` in
 Claude for a readable audit summary.
 
-## 6. What this does and does not cover
+## 7. What this does and does not cover
 
 Covered: Claude Code and Cowork tool calls (Bash, Write/Edit, Read, MCP tools)
 on the machine, machine-wide — including synced OneDrive/SharePoint/Drive/

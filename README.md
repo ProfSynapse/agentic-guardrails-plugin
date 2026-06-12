@@ -9,6 +9,8 @@ plugin install.
 - `rm` and every destructive equivalent is blocked and redirected to
   `agw archive`: a reversible, versioned move into an archive store.
 - Every file the agent Writes or Edits is snapshotted *first*, automatically.
+  So is every file a raw shell `>`, `mv`, `cp`, or `tee` would clobber, so the
+  promise holds even when the agent bypasses the Write tool.
 - Office documents are edited via **CRUA** (Create, Read, Update, **Archive**):
   the agent works on a markdown/csv copy in `_workspace/`, and `agw publish`
   archives the old version before replacing the original, with conflict
@@ -55,11 +57,16 @@ so the agent self-corrects instead of fighting the rails:
 | `mv` (untracked) | `agw move` (logged, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 
+Exception: `rm` of purely regenerable build/dependency dirs (`node_modules`,
+`dist`, `.venv`, `__pycache__`...) is allowed at `standard` and above (pointless
+and huge to archive). `strict` archives even those. The list is extensible via
+`settings.regenerable_globs`.
+
 Escalations (`ask`): `git checkout -- <file>`, shrink-suspicious writes
 (replacing a large file with tiny content), reading cloud-only placeholders,
 publish conflicts, `agw prune`/`apply`/`hydrate`, reading credential-type
 files (.env, keys, `~/.aws`...), files whose content prescan finds secrets or
-"CONFIDENTIAL" markings ("this might contain a password — confirm"), and
+"CONFIDENTIAL" markings ("this might contain a password, confirm"), and
 recursive credential-keyword searches. Combining a credential file with a
 network tool in one command (`curl -d @.env ...`) is denied as exfiltration. Hard denies: `rm`/`shred`/
 `find -delete`, `git push --force` / `reset --hard` / `clean -f`, `dd` to
@@ -75,12 +82,20 @@ protected zones, the plugin itself, and the archive store.
 - **Zone a folder:** mark globs `no-access`, `read-only`, or `workspace` in
   `~/.agw/policies.d/*.yaml`.
 - **Archive location:** defaults to `~/.agw` (deliberately outside synced
-  trees); override with `AGW_HOME`.
+  trees); override with `AGW_HOME`. In Cowork, set it to a persistent volume;
+  the hook VM's home is wiped per session.
+- **Enforcement level:** `AGW_LEVEL` (or `settings.level`) picks a bundle:
+  `strict`, `standard` (default), `relaxed`, or `observe` (shadow mode: logs
+  what it would do, blocks nothing). Safe by default; the company sets one knob.
+  See [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md) for the full table.
+- **Disk budget:** `AGW_ARCHIVE_MAX_BYTES` caps the store (0 = unlimited);
+  oldest redundant pre-image copies are evicted first, never the sole copy of an
+  archived file.
 
 ## Testing
 
 ```
-python3 -m pytest tests/   # 122 tests, no third-party deps beyond pytest
+python3 -m pytest tests/   # 185 tests, no third-party deps beyond pytest
 ```
 
 Includes a ~50-entry bypass corpus (nested `bash -c`, command substitution,

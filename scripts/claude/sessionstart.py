@@ -26,20 +26,35 @@ secrets/confidentiality markings prompts the user for confirmation — explain w
 you need the file when asking. Never combine credential files with network \
 commands; that is blocked outright.
 - `agw status` shows open checkouts; `agw doctor` checks the environment.
-Every file the native Write/Edit tools touch is automatically snapshotted first — \
-prior versions are always recoverable."""
+Every file the native Write/Edit tools (and shell `>`/mv/cp/tee clobbers) touch is \
+automatically snapshotted first — prior versions are always recoverable."""
+
+# Appended only when the active enforcement level differs from the default, so
+# the model knows whether these rules will actually block or merely advise.
+_LEVEL_NOTE = {
+    "strict": "\nEnforcement level: STRICT — no session-approval memory, and even "
+              "regenerable dirs (node_modules, build) must be archived, not rm'd.",
+    "relaxed": "\nEnforcement level: RELAXED — credential/secret reads are allowed "
+               "without prompting (still audited). Destruction and exfil are still blocked.",
+    "observe": "\nEnforcement level: OBSERVE (shadow mode) — nothing is blocked; the "
+               "guardrails only log what they would have done. Still follow the CRUA "
+               "flow, but expect no hard stops.",
+}
 
 
 def main():
+    note = ""
     try:
         from core import engine, store
         store.agw_home()  # ensures ~/.agw exists
-        engine.load_policy(PLUGIN_ROOT)  # warms any future cache; validates packs
+        policy = engine.load_policy(PLUGIN_ROOT)  # warms cache; validates packs
+        cfg = engine.resolve_settings(policy)
+        note = _LEVEL_NOTE.get(cfg.get("level"), "")
     except Exception:
         pass
     json.dump({"hookSpecificOutput": {
         "hookEventName": "SessionStart",
-        "additionalContext": CONTEXT}}, sys.stdout)
+        "additionalContext": CONTEXT + note}}, sys.stdout)
 
 
 if __name__ == "__main__":

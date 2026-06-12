@@ -16,6 +16,7 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))  # scripts/ → core importable
+PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.dirname(_HERE))
 
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
@@ -274,21 +275,33 @@ def cmd_log(args):
 
 
 def cmd_doctor(args):
+    from core import engine
     caps = converters.capabilities()
     home = store.agw_home()
     writable = os.access(home, os.W_OK)
     profile = prof.detect(os.getcwd())
+    cfg = engine.resolve_settings(engine.load_policy(PLUGIN_ROOT))
+    size = store.archive_size_bytes()
+    budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES", 0) or 0)
     checks = {
         "agw_home": home, "agw_home_writable": writable,
         "python": sys.version.split()[0], "cwd_profile": profile.name,
+        "enforcement_level": cfg.get("level"), "enforcement": cfg.get("enforcement"),
+        "session_memory": cfg.get("session_memory"),
+        "regenerable_rm": cfg.get("regenerable_rm"),
+        "archive_bytes": size,
+        "archive_budget": budget or "unlimited",
         **{f"converter_{k}": v for k, v in caps.items()},
         **{f"office_{k}": v for k, v in office.capabilities().items()},
     }
-    lines = [f"{'OK ' if v not in (False, None) else 'MISSING '} {k}: {v}"
+    lines = [f"{'OK ' if v is not False and v is not None else 'MISSING '} {k}: {v}"
              for k, v in checks.items()]
     if not caps["pandoc"]:
         lines.append("note: pandoc not found — Office checkouts degrade to copy-only "
                      "(archive safety unaffected). Install: https://pandoc.org")
+    if budget and size > budget:
+        lines.append(f"note: archive ({size} B) exceeds budget ({budget} B); "
+                     "oldest pre-image snapshots will be evicted on next write.")
     _out(args, "\n".join(lines), checks)
 
 

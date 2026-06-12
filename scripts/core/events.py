@@ -45,12 +45,16 @@ class Decision:
     reason: str = ""
     rule_id: str = ""
     warnings: list = field(default_factory=list)
+    # Stable key identifying the *resource* this decision is about, for
+    # session approval memory ("you already okayed reading this file").
+    # Only set on access-type asks; None means "never remember, re-ask".
+    memo_key: str = None
 
     def merge(self, other: "Decision") -> "Decision":
         """Combine two decisions: highest severity wins; warnings accumulate."""
         winner = self if _SEVERITY[self.action] >= _SEVERITY[other.action] else other
         merged = Decision(winner.action, winner.reason, winner.rule_id,
-                          self.warnings + other.warnings)
+                          self.warnings + other.warnings, winner.memo_key)
         return merged
 
 

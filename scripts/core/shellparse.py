@@ -62,6 +62,26 @@ _DOWNLOADERS = {"curl", "wget"}
 _SUBST_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\1", re.DOTALL)
 
+# Truncating redirects (`>`, `>|`, fd-prefixed `1>`/`&>`) and their target.
+# Deliberately NOT `>>` (append: no data loss). Best-effort, for snapshotting
+# only — a false positive just snapshots a file that wasn't clobbered (cheap,
+# deduped); a miss is the cost we avoid by biasing toward matching.
+_REDIR_TARGET_RE = re.compile(
+    r"""(?:^|[^>\d&])(?:\d*|&)>\|?\s*("[^"]+"|'[^']+'|[^\s;|&<>()]+)""")
+
+
+def redirect_targets(command: str) -> list:
+    """Files a command would truncate via `>`/`>|` redirection (not `>>`)."""
+    s = _HEREDOC_RE.sub(" ", command)
+    s = _SUBST_RE.sub(" ", s)
+    s = re.sub(r">>", "  ", s)  # drop appends before scanning for truncates
+    out = []
+    for m in _REDIR_TARGET_RE.finditer(s):
+        tok = m.group(1).strip("\"'")
+        if tok and not tok.startswith("/dev/") and tok != "SUBST_OUT":
+            out.append(tok)
+    return out
+
 
 def extract_commands(command: str, depth: int = 0) -> ParseResult:
     if depth > MAX_DEPTH:

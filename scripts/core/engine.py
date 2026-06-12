@@ -21,7 +21,8 @@ from . import profiles as prof
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, READ, WRITE, \
     Decision, ToolEvent, worst
 from .shellparse import FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, FLAG_EVAL, \
-    FLAG_INDIRECT, ParseUncertain, SimpleCommand, extract_commands, extract_payloads
+    FLAG_INDIRECT, ParseUncertain, SimpleCommand, extract_commands, extract_payloads, \
+    redirect_targets
 
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
                     "instead — it moves files to the archive store and is fully reversible "
@@ -114,6 +115,74 @@ _SQL_DELETE = re.compile(r"\bDELETE\s+FROM\b(?![\s\S]*\bWHERE\b)", re.IGNORECASE
 
 _MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate"}
 
+# Regenerable build/dependency dirs: deleting them is routine dev work and
+# archiving them would copy gigabytes of reproducible junk. rm of these is
+# allowed (item: don't make the backup plan absurd). Company-extensible.
+_REGENERABLE = {"node_modules", "bower_components", ".venv", "venv", "__pycache__",
+                ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "build", "dist",
+                "target", "out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+                ".cache", "coverage", ".gradle", ".terraform"}
+
+# Access-type asks (about *reading* a sensitive resource, not destroying one):
+# eligible for session approval memory and for relaxed-level downgrade.
+_ACCESS_ASK_RULES = {"builtin:secret-file", "builtin:content-prescan",
+                     "builtin:credential-hunt", "builtin:placeholder-read"}
+
+# Named enforcement levels. Each expands to defaults for the individual knobs;
+# explicit settings/env knobs override. `standard` is the safe default.
+_LEVELS = {
+    "strict":   {"enforcement": "enforce", "session_memory": False,
+                 "regenerable_rm": False, "relaxed_access": False},
+    "standard": {"enforcement": "enforce", "session_memory": True,
+                 "regenerable_rm": True,  "relaxed_access": False},
+    "relaxed":  {"enforcement": "enforce", "session_memory": True,
+                 "regenerable_rm": True,  "relaxed_access": True},
+    "observe":  {"enforcement": "observe", "session_memory": True,
+                 "regenerable_rm": True,  "relaxed_access": False},
+}
+_DEFAULT_LEVEL = "standard"
+_BOOL_KNOBS = {"session_memory", "regenerable_rm", "relaxed_access"}
+
+
+def _as_bool(val):
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_settings(policy: "Policy") -> dict:
+    """Effective config: built-in default <- level bundle <- explicit knobs
+    (policy `settings:` block) <- AGW_* environment overrides. The company
+    sets `level` once; power users override individual knobs."""
+    s = dict(policy.settings or {})
+    level = os.environ.get("AGW_LEVEL") or s.get("level") or _DEFAULT_LEVEL
+    level = level if level in _LEVELS else _DEFAULT_LEVEL
+    cfg = dict(_LEVELS[level])
+    cfg["level"] = level
+    for knob in _BOOL_KNOBS:
+        if knob in s:
+            cfg[knob] = _as_bool(s[knob])
+    if "enforcement" in s:
+        cfg["enforcement"] = str(s["enforcement"]).lower()
+    # env overrides win last
+    env_map = {"AGW_ENFORCEMENT": "enforcement", "AGW_SESSION_MEMORY": "session_memory",
+               "AGW_REGENERABLE_RM": "regenerable_rm", "AGW_RELAXED_ACCESS": "relaxed_access"}
+    for env, knob in env_map.items():
+        if env in os.environ:
+            cfg[knob] = (os.environ[env].lower() if knob == "enforcement"
+                         else _as_bool(os.environ[env]))
+    # company-extended regenerable list (additive); empty when the knob is off,
+    # so the rm handler simply sees no regenerable set and denies as normal.
+    extra = s.get("regenerable_globs") or []
+    cfg["regenerable"] = ((_REGENERABLE | {str(x) for x in extra})
+                          if cfg.get("regenerable_rm") else set())
+    return cfg
+
+
+def _is_regenerable(path: str, regen: set) -> bool:
+    parts = [p for p in os.path.normpath(path).replace("\\", "/").split("/") if p]
+    return any(p in regen for p in parts)
+
 
 class Policy:
     def __init__(self):
@@ -205,8 +274,9 @@ def _merge_pack(policy: Policy, data, pack: str):
 # --- evaluation ---------------------------------------------------------------
 
 def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decision:
+    cfg = resolve_settings(policy)
     if event.kind == EXEC:
-        decision = _eval_exec(event, policy, plugin_root)
+        decision = _eval_exec(event, policy, plugin_root, cfg)
     elif event.kind in (WRITE, EDIT):
         decision = _eval_write(event, policy)
     elif event.kind == READ:
@@ -215,10 +285,62 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
         decision = _eval_mcp(event, policy)
     else:
         decision = Decision()
+    # relaxed level: access-type asks (reading a sensitive resource) become
+    # silent-with-audit. The hard denies (exfil, destruction) are untouched.
+    if cfg.get("relaxed_access") and decision.action == ASK \
+            and decision.rule_id in _ACCESS_ASK_RULES:
+        decision = Decision(DEFER, "", decision.rule_id,
+                            warnings=[f"relaxed mode: allowed without prompt "
+                                      f"({decision.rule_id}) — {decision.reason}"],
+                            memo_key=decision.memo_key)
     if policy.degraded and decision.action in (DEFER, ALLOW):
         decision.warnings.append(
             f"guardrails: policy pack(s) failed to load: {', '.join(policy.degraded)}")
     return decision
+
+
+def clobber_targets(command: str, cwd: str = "") -> list:
+    """Existing files a shell command would overwrite/truncate: `>` redirects
+    plus mv/cp/tee/dd/truncate/install destinations. Used by the adapter to
+    pre-image-snapshot them before the command runs — the Bash equivalent of
+    the Write/Edit pre-image. Best-effort: never raises."""
+    def _abs(tok):
+        p = os.path.expanduser(tok)
+        if not os.path.isabs(p):
+            p = os.path.join(cwd or os.getcwd(), p)
+        return os.path.normpath(p)
+
+    targets = set()
+    try:
+        for t in redirect_targets(command):
+            targets.add(_abs(t))
+    except Exception:
+        pass
+    try:
+        parsed = extract_commands(command)
+    except Exception:
+        parsed = None
+    if parsed:
+        for cmd in parsed.commands:
+            ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
+            name = cmd.name
+            if name in ("mv", "cp", "install") and len(ops) >= 2:
+                dest = ops[-1]
+                dest_abs = _abs(dest)
+                if os.path.isdir(dest_abs):
+                    for src in ops[:-1]:
+                        targets.add(os.path.join(dest_abs, os.path.basename(src)))
+                else:
+                    targets.add(dest_abs)
+            elif name == "tee" and "-a" not in cmd.argv and "--append" not in cmd.argv:
+                targets.update(_abs(o) for o in ops)
+            elif name == "dd":
+                for a in cmd.argv[1:]:
+                    if a.startswith("of=") and not a.startswith("of=/dev/"):
+                        targets.add(_abs(a[3:]))
+            elif name == "truncate":
+                targets.update(_abs(o) for o in ops)
+    return [p for p in targets if os.path.isfile(p)]
 
 
 def _zone_for(path: str, policy: Policy) -> str:
@@ -244,7 +366,7 @@ def _is_protected(path: str, policy: Policy) -> bool:
 
 # --- exec ---------------------------------------------------------------------
 
-def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str) -> Decision:
+def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) -> Decision:
     try:
         parsed = extract_commands(event.command)
     except ParseUncertain as exc:
@@ -302,10 +424,11 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str) -> Decision:
             decisions.append(Decision(
                 ASK, f"Heads up: this reads credential-type file(s) ({names}), and "
                      "their contents would enter the conversation. Confirm this is "
-                     "needed for the task.", "builtin:secret-file"))
+                     "needed for the task.", "builtin:secret-file",
+                memo_key=f"secret-file:{'|'.join(sorted(set(secret_hits)))}"))
 
     for cmd in parsed.commands:
-        decisions.append(_eval_simple_command(cmd, policy, plugin_root, event))
+        decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
 
     # content rules also see payloads the command would write (heredocs, echo)
     for payload in extract_payloads(event.command):
@@ -315,8 +438,9 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str) -> Decision:
 
 
 def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
-                         event: ToolEvent) -> Decision:
+                         event: ToolEvent, cfg: dict = None) -> Decision:
     name = cmd.name
+    cfg = cfg or {}
 
     # trusted agw verbs
     if name == "agw" or name == "agw.py":
@@ -336,6 +460,14 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
 
     # ---- built-in semantic deny table ----
     if name in ("rm", "rmdir", "shred", "unlink"):
+        # Regenerable build/dependency dirs are routine to delete and pointless
+        # (and huge) to archive — allow rm of them when every path operand is
+        # regenerable. shred still denies (it's about secure-wipe, not cleanup).
+        regen = cfg.get("regenerable")
+        if name == "rm" and regen:
+            ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
+            if ops and all(_is_regenerable(o, regen) for o in ops):
+                return Decision(ALLOW, "", "builtin:rm-regenerable")
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:rm")
     if name == "find" and ("-delete" in cmd.argv):
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:find-delete")
@@ -378,7 +510,7 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                                  "keywords (password/secret/key...). Fine for "
                                  "debugging, but confirm it's intended — the matches "
                                  "would land in the conversation.",
-                            "builtin:credential-hunt")
+                            "builtin:credential-hunt", memo_key=f"credential-hunt:{pattern}")
 
     # content prescan for plain readers: "hey, this might contain a password"
     if name in _READER_CMDS:
@@ -396,7 +528,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                     return Decision(ASK, f"Heads up: {os.path.basename(tok)} looks "
                                          f"like it contains {marker}. Reading it "
                                          "pulls that into the conversation — confirm "
-                                         "this is needed.", "builtin:content-prescan")
+                                         "this is needed.", "builtin:content-prescan",
+                                    memo_key=f"content-prescan:{p}")
 
     # protected-path mutation via shell
     if name in _MUTATOR_CMDS or name in ("rm",):
@@ -545,20 +678,22 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
             decisions.append(Decision(ASK, "This file is a cloud-only placeholder; reading "
                                            "it here may return truncated content (or "
                                            "trigger a download). Hydrate it first for "
-                                           "reliable results.", "builtin:placeholder-read"))
+                                           "reliable results.", "builtin:placeholder-read",
+                                      memo_key=f"placeholder-read:{p}"))
             continue
         if _is_secret_path(p):
             decisions.append(Decision(ASK, f"'{os.path.basename(p)}' is a credential-type "
                                            "file (keys/secrets/tokens). Its contents would "
                                            "enter the conversation — confirm this is "
-                                           "needed for the task.", "builtin:secret-file"))
+                                           "needed for the task.", "builtin:secret-file",
+                                      memo_key=f"secret-file:{p}"))
             continue
         marker = _prescan_file(p)
         if marker:
             decisions.append(Decision(ASK, f"Heads up: this file looks like it contains "
                                            f"{marker}. Reading it pulls that into the "
                                            "conversation — confirm this is needed.",
-                                      "builtin:content-prescan"))
+                                      "builtin:content-prescan", memo_key=f"content-prescan:{p}"))
     return worst(decisions)
 
 

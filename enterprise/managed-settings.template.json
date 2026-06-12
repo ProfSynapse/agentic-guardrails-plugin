@@ -18,5 +18,12 @@
 
   "$comment_allowManagedHooksOnly": "Set allowManagedHooksOnly to true for maximum lockdown: only hooks from managed settings and managed plugins run, so users cannot add hooks that interfere with the guardrails. Test with your developers' existing hooks first.",
 
+  "env": {
+    "$comment_env": "Fleet-wide guardrail tuning. AGW_LEVEL picks an enforcement bundle; the default (omit it) is 'standard'. Levels: 'strict' (archive even node_modules, no session-approval memory), 'standard' (safe default), 'relaxed' (credential reads allowed without prompting, still audited), 'observe' (shadow mode: log only, block nothing — use to trial the plugin without disrupting work). Individual knobs (AGW_SESSION_MEMORY, AGW_REGENERABLE_RM, AGW_RELAXED_ACCESS, AGW_ENFORCEMENT) override the level. AGW_ARCHIVE_MAX_BYTES caps the archive store (0 = unlimited, the safe default); oldest pre-image snapshots are evicted first, never move-archives or the newest version.",
+    "AGW_LEVEL": "standard",
+    "$comment_AGW_HOME": "The machine-wide archive/session store. Defaults to ~/.agw. Point it at a persistent, NON-cloud-synced path. IMPORTANT for Cowork: hooks run in a per-session Linux VM whose home (~) is wiped on teardown, so ~/.agw does not persist there — set AGW_HOME to a mounted persistent volume.",
+    "AGW_HOME": ""
+  },
+
   "$comment_optional_hardening": "Optionally also pin permissions at the managed level, e.g.: \"permissions\": { \"deny\": [\"Bash(rm:*)\", \"Bash(sudo:*)\"] } — the plugin's hooks already cover these with better redirects, but managed permission rules add defense in depth that survives even plugin removal."
 }

@@ -88,3 +88,62 @@ def test_audit_redaction(tmp_path):
     audit = (home / "audit.jsonl").read_text()
     assert "AKIAIOSFODNN7EXAMPLE" not in audit
     assert "[REDACTED]" in audit
+
+
+def test_shell_clobber_snapshots_pre_image(tmp_path):
+    # a bare `>` redirect bypasses the Write tool entirely — the adapter must
+    # still pre-image the file it is about to truncate.
+    target = tmp_path / "config.json"
+    target.write_text("the original config")
+    home = tmp_path / "home"
+    out = run_hook({"tool_name": "Bash",
+                    "tool_input": {"command": f"echo '{{}}' > {target}"},
+                    "cwd": str(tmp_path), "session_id": "t1",
+                    "hook_event_name": "PreToolUse"},
+                   env_extra={"AGW_HOME": str(home)})
+    assert _decision(out) in ("defer", "allow")  # clobber via > is not blocked
+    archived = []
+    for dirpath, _dirs, files in os.walk(home / "archive"):
+        archived += [os.path.join(dirpath, f) for f in files
+                     if "config.json" in f and not f.endswith(".jsonl")]
+    assert any(open(p).read() == "the original config" for p in archived), \
+        "shell redirect clobber was not snapshotted"
+
+
+def test_observe_mode_logs_but_never_blocks(tmp_path):
+    home = tmp_path / "home"
+    out = run_hook({"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"},
+                    "cwd": "/tmp", "session_id": "t1", "hook_event_name": "PreToolUse"},
+                   env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "observe"})
+    # no permissionDecision at all — observe never enforces
+    assert "hookSpecificOutput" not in out
+    assert "would have DENY" in out.get("systemMessage", "")
+    # but the real decision is still audited (so the trail shows what it caught)
+    audit = (home / "audit.jsonl").read_text()
+    assert '"observe": true' in audit or '"observe":true' in audit
+
+
+def test_session_memory_suppresses_repeat_ask(tmp_path):
+    from core import store
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    home = tmp_path / "home"
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "sess-X",
+               "hook_event_name": "PreToolUse"}
+    # first read asks
+    out1 = run_hook(payload, env_extra={"AGW_HOME": str(home)})
+    assert _decision(out1) == "ask"
+    # simulate PostToolUse recording approval into the same store, then re-read
+    prev_home = os.environ.get("AGW_HOME")
+    os.environ["AGW_HOME"] = str(home)
+    try:
+        store.session_approve("sess-X", f"secret-file:{os.path.abspath(secret)}")
+    finally:
+        if prev_home is None:
+            os.environ.pop("AGW_HOME", None)
+        else:
+            os.environ["AGW_HOME"] = prev_home
+    out2 = run_hook(payload, env_extra={"AGW_HOME": str(home)})
+    assert "hookSpecificOutput" not in out2
+    assert "already approved this session" in out2.get("systemMessage", "")

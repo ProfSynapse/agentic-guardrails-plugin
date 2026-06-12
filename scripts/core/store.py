@@ -293,3 +293,110 @@ def archive_size_bytes() -> int:
             except OSError:
                 pass
     return total
+
+
+# --- session approval memory --------------------------------------------------
+# Remembers per-session that the user already approved access to a resource, so
+# the same ask doesn't fire repeatedly. Keyed by session id; bounded; cleaned
+# opportunistically. This is convenience state, not safety state — losing it
+# just means an extra prompt.
+
+def _sessions_dir() -> str:
+    d = os.path.join(agw_home(), "sessions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _session_path(session_id: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (session_id or "_"))[:80]
+    return os.path.join(_sessions_dir(), f"{safe or '_'}.json")
+
+
+def session_approved(session_id: str, memo_key: str) -> bool:
+    if not (session_id and memo_key):
+        return False
+    try:
+        with open(_session_path(session_id), encoding="utf-8") as f:
+            return memo_key in set(json.load(f).get("approved", []))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def session_approve(session_id: str, memo_key: str):
+    if not (session_id and memo_key):
+        return
+    path = _session_path(session_id)
+    with Lock("session-" + os.path.basename(path)):
+        approved = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                approved = json.load(f).get("approved", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+        if memo_key in approved:
+            return
+        approved.append(memo_key)
+        approved = approved[-200:]  # bound per-session memory
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": SCHEMA_VERSION, "approved": approved}, f)
+        os.replace(tmp, path)
+
+
+# --- retention / disk budget --------------------------------------------------
+
+def enforce_budget(max_bytes: int) -> dict:
+    """Keep the archive under max_bytes by evicting oldest *pre-image copy*
+    snapshots first. NEVER evicts move-mode archives (the only copy of a
+    displaced file) or the newest version in any file_dir. Returns a summary.
+    A budget of 0/None means unlimited (the safe default — keep everything)."""
+    if not max_bytes or max_bytes <= 0:
+        return {"enforced": False}
+    total = archive_size_bytes()
+    if total <= max_bytes:
+        return {"enforced": True, "evicted": 0, "bytes": total, "freed": 0}
+
+    root = os.path.join(agw_home(), "archive")
+    candidates = []  # (ts, path, size, file_dir)
+    for file_dir, _dirs, files in os.walk(root):
+        versions = sorted(f for f in files if f.startswith("v") and "_" in f)
+        if len(versions) <= 1:
+            continue  # never evict the sole version of anything
+        manifest = os.path.join(file_dir, "manifest.jsonl")
+        modes = {}
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        e = json.loads(line)
+                        modes[os.path.basename(e.get("dest", ""))] = e.get("mode")
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            modes = {}
+        for v in versions[:-1]:  # keep the newest version in every file_dir
+            if modes.get(v) and modes.get(v) != "copy":
+                continue  # only evict pre-image *copies*, never moves
+            full = os.path.join(file_dir, v)
+            try:
+                candidates.append((v.split("_", 2)[1] if v.count("_") >= 2 else v,
+                                   full, os.path.getsize(full), file_dir))
+            except OSError:
+                continue
+    candidates.sort()  # oldest timestamp first
+    freed, evicted = 0, 0
+    with Lock("retention"):
+        for _ts_key, full, size, _fd in candidates:
+            if total - freed <= max_bytes:
+                break
+            try:
+                os.unlink(full)
+                _append_jsonl(os.path.join(agw_home(), "oplog.jsonl"),
+                              {"op": "evict", "dest": full, "bytes": size,
+                               "reason": "archive budget"})
+                freed += size
+                evicted += 1
+            except OSError:
+                continue
+    return {"enforced": True, "evicted": evicted, "bytes": total - freed,
+            "freed": freed, "budget": max_bytes}
