@@ -29,6 +29,7 @@ editors.
      markdown natively; Sheets to csv/xlsx).
    - Ask the user to download it (File → Download → Markdown/docx/csv) into
      the working folder, then use the normal `agw checkout` flow on that file.
+   - Last resort: transcribe it yourself (see below).
 3. Edit the exported open-format file in `_workspace/` as usual.
 4. Publishing back:
    - Via connector: update the document content through the API (updates
@@ -36,6 +37,25 @@ editors.
      only if the user agrees — it gets a new ID.
    - No connector: hand the finished file back to the user to upload/import,
      and say clearly that the Google Doc itself was not modified.
+
+## Last resort: transcribing the doc to markdown yourself
+
+If you can see the doc's content (browser, screenshot, paste from the user)
+but have no export channel, you may rewrite it as markdown. This is
+**transcription, not export** — it is lossy and can silently truncate, so:
+
+- **Short docs only** (roughly a few pages). For anything long, stop and ask
+  the user for File → Download → Markdown instead — Google's own export is
+  native and lossless, and a hand transcription of a long doc *will* drop
+  content without anyone noticing.
+- Save it as `<name>.transcribed.md` in `_workspace/`, never as a file that
+  looks like the original.
+- Verify completeness before using it: compare heading list and rough
+  paragraph count against the source, and confirm the final paragraph of the
+  doc appears at the end of your transcript.
+- Tell the user it's a transcription. Never publish a transcription back over
+  the real document or present it as a faithful copy — comments, suggestions,
+  images, and formatting are not preserved.
 
 ## Things that look like they'd work but don't
 
