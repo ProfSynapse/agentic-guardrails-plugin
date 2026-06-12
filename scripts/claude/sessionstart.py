@@ -21,6 +21,10 @@ copy, then `agw publish <file>` (archives the old version and replaces the origi
 one-liners.
 - Cloud-synced folders (OneDrive/SharePoint/Google Drive/Dropbox): run `agw scan \
 <folder>` before bulk work; never edit cloud-only placeholder files or .gdoc stubs.
+- Reading credential-type files (.env, keys, cloud configs) or files containing \
+secrets/confidentiality markings prompts the user for confirmation — explain why \
+you need the file when asking. Never combine credential files with network \
+commands; that is blocked outright.
 - `agw status` shows open checkouts; `agw doctor` checks the environment.
 Every file the native Write/Edit tools touch is automatically snapshotted first — \
 prior versions are always recoverable."""

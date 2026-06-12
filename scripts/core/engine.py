@@ -36,6 +36,74 @@ AGW_ASK_VERBS = {"prune": "prune permanently destroys archived versions (human d
                  "apply": "bulk apply executes a stored plan — review the manifest",
                  "hydrate": "hydration downloads cloud-only content"}
 
+# --- secret/confidential detection: ask, don't block --------------------------
+# Reading a credential-type file is often legitimate (dev setup), so it asks.
+# The only hard deny is the exfiltration shape: credential file + network tool
+# in the same command.
+
+_SECRET_BASENAME_RE = re.compile(
+    r"^(?:\.env(?:\..+)?|\.netrc|\.pgpass|\.git-credentials"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519)|.*\.(?:pem|key|p12|pfx|jks|keystore|ppk))$",
+    re.IGNORECASE)
+_SECRET_NAMES = {"credentials", "credentials.json", "service_account.json",
+                 "service-account.json", "secrets.json", "secrets.yaml", "secrets.yml"}
+_SECRET_DIRS = {".ssh", ".aws", ".azure", ".kube", "gcloud"}
+_NOT_SECRET_SUFFIX = re.compile(r"\.(?:example|sample|template|dist|pub)$", re.IGNORECASE)
+
+_NETWORK_CMDS = {"curl", "wget", "nc", "ncat", "netcat", "scp", "sftp", "rsync",
+                 "ssh", "ftp", "telnet", "socat"}
+_READER_CMDS = {"cat", "head", "tail", "less", "more", "bat", "strings"}
+
+_HUNT_RE = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token|credential)")
+
+_PRESCAN_BYTES = 64 * 1024
+_PRESCAN_MARKERS = (
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("an AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("an API token", re.compile(
+        r"\bgh[pos]_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{20,}"
+        r"|\bxox[bpoars]-[A-Za-z0-9-]{10,}")),
+    ("a hardcoded password", re.compile(
+        r"(?i)\b(?:password|passwd|pwd)\s*[=:]\s*[\"'][^\"']{6,}[\"']")),
+    ("a credential assignment", re.compile(
+        r"(?m)^[A-Za-z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_?KEY)[A-Za-z0-9_]*\s*=\s*\S{6,}")),
+    ("a confidentiality marking", re.compile(
+        r"(?i)\b(?:confidential|do not distribute|internal use only|trade secret)\b")),
+)
+
+
+def _is_secret_path(path: str) -> bool:
+    if "://" in path:
+        return False  # URL, not a filesystem path
+    p = os.path.expanduser(path).replace("\\", "/")
+    base = os.path.basename(p)
+    if _NOT_SECRET_SUFFIX.search(base):
+        return False
+    if _SECRET_BASENAME_RE.match(base) or base.lower() in _SECRET_NAMES:
+        return True
+    return any(d in p.split("/")[:-1] for d in _SECRET_DIRS)
+
+
+def _prescan_file(path: str):
+    """Return a human label for the first secret/confidential marker found in
+    the file head, or None. Cheap (one bounded read), binary-safe."""
+    if _NOT_SECRET_SUFFIX.search(os.path.basename(path)):
+        return None  # .example/.sample/.template files hold placeholders
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return None
+        with open(path, "rb") as f:
+            head = f.read(_PRESCAN_BYTES)
+    except OSError:
+        return None
+    if b"\0" in head:
+        return None  # binary container; plaintext markers won't be meaningful
+    text = head.decode("utf-8", "replace")
+    for label, rx in _PRESCAN_MARKERS:
+        if rx.search(text):
+            return label
+    return None
+
 _INTERPRETER_DESTRUCTIVE = re.compile(
     r"os\.(remove|unlink|rmdir|removedirs)|shutil\.rmtree|\.unlink\(|send2trash"
     r"|\b(rmSync|rmdirSync|unlinkSync|rm_rf|rm_r)\b|\.rm\s*\(|FileUtils\.(rm|remove)"
@@ -209,6 +277,33 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str) -> Decision:
         decisions.append(Decision(DENY, "DELETE without WHERE is blocked.",
                                   "builtin:sql-delete"))
 
+    # credential files anywhere in the command: ask; with a network tool in the
+    # same command line, that's the exfiltration shape: deny. Tokens directly
+    # after -i are identity-file *usage* (ssh -i key host), not access.
+    secret_hits, prev = [], ""
+    for cmd in parsed.commands:
+        prev = ""
+        for tok in cmd.argv[1:]:
+            t = tok.lstrip("@")  # curl -d @.env
+            if t and not t.startswith("-") and prev != "-i" and _is_secret_path(t):
+                secret_hits.append(os.path.basename(t))
+            prev = tok
+    if secret_hits:
+        names = ", ".join(sorted(set(secret_hits)))
+        net = sorted({c.name for c in parsed.commands if c.name in _NETWORK_CMDS})
+        if net:
+            decisions.append(Decision(
+                DENY, f"This command combines credential file(s) ({names}) with a "
+                      f"network tool ({', '.join(net)}) — that is the shape of "
+                      "credential exfiltration, so it is blocked. If this is "
+                      "legitimate, the user can run it themselves.",
+                "builtin:secret-exfil"))
+        else:
+            decisions.append(Decision(
+                ASK, f"Heads up: this reads credential-type file(s) ({names}), and "
+                     "their contents would enter the conversation. Confirm this is "
+                     "needed for the task.", "builtin:secret-file"))
+
     for cmd in parsed.commands:
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event))
 
@@ -269,6 +364,39 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                                 "builtin:interpreter-delete")
     if name == "trash" or name == "gio" and "trash" in cmd.argv:
         return Decision(ALLOW, "", "builtin:trash-ok")
+
+    # recursive keyword sweeps for credentials: ask, with the why
+    if name in ("grep", "egrep", "rg", "ag", "ack"):
+        recursive = name in ("rg", "ag") or any(
+            a in ("-r", "-R", "--recursive") or
+            (a.startswith("-") and not a.startswith("--") and
+             any(ch in "rR" for ch in a[1:]))
+            for a in cmd.argv[1:])
+        pattern = next((a for a in cmd.argv[1:] if not a.startswith("-")), "")
+        if recursive and _HUNT_RE.search(pattern):
+            return Decision(ASK, "This recursively searches for credential-related "
+                                 "keywords (password/secret/key...). Fine for "
+                                 "debugging, but confirm it's intended — the matches "
+                                 "would land in the conversation.",
+                            "builtin:credential-hunt")
+
+    # content prescan for plain readers: "hey, this might contain a password"
+    if name in _READER_CMDS:
+        checked = 0
+        for tok in cmd.argv[1:]:
+            if tok.startswith("-") or checked >= 2:
+                continue
+            p = os.path.expanduser(tok)
+            if not os.path.isabs(p):
+                p = os.path.join(event.cwd or os.getcwd(), p)
+            if os.path.isfile(p):
+                checked += 1
+                marker = _prescan_file(p)
+                if marker:
+                    return Decision(ASK, f"Heads up: {os.path.basename(tok)} looks "
+                                         f"like it contains {marker}. Reading it "
+                                         "pulls that into the conversation — confirm "
+                                         "this is needed.", "builtin:content-prescan")
 
     # protected-path mutation via shell
     if name in _MUTATOR_CMDS or name in ("rm",):
@@ -418,6 +546,19 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
                                            "it here may return truncated content (or "
                                            "trigger a download). Hydrate it first for "
                                            "reliable results.", "builtin:placeholder-read"))
+            continue
+        if _is_secret_path(p):
+            decisions.append(Decision(ASK, f"'{os.path.basename(p)}' is a credential-type "
+                                           "file (keys/secrets/tokens). Its contents would "
+                                           "enter the conversation — confirm this is "
+                                           "needed for the task.", "builtin:secret-file"))
+            continue
+        marker = _prescan_file(p)
+        if marker:
+            decisions.append(Decision(ASK, f"Heads up: this file looks like it contains "
+                                           f"{marker}. Reading it pulls that into the "
+                                           "conversation — confirm this is needed.",
+                                      "builtin:content-prescan"))
     return worst(decisions)
 
 

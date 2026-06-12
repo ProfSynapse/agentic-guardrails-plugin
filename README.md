@@ -57,7 +57,11 @@ so the agent self-corrects instead of fighting the rails:
 
 Escalations (`ask`): `git checkout -- <file>`, shrink-suspicious writes
 (replacing a large file with tiny content), reading cloud-only placeholders,
-publish conflicts, `agw prune`/`apply`/`hydrate`. Hard denies: `rm`/`shred`/
+publish conflicts, `agw prune`/`apply`/`hydrate`, reading credential-type
+files (.env, keys, `~/.aws`...), files whose content prescan finds secrets or
+"CONFIDENTIAL" markings ("this might contain a password — confirm"), and
+recursive credential-keyword searches. Combining a credential file with a
+network tool in one command (`curl -d @.env ...`) is denied as exfiltration. Hard denies: `rm`/`shred`/
 `find -delete`, `git push --force` / `reset --hard` / `clean -f`, `dd` to
 devices, `mkfs`, `sudo`, decode-to-shell and download-to-shell pipes,
 destructive SQL/interpreter one-liners, writes to `.gdoc` stubs, placeholders,
