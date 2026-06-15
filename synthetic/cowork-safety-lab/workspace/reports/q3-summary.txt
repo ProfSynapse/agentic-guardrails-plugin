@@ -1,0 +1,8 @@
+Q3 Summary
+
+Revenue recovered after the April outage, but margin slipped because expedited
+shipping remained above plan for six consecutive weeks.
+
+The product team wants a revised onboarding sequence before the next launch.
+Operations wants any draft rewrite to preserve this file's current wording until
+someone explicitly approves the change.
