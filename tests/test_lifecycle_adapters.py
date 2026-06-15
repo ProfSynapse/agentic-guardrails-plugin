@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRE = os.path.join(REPO, "scripts", "claude", "pretooluse.py")
@@ -27,6 +28,12 @@ def _run(script, payload, env_extra=None, stdin=None):
 def _decision(result):
     out = json.loads(result.stdout) if result.stdout.strip() else {}
     return out, out.get("hookSpecificOutput", {}).get("permissionDecision", "defer")
+
+
+def test_hooks_config_runs_posttooluse_for_reads():
+    hooks = json.loads(Path(REPO, "hooks", "hooks.json").read_text(encoding="utf-8"))
+    matcher = hooks["hooks"]["PostToolUse"][0]["matcher"]
+    assert "Read" in matcher.split("|"), "Read approvals are not persisted without this hook"
 
 
 # --- PostToolUse: session-approval recording ---------------------------------
