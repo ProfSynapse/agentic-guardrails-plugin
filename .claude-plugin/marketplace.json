@@ -2,20 +2,20 @@
   "name": "synaptic-guardrails",
   "owner": {
     "name": "Synaptic Labs",
-    "email": "joseph@synapticlabs.ai"
+    "url": "https://github.com/ProfSynapse/agentic-guardrails-plugin"
   },
   "metadata": {
-    "description": "Enterprise guardrails for agentic tools (Claude Code, Cowork): CRUA file safety, agent workspace, sync-aware protection for OneDrive/Drive/Dropbox.",
-    "version": "0.1.0"
+    "description": "Enterprise guardrails for agentic tools (Claude Code, Cowork): CRUA file safety, agent workspace, sync-aware protection for OneDrive/Drive/Dropbox."
   },
   "plugins": [
     {
       "name": "agentic-guardrails",
-      "source": ".",
+      "displayName": "Agentic Guardrails",
+      "source": "./",
       "description": "Nothing is ever destroyed: deletion redirected to a reversible archive, pre-image snapshots on every write, checkout/publish workflow for Office documents, placeholder/stub protection in cloud-synced folders, and policy-driven command and content blocking.",
       "category": "security",
-      "installationPreference": "required",
-      "strict": true
+      "homepage": "https://github.com/ProfSynapse/agentic-guardrails-plugin",
+      "installationPreference": "required"
     }
   ]
 }

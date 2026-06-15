@@ -22,9 +22,12 @@ plugin install.
 ## Install
 
 ```
-/plugin marketplace add <this-repo-url-or-path>
+/plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
 /plugin install agentic-guardrails@synaptic-guardrails
 ```
+
+If Claude's marketplace UI rejects `ProfSynapse/agentic-guardrails-plugin`, use
+the full GitHub URL above instead of the owner/repo shorthand.
 
 Requires Python 3.9+ as `python3`. Optional: `pandoc` (docx↔markdown) and
 `openpyxl` (xlsx→csv) for high-fidelity document checkout; without them files

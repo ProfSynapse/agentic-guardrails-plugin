@@ -13,9 +13,12 @@ Sanity check from any machine:
 
 ```bash
 claude  # then:
-/plugin marketplace add git@your-git:tools/agentic-guardrails-plugin.git
+/plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
 /plugin install agentic-guardrails@synaptic-guardrails
 ```
+
+If the marketplace UI reports a sync failure for the owner/repo shorthand, use
+the full repository URL form shown above.
 
 ## 2. Enforce via managed settings
 
