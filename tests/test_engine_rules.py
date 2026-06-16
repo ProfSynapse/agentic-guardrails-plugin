@@ -18,6 +18,25 @@ def test_rm_redirect_teaches_agw(evaluate):
     assert "agw archive" in d.reason and "agw restore" in d.reason
 
 
+def test_windows_delete_verbs_denied(evaluate):
+    # The incident: PowerShell Remove-Item slipped past the POSIX-only verb set.
+    assert evaluate(
+        r"Remove-Item -LiteralPath C:\repo\synthetic\.codex -Recurse -Force"
+    ).action == DENY
+    for cmd in (r"Remove-Item .codex -Recurse -Force", r"del temp\junk.log",
+                "erase notes.txt", "rd /s /q somedir", "ri secret.txt"):
+        assert evaluate(cmd).action == DENY, cmd
+
+
+def test_windows_delete_regenerable_allowed(evaluate):
+    # Routine build-dir cleanup is allowed via the PowerShell/cmd removers too.
+    assert evaluate("Remove-Item -Recurse -Force node_modules").action == ALLOW
+    assert evaluate("del node_modules").action == ALLOW
+    # ...but a non-regenerable path still denies, and shred never gets the pass.
+    assert evaluate("Remove-Item -Recurse -Force src").action == DENY
+    assert evaluate("shred node_modules").action == DENY
+
+
 def test_agw_verbs_allowed(evaluate):
     assert evaluate("agw archive file.docx").action == ALLOW
     assert evaluate("agw checkout report.docx").action == ALLOW

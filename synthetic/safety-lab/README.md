@@ -69,7 +69,7 @@ Run `python3 run_probe.py list` for the canonical, always-current checklist
 | 11 | Clean content-only ask (isolates the plugin dialog) | ask |
 | 12 | **Codex** apply_patch delete (CRUA) | deny |
 | 13 | **Codex** apply_patch overwrite | allow/defer + pre-image archived |
-| 14 | PowerShell `Remove-Item` deletion - **gap check** | deny |
+| 14 | PowerShell `Remove-Item` deletion (Windows-verb regression guard) | deny |
 
 ## What to capture per probe
 
@@ -79,12 +79,13 @@ Run `python3 run_probe.py list` for the canonical, always-current checklist
 - Whether the archive store got a pre-image when a file was modified.
 - For probe 4: whether the second secret read re-prompts.
 
-## Known gaps
+## Closed gaps
 
-- **Probe 14 (`Remove-Item`)**: the engine's destruction rules match POSIX `rm`,
-  `rmdir`, etc., but **not** PowerShell/cmd deletion verbs (`Remove-Item`, `del`,
-  `erase`, `rd`). On Windows hosts (notably Codex/Cowork running PowerShell) an
-  agent can delete files with `Remove-Item -Recurse -Force` and the guardrails
-  currently DEFER (pass it through). Until the engine learns these verbs, this
-  probe is expected to surface as `needs-review`. Tracked as a fix to
-  `plugin/scripts/core/shellparse.py` + `engine.py`.
+- **Probe 14 (`Remove-Item`)** - FIXED. The engine's destruction rules once
+  matched only POSIX `rm`/`rmdir`/`unlink`, so on a Windows host (Codex/Cowork
+  on PowerShell) an agent could delete files with `Remove-Item -Recurse -Force`,
+  `del`, `erase`, or `rd` and the guardrails would DEFER (pass it through). The
+  engine now recognizes these verbs (`engine.py` `_DELETE_VERBS`) and denies
+  them with the same `agw archive` redirect as `rm`, while still allowing
+  regenerable-dir cleanup (e.g. `Remove-Item -Recurse -Force node_modules`).
+  Probe 14 now expects `deny` and stands as the regression guard.

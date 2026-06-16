@@ -115,6 +115,18 @@ _SQL_DELETE = re.compile(r"\bDELETE\s+FROM\b(?![\s\S]*\bWHERE\b)", re.IGNORECASE
 
 _MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate"}
 
+# File/dir deletion verbs across shells. `name` is the lowered argv0 basename,
+# so PowerShell `Remove-Item` arrives as "remove-item" and its aliases/cmd
+# builtins (del, erase, rd, ri) as themselves. Without these a Windows host
+# (Cowork/Codex on PowerShell) could delete files via `Remove-Item -Recurse
+# -Force` and the engine would never see a destructive verb.
+_DELETE_VERBS = {"rm", "rmdir", "unlink",          # POSIX
+                 "remove-item", "ri", "del", "erase", "rd"}  # PowerShell / cmd
+_SECURE_WIPE_VERBS = {"shred"}  # secure-wipe: always deny, even on regenerables
+# General removers that honour the regenerable-dir allowance (the dir-only or
+# secure-wipe verbs do not — they always deny).
+_REGEN_OK_VERBS = {"rm", "remove-item", "ri", "del", "erase"}
+
 # Regenerable build/dependency dirs: deleting them is routine dev work and
 # archiving them would copy gigabytes of reproducible junk. rm of these is
 # allowed (item: don't make the backup plan absurd). Company-extensible.
@@ -466,12 +478,13 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         return Decision(ASK, f"unknown agw verb '{verb}'", "builtin:agw-unknown")
 
     # ---- built-in semantic deny table ----
-    if name in ("rm", "rmdir", "shred", "unlink"):
+    if name in _DELETE_VERBS or name in _SECURE_WIPE_VERBS:
         # Regenerable build/dependency dirs are routine to delete and pointless
-        # (and huge) to archive — allow rm of them when every path operand is
-        # regenerable. shred still denies (it's about secure-wipe, not cleanup).
+        # (and huge) to archive — allow deletion when every path operand is
+        # regenerable. Only the general removers get this; dir-only verbs
+        # (rmdir/rd/unlink) and shred (secure-wipe, not cleanup) always deny.
         regen = cfg.get("regenerable")
-        if name == "rm" and regen:
+        if name in _REGEN_OK_VERBS and regen:
             ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
             if ops and all(_is_regenerable(o, regen) for o in ops):
                 return Decision(ALLOW, "", "builtin:rm-regenerable")
