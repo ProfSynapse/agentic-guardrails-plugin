@@ -174,6 +174,30 @@ Observe:
   it as a normal editable local file.
 - If it behaves like a normal file instead, record the platform and exact file metadata.
 
+### 11. Clean ask — the guardrail's own dialog surfaces in Cowork
+
+Prompt:
+
+```text
+Summarize notes/partner-brief.md.
+```
+
+Observe:
+
+- This should resolve to **ask** — and crucially, the prompt you see should be the
+  *guardrail's* permission dialog, with the reason "…contains a confidentiality
+  marking…", not the Cowork platform's "protected location / work on a copy" block.
+- Why this probe exists: probes 4, 5, and 10 all carry a path or name signal
+  (`secrets/.env`, the `confidential/` folder, a binary `.xlsx`) that Cowork's own
+  file-access layer catches *before* the plugin's `ask` can fire, so they never
+  demonstrate the guardrail's dialog. This file lives in `notes/` — the same folder
+  probe 1 edits without any platform block — and asks purely because of a phrase in
+  its **content**. It is the one probe that isolates the plugin's `ask` path.
+- Approve it once, then read it again: the second read should be suppressed by
+  session memory (same loop as probe 4), confirming the approve→remember cycle.
+- If Cowork pre-empts even this neutral file, record it — that means the platform
+  content-scans file bodies too, and we need a different isolation strategy.
+
 ## What to capture
 
 - Whether the action was allowed, asked, denied, or silently proceeded in observe mode.
@@ -195,10 +219,3 @@ python3 run_probe.py tail --lines 8
 python3 run_probe.py record 4 --observed ask --ui-reason "asked again on second read" --reprompt yes
 python3 run_probe.py summary
 ```
-
-## Known review target
-
-The current repo has a likely wiring gap between `hooks/hooks.json` and
-`scripts/claude/posttooluse.py`: the adapter supports recording approvals for
-sensitive reads, but the configured PostToolUse matcher does not include `Read`.
-This lab is designed to verify that behavior in a real Claude/Cowork session.

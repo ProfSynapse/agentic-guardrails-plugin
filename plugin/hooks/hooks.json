@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|Read|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGW_PY=\"$(command -v python3 || command -v python || command -v py || echo python3)\"; exec \"$AGW_PY\" -c \"import os,sys,glob,runpy,json; ev=sys.argv[1]; C=os.path.expanduser('~/.claude/plugins/cache'); H=os.path.expanduser('~'); W=os.getcwd(); R=os.environ.get('CLAUDE_PLUGIN_ROOT') or ''; G=[C+'/*/agentic-guardrails*',C+'/*/agentic-guardrails*/*',W+'/.remote-plugins/plugin_*',W+'/*/.remote-plugins/plugin_*',W+'/../.remote-plugins/plugin_*',W+'/../../.remote-plugins/plugin_*',H+'/.remote-plugins/plugin_*',H+'/*/.remote-plugins/plugin_*',H+'/*/*/.remote-plugins/plugin_*',H+'/*/*/rpm/plugin_*',H+'/*/*/*/rpm/plugin_*']; cands=[R]+[c for g in G for c in glob.glob(g)]+[v for v in os.environ.values() if v and 'plugin' in v.lower()]; root=next((c for c in cands if c and os.path.isfile(os.path.join(c,'scripts','claude','_dispatch.py')) and os.path.isfile(os.path.join(c,'scripts','claude',ev+'.py'))),None); sys.argv=[ev,ev]; runpy.run_path(os.path.join(root,'scripts','claude','_dispatch.py'),run_name='__main__') if root else (ev=='pretooluse' and (sys.stderr.write('agentic-guardrails: cannot locate scripts; failing closed\\n'),json.dump({'hookSpecificOutput':{'hookEventName':'PreToolUse','permissionDecision':'ask','permissionDecisionReason':'agentic-guardrails could not locate its scripts; failing closed. Review this operation manually.'}},sys.stdout)))\" pretooluse",
+            "timeout": 15,
+            "statusMessage": "guardrails check"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGW_PY=\"$(command -v python3 || command -v python || command -v py || echo python3)\"; exec \"$AGW_PY\" -c \"import os,sys,glob,runpy,json; ev=sys.argv[1]; C=os.path.expanduser('~/.claude/plugins/cache'); H=os.path.expanduser('~'); W=os.getcwd(); R=os.environ.get('CLAUDE_PLUGIN_ROOT') or ''; G=[C+'/*/agentic-guardrails*',C+'/*/agentic-guardrails*/*',W+'/.remote-plugins/plugin_*',W+'/*/.remote-plugins/plugin_*',W+'/../.remote-plugins/plugin_*',W+'/../../.remote-plugins/plugin_*',H+'/.remote-plugins/plugin_*',H+'/*/.remote-plugins/plugin_*',H+'/*/*/.remote-plugins/plugin_*',H+'/*/*/rpm/plugin_*',H+'/*/*/*/rpm/plugin_*']; cands=[R]+[c for g in G for c in glob.glob(g)]+[v for v in os.environ.values() if v and 'plugin' in v.lower()]; root=next((c for c in cands if c and os.path.isfile(os.path.join(c,'scripts','claude','_dispatch.py')) and os.path.isfile(os.path.join(c,'scripts','claude',ev+'.py'))),None); sys.argv=[ev,ev]; runpy.run_path(os.path.join(root,'scripts','claude','_dispatch.py'),run_name='__main__') if root else None\" posttooluse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGW_PY=\"$(command -v python3 || command -v python || command -v py || echo python3)\"; exec \"$AGW_PY\" -c \"import os,sys,glob,runpy,json; ev=sys.argv[1]; C=os.path.expanduser('~/.claude/plugins/cache'); H=os.path.expanduser('~'); W=os.getcwd(); R=os.environ.get('CLAUDE_PLUGIN_ROOT') or ''; G=[C+'/*/agentic-guardrails*',C+'/*/agentic-guardrails*/*',W+'/.remote-plugins/plugin_*',W+'/*/.remote-plugins/plugin_*',W+'/../.remote-plugins/plugin_*',W+'/../../.remote-plugins/plugin_*',H+'/.remote-plugins/plugin_*',H+'/*/.remote-plugins/plugin_*',H+'/*/*/.remote-plugins/plugin_*',H+'/*/*/rpm/plugin_*',H+'/*/*/*/rpm/plugin_*']; cands=[R]+[c for g in G for c in glob.glob(g)]+[v for v in os.environ.values() if v and 'plugin' in v.lower()]; root=next((c for c in cands if c and os.path.isfile(os.path.join(c,'scripts','claude','_dispatch.py')) and os.path.isfile(os.path.join(c,'scripts','claude',ev+'.py'))),None); sys.argv=[ev,ev]; runpy.run_path(os.path.join(root,'scripts','claude','_dispatch.py'),run_name='__main__') if root else None\" sessionstart",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

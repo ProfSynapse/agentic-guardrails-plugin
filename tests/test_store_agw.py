@@ -9,7 +9,7 @@ import pytest
 
 from core import store
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 AGW = os.path.join(REPO, "scripts", "agw", "agw.py")
 
 

@@ -1,0 +1,21 @@
+# Force LF on everything that gets executed or parsed as code.
+#
+# Why: a CRLF in a shebang (`#!/usr/bin/env bash\r`) makes the kernel look for
+# an interpreter literally named "bash\r" and fail with a cryptic
+# "no such file or directory". Python sources, shell scripts, the agw shim, and
+# the YAML/JSON policy files must stay LF regardless of the host's
+# core.autocrlf setting (Windows checkouts otherwise corrupt them).
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+bin/*   text eol=lf
+
+# Cowork lab fixtures are byte-exact test inputs: the product-plan.gdoc stub
+# deliberately keeps CRLF to mimic a Windows-authored Google Docs stub, and the
+# snapshot/restore probes assert on exact byte counts. Never normalize them.
+synthetic/cowork-safety-lab/workspace/** -text

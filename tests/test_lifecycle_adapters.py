@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "claude", "pretooluse.py")
 POST = os.path.join(REPO, "scripts", "claude", "posttooluse.py")
 START = os.path.join(REPO, "scripts", "claude", "sessionstart.py")

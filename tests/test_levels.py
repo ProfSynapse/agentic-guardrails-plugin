@@ -10,7 +10,7 @@ from core import engine, store
 from core.events import ALLOW, ASK, DEFER, DENY, EXEC, ToolEvent
 
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
 
 def _exec(command, cwd=None):

@@ -7,6 +7,9 @@ venv/
 # local agw store should never be committed (tests use AGW_HOME=tmp anyway)
 .agw/
 
+# build artifacts
+*.zip
+
 # editor/OS noise
 .idea/
 .vscode/
