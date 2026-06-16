@@ -1,0 +1,42 @@
+{
+  "_comment": "Codex-only hook definitions. Codex <= 0.130.x runs hooks via cmd.exe /C on Windows and $SHELL -lc on unix, and (unlike newer builds) does NOT honor a commandWindows field. So each command is a sh/cmd polyglot with NO double quotes: cmd.exe runs the leading `py %PLUGIN_ROOT%...` branch; POSIX sh skips the `py`/`%VAR%` branches (py absent or path mangled, both nonzero) and runs the `$PLUGIN_ROOT` branch. The codex dispatcher always exits 0 (decision via stdout), so the `||` chain stops at the first branch that launches python. Claude Code uses the separate hooks/hooks.json bash shim.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py pretooluse || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py pretooluse || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py pretooluse || python $PLUGIN_ROOT/scripts/codex/_dispatch.py pretooluse",
+            "timeout": 15,
+            "statusMessage": "guardrails check"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py posttooluse || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py posttooluse || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py posttooluse || python $PLUGIN_ROOT/scripts/codex/_dispatch.py posttooluse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py sessionstart || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py sessionstart || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py sessionstart || python $PLUGIN_ROOT/scripts/codex/_dispatch.py sessionstart",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
