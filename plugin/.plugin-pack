@@ -8,5 +8,8 @@ commands
 skills
 bin
 enterprise
+.codex-plugin
+codex-prompts
 README.md
 LICENSE
+CODEX.md

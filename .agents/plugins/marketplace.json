@@ -1,0 +1,25 @@
+{
+  "name": "agentic-guardrails",
+  "interface": {
+    "displayName": "Agentic Guardrails"
+  },
+  "plugins": [
+    {
+      "name": "agentic-guardrails",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/ProfSynapse/agentic-guardrails-plugin.git",
+        "path": "./plugin",
+        "ref": "main"
+      },
+      "interface": {
+        "displayName": "Agentic Guardrails"
+      },
+      "category": "Productivity",
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      }
+    }
+  ]
+}
