@@ -367,6 +367,13 @@ def _is_protected(path: str, policy: Policy) -> bool:
 # --- exec ---------------------------------------------------------------------
 
 def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) -> Decision:
+    # A recognized MCP shell tool whose command we couldn't read from the tool
+    # input must fail closed — never let an opaque shell call through as a
+    # silent allow (that was the MCP-shell bypass).
+    if event.tool.startswith("mcp__") and not event.command.strip():
+        return Decision(ASK, "An MCP shell tool was invoked but its command could not be "
+                             "read from the tool input — approve only if you know what it "
+                             "runs.", "builtin:mcp-shell-opaque")
     try:
         parsed = extract_commands(event.command)
     except ParseUncertain as exc:
@@ -699,6 +706,30 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
 
 # --- mcp ----------------------------------------------------------------------
 
+# Destructive / removal verbs that may appear ANYWHERE in a connector tool's
+# name. `allow_cowork_file_delete` and `bulk_purge_v2` must be caught as
+# readily as `delete_file`, so we tokenize the name rather than prefix-match it
+# (a prefix check let `allow_cowork_file_delete` through because it starts with
+# "allow", not "delete").
+_MCP_DESTROY_VERBS = {"delete", "destroy", "purge", "trash", "erase", "wipe",
+                      "shred", "rm", "rmdir", "truncate", "drop"}
+_MCP_REMOVE_VERBS = {"remove", "unlink", "discard", "detach"}
+# Safe verbs that neutralize a destructive-sounding token, so read-only or
+# recovery tools aren't blocked: restore_from_trash, list_deleted_files,
+# undelete_item, get_trash.
+_MCP_SAFE_VERBS = {"restore", "undelete", "undo", "recover", "list", "get",
+                   "search", "find", "read", "view", "fetch", "describe", "count"}
+
+
+def _mcp_name_tokens(tool: str) -> set:
+    """Lowercase word tokens of a connector tool's short name, splitting on
+    both snake_case and camelCase: `allow_cowork_file_delete` -> {allow,
+    cowork, file, delete}; `deleteFileForever` -> {delete, file, forever}."""
+    short = tool.split("__")[-1]
+    short = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", short)
+    return {t for t in re.split(r"[^A-Za-z0-9]+", short.lower()) if t}
+
+
 def _eval_mcp(event: ToolEvent, policy: Policy) -> Decision:
     tool = event.tool
     verdicts = []
@@ -707,11 +738,14 @@ def _eval_mcp(event: ToolEvent, policy: Policy) -> Decision:
             verdicts.append(Decision(rule["action"], rule["reason"] or
                                      f"matched {rule['id']}", rule["id"]))
     if not verdicts:
-        short = tool.split("__")[-1].lower()
-        if short.startswith(("delete", "trash", "destroy", "purge")):
-            verdicts.append(Decision(DENY, "Connector delete/trash operations are blocked "
-                                           "(CRUA: archive instead).", "builtin:mcp-delete"))
-        elif short.startswith("remove"):
-            verdicts.append(Decision(ASK, "Connector remove operation — confirm intent.",
-                                     "builtin:mcp-remove"))
+        tokens = _mcp_name_tokens(tool)
+        safe = bool(tokens & _MCP_SAFE_VERBS)
+        if tokens & _MCP_DESTROY_VERBS and not safe:
+            verdicts.append(Decision(DENY, "This connector tool performs or enables a "
+                                           "delete/destroy operation, which is blocked "
+                                           "(CRUA: archive instead of deleting).",
+                                     "builtin:mcp-delete"))
+        elif tokens & _MCP_REMOVE_VERBS and not safe:
+            verdicts.append(Decision(ASK, "This connector tool performs a remove/unlink "
+                                          "operation — confirm intent.", "builtin:mcp-remove"))
     return worst(verdicts) if verdicts else Decision()

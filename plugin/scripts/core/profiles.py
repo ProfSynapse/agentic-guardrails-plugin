@@ -121,9 +121,17 @@ def _is_under(path: str, root: str) -> bool:
 def is_placeholder(path: str) -> bool:
     """Cloud-only placeholder detection.
 
-    POSIX/WSL: st_blocks == 0 with st_size > 0 (the signature from the
-    Cowork/OneDrive corruption issue #62140). Windows: RECALL_ON_DATA_ACCESS
-    or OFFLINE attributes. False for missing files."""
+    Authoritative OS signals (trusted on their own): Windows
+    RECALL_ON_DATA_ACCESS/OFFLINE attributes; macOS SF_DATALESS flag.
+
+    POSIX/WSL fallback: st_blocks == 0 with st_size > 0 (the signature from
+    the Cowork/OneDrive corruption issue #62140). This is an *inference*, not
+    an OS flag — it also fires on filesystems that don't report block
+    allocation normally (tmpfs, many FUSE/network mounts, some WSL DrvFs and
+    bind mounts), where ordinary files would be misread as placeholders. So
+    the bare st_blocks==0 signal is only trusted when the path is under a
+    detected cloud-sync profile; on plain local/git folders it is ignored.
+    False for missing files."""
     try:
         st = os.stat(path)
     except OSError:
@@ -142,7 +150,11 @@ def is_placeholder(path: str) -> bool:
         dataless = getattr(stat_mod, "SF_DATALESS", 0x40000000)
         if getattr(st, "st_flags", 0) & dataless:
             return True
-    return blocks == 0
+    if blocks != 0:
+        return False
+    # Corroborate the st_blocks==0 inference with a cloud-sync profile so odd
+    # filesystems (tmpfs/FUSE/DrvFs) don't trigger false positives.
+    return detect(path).sync_provider
 
 
 def is_gdoc_stub(path: str) -> bool:
