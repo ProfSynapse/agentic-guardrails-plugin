@@ -5,7 +5,7 @@ import os
 from core import engine
 from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, READ, WRITE, ToolEvent
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
 
 def _ev(kind, **kw):
@@ -64,29 +64,41 @@ def test_gdoc_stub_write_denied(policy, tmp_path):
     assert "stub" in d.reason or "pointer" in d.reason
 
 
-def test_placeholder_write_denied(policy, tmp_path):
-    # sparse file: st_blocks == 0, st_size > 0 — the cloud-placeholder signature
-    placeholder = tmp_path / "report.docx"
-    with open(placeholder, "wb") as f:
-        f.truncate(1024 * 1024)
-    st = os.stat(placeholder)
-    if st.st_blocks != 0:  # filesystem doesn't support sparse files
+def _sparse(path, size):
+    """Create a sparse file (st_blocks==0, st_size>0). Skips if unsupported."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.truncate(size)
+    if os.stat(path).st_blocks != 0:  # filesystem doesn't support sparse files
         import pytest
         pytest.skip("no sparse-file support on this filesystem")
+
+
+def test_placeholder_write_denied(policy, tmp_path):
+    # sparse file (st_blocks==0, st_size>0) UNDER a detected sync profile —
+    # the genuine cloud-placeholder signature.
+    placeholder = tmp_path / "Dropbox" / "report.docx"
+    _sparse(placeholder, 1024 * 1024)
     d = engine.evaluate(_ev(WRITE, paths=[str(placeholder)], content="x"), policy, REPO)
     assert d.action == DENY
     assert "placeholder" in d.reason.lower() or "cloud-only" in d.reason.lower()
 
 
 def test_placeholder_read_asks(policy, tmp_path):
-    placeholder = tmp_path / "data.xlsx"
-    with open(placeholder, "wb") as f:
-        f.truncate(512 * 1024)
-    if os.stat(placeholder).st_blocks != 0:
-        import pytest
-        pytest.skip("no sparse-file support")
+    placeholder = tmp_path / "Dropbox" / "data.xlsx"
+    _sparse(placeholder, 512 * 1024)
     d = engine.evaluate(_ev(READ, tool="Read", paths=[str(placeholder)]), policy, REPO)
     assert d.action == ASK
+
+
+def test_sparse_file_on_local_is_not_placeholder(policy, tmp_path):
+    # Regression guard for the st_blocks==0 false-positive class (tmpfs/FUSE/
+    # DrvFs, the Cowork outputs mount): a sparse file on a plain local folder
+    # must NOT be treated as a cloud placeholder.
+    local = tmp_path / "report.docx"
+    _sparse(local, 1024 * 1024)
+    d = engine.evaluate(_ev(READ, tool="Read", paths=[str(local)]), policy, REPO)
+    assert "placeholder" not in (d.reason or "").lower()
 
 
 def test_shrink_guard(policy, tmp_path):

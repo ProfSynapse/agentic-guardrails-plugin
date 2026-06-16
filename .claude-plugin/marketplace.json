@@ -11,12 +11,8 @@
     {
       "name": "agentic-guardrails",
       "displayName": "Agentic Guardrails",
-      "version": "0.2.0",
-      "source": {
-        "source": "github",
-        "repo": "ProfSynapse/agentic-guardrails-plugin",
-        "ref": "v0.2.0"
-      },
+      "version": "0.2.1",
+      "source": "./plugin",
       "description": "Nothing is ever destroyed: deletion redirected to a reversible archive, pre-image snapshots on every write, checkout/publish workflow for Office documents, placeholder/stub protection in cloud-synced folders, and policy-driven command and content blocking.",
       "category": "security",
       "homepage": "https://github.com/ProfSynapse/agentic-guardrails-plugin",

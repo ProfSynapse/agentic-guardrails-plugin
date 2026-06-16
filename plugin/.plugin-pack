@@ -1,0 +1,12 @@
+# Allowlist of paths shipped in the installable plugin zip (used by the
+# plugin-packager skill's build_plugin.sh). One path per line; # comments ignored.
+# .claude-plugin/plugin.json is always included automatically (never marketplace.json).
+hooks
+scripts
+policies
+commands
+skills
+bin
+enterprise
+README.md
+LICENSE
