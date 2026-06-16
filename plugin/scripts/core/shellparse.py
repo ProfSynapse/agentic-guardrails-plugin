@@ -11,6 +11,8 @@ inside shell plumbing.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -22,6 +24,38 @@ MAX_DEPTH = 6
 # must name them.
 _TRANSPARENT = {"nohup", "nice", "stdbuf", "time", "command", "builtin", "env", "setsid"}
 _SHELLS = {"bash", "sh", "zsh", "ksh", "dash", "ash"}
+# Windows interpreters. Codex (and Cowork) on Windows route shell calls through
+# these, so a destructive command can hide inside `-Command`/`/c` like it hides
+# inside `bash -c`. We recurse their inner command line the same way.
+_PWSH = {"powershell", "pwsh"}
+_WIN_CMD = {"cmd"}
+
+# PowerShell parameter prefixes (it accepts any unambiguous abbreviation). We
+# only need the exec-surface ones: -Command, -EncodedCommand, -File, plus the
+# value-taking setup flags so we can skip them and their argument.
+_PWSH_COMMAND_RE = re.compile(r"c(o(m(m(a(n(d)?)?)?)?)?)?$", re.IGNORECASE)
+_PWSH_ENCODED_RE = re.compile(r"e(n(c(o(d(e(d(c(o(m(m(a(n(d)?)?)?)?)?)?)?)?)?)?)?)?)?$",
+                              re.IGNORECASE)
+_PWSH_FILE_RE = re.compile(r"f(i(l(e)?)?)?$", re.IGNORECASE)
+_PWSH_VALUE_FLAG_RE = re.compile(
+    r"(ex(e(c(u(t(i(o(n(p(o(l(i(c(y)?)?)?)?)?)?)?)?)?)?)?)?)?"
+    r"|version|inputformat|if|outputformat|of"
+    r"|windowstyle|configurationname|workingdirectory|cwd)$", re.IGNORECASE)
+
+
+def _decode_pwsh_encoded(token: str):
+    """Decode a PowerShell -EncodedCommand argument (base64 of UTF-16LE).
+    Returns the script text, or None if it does not decode."""
+    try:
+        raw = base64.b64decode(token, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    for enc in ("utf-16-le", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class ParseUncertain(Exception):
@@ -49,6 +83,10 @@ class SimpleCommand:
 class ParseResult:
     commands: list = field(default_factory=list)   # list[SimpleCommand]
     flags: set = field(default_factory=set)        # see FLAG_* below
+    # Inner command-line text recovered from wrappers we recursed (PowerShell
+    # -Command / -EncodedCommand, cmd /c). The engine scans these for
+    # PowerShell/.NET deletion and for secret content that argv parsing misses.
+    payloads: list = field(default_factory=list)
 
 FLAG_EVAL = "eval"                    # eval / source of dynamic strings
 FLAG_INDIRECT = "indirect-command"    # command name comes from a variable/substitution
@@ -171,14 +209,44 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
 
     head_base = toks[0].rsplit("/", 1)[-1].lower()
 
-    # command name supplied by variable or substitution output => indirection
+    # command name supplied by variable or substitution output => indirection.
+    # $_ / $PSItem are the pipeline current-object (e.g. `| % { $_.Name }`), not
+    # a command name from a variable, so property access on them is not
+    # indirection — a destructive `$_.Delete()` is caught by the content scan.
     if toks[0].startswith("$") or toks[0] == "SUBST_OUT":
-        result.flags.add(FLAG_INDIRECT)
+        if not re.match(r"\$(_|psitem)\b", toks[0], re.IGNORECASE):
+            result.flags.add(FLAG_INDIRECT)
         return [SimpleCommand(argv=toks)]
 
     if head_base == "eval" or (head_base == "source" and len(toks) > 1):
         result.flags.add(FLAG_EVAL)
         return [SimpleCommand(argv=toks)]
+
+    # PowerShell dynamic-eval / scriptblock invokers (iex, Invoke-Expression,
+    # icm, Invoke-Command): the real command hides in a string/scriptblock we
+    # can't tokenize, so treat like `eval` — reviewed, not silently run.
+    if head_base in ("iex", "invoke-expression", "icm", "invoke-command"):
+        result.flags.add(FLAG_EVAL)
+        return [SimpleCommand(argv=toks)]
+
+    # PowerShell block / pipeline invokers: the real command sits after a
+    # dot-source / ForEach / Where invoker (`. cmd`, `% cmd`, `foreach cmd`).
+    # argv0 would be the invoker, so the verb hides in argv[1] — drop it and
+    # recurse so a deletion buried behind it is still evaluated.
+    if head_base in (".", "%", "foreach", "foreach-object", "?", "where",
+                     "where-object") and len(toks) > 1:
+        return _analyze_segment(toks[1:], result, depth)
+
+    # PowerShell scriptblock `{ ... }` (e.g. after `&`, `%`, or a dot-source).
+    # shlex makes `{` the argv0, hiding the verb inside the braces — strip the
+    # braces and recurse the body.
+    if toks[0].startswith("{"):
+        inner = list(toks)
+        inner[0] = inner[0].lstrip("{")
+        inner[-1] = inner[-1].rstrip("}")
+        inner = [t for t in inner if t]
+        if inner and inner != toks:
+            return _analyze_segment(inner, result, depth)
 
     # bash -c "string" → recurse into the string
     if head_base in _SHELLS:
@@ -187,6 +255,57 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
                 inner = extract_commands(toks[i + 1], depth + 1)
                 result.flags.update(inner.flags)
                 return [SimpleCommand(argv=toks)] + inner.commands
+        return [SimpleCommand(argv=toks)]
+
+    # Windows interpreters. Strip a trailing .exe so 'cmd.exe'/'powershell.exe'
+    # match. A destructive command can hide in their inner command line exactly
+    # as it does in `bash -c`, so we recurse it and record the inner text.
+    wname = head_base[:-4] if head_base.endswith(".exe") else head_base
+
+    def _recurse_inner(inner_text: str):
+        if not inner_text.strip():
+            return [SimpleCommand(argv=toks)]
+        inner = extract_commands(inner_text, depth + 1)
+        result.flags.update(inner.flags)
+        result.payloads.append(inner_text)
+        result.payloads.extend(inner.payloads)
+        return [SimpleCommand(argv=toks)] + inner.commands
+
+    # cmd /c <command> / cmd /k <command> → the real command follows the switch
+    if wname in _WIN_CMD:
+        rest = toks[1:]
+        for i, tok in enumerate(rest):
+            if tok.lower() in ("/c", "/k", "/r"):
+                return _recurse_inner(" ".join(rest[i + 1:]))
+        return [SimpleCommand(argv=toks)]
+
+    # powershell / pwsh -Command "..." / -EncodedCommand <b64> / positional
+    if wname in _PWSH:
+        rest = toks[1:]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            stripped = tok[1:] if tok.startswith("-") else ""
+            if stripped and _PWSH_ENCODED_RE.fullmatch(stripped):
+                # -EncodedCommand: base64 of UTF-16LE. Undecodable => fail closed.
+                if i + 1 < len(rest):
+                    decoded = _decode_pwsh_encoded(rest[i + 1])
+                    if decoded is None:
+                        raise ParseUncertain("undecodable PowerShell -EncodedCommand")
+                    return _recurse_inner(decoded)
+                break
+            if stripped and _PWSH_COMMAND_RE.fullmatch(stripped):
+                # -Command consumes the remainder of the line as the script.
+                return _recurse_inner(" ".join(rest[i + 1:]))
+            if stripped and _PWSH_FILE_RE.fullmatch(stripped):
+                break  # -File <script>: a path we cannot inspect
+            if stripped and _PWSH_VALUE_FLAG_RE.fullmatch(stripped):
+                i += 2  # skip the flag and its value
+                continue
+            if not tok.startswith("-"):
+                # first positional arg is the implicit -Command body
+                return _recurse_inner(" ".join(rest[i:]))
+            i += 1  # an unrecognized boolean switch (-NoProfile, ...)
         return [SimpleCommand(argv=toks)]
 
     # xargs [flags] CMD ... → the real command is what xargs runs

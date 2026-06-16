@@ -110,6 +110,32 @@ _INTERPRETER_DESTRUCTIVE = re.compile(
     r"|\b(rmSync|rmdirSync|unlinkSync|rm_rf|rm_r)\b|\.rm\s*\(|FileUtils\.(rm|remove)"
     r"|unlink\s", re.IGNORECASE)
 
+# PowerShell/.NET deletion and truncation forms that do not tokenize to a clean
+# argv0 verb (so the verb table can't see them): the [IO.File]::Delete() family
+# and the Clear-* content-wiping cmdlets. Verb-first forms (Remove-Item, del,
+# rd, ...) are intentionally NOT here — the verb table handles those, with the
+# regenerable-dir allowance this scan would clobber. Scanned over the raw
+# command and over any decoded -EncodedCommand / inner -Command payloads.
+_PWSH_DESTRUCTIVE = re.compile(
+    # static [IO.File]::Delete(...) family
+    r"\[\s*(?:system\.)?io\.(?:file|directory|fileinfo|directoryinfo)\s*\]\s*::\s*delete"
+    # instance .Delete(...) on any receiver: (Get-Item x).Delete(), $_.Delete(), $f.Delete()
+    r"|[)\]\w$]\s*\.\s*delete\s*\("
+    # parens-less method invocation: `... | % Delete`, `ForEach-Object Delete`
+    r"|(?:%|foreach(?:-object)?)\s+delete\b"
+    # .MoveTo(NUL)/$null — relocating a file into a null sink destroys it
+    r"|\.\s*moveto\s*\(\s*['\"]?(?:nul|\$null)"
+    # content-wiping cmdlets
+    r"|(?:^|[\s;|&({@.'\"])(?:clear-content|clear-item|clear-recyclebin)\b",
+    re.IGNORECASE)
+
+# .NET in-place file writers — overwrite an existing file with no `>` token, so
+# redirect_targets misses them. Append* is excluded (no data loss). Used by
+# clobber_targets to pre-image the target, not to block.
+_WRITEALLTEXT_RE = re.compile(
+    r"\[\s*(?:system\.)?io\.file\s*\]\s*::\s*"
+    r"writeall(?:text|lines|bytes)\s*\(\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+
 _SQL_DENY = re.compile(r"\b(DROP\s+(TABLE|DATABASE|SCHEMA)|TRUNCATE\s+TABLE?)\b", re.IGNORECASE)
 _SQL_DELETE = re.compile(r"\bDELETE\s+FROM\b(?![\s\S]*\bWHERE\b)", re.IGNORECASE)
 
@@ -123,9 +149,23 @@ _MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "t
 _DELETE_VERBS = {"rm", "rmdir", "unlink",          # POSIX
                  "remove-item", "ri", "del", "erase", "rd"}  # PowerShell / cmd
 _SECURE_WIPE_VERBS = {"shred"}  # secure-wipe: always deny, even on regenerables
-# General removers that honour the regenerable-dir allowance (the dir-only or
-# secure-wipe verbs do not — they always deny).
-_REGEN_OK_VERBS = {"rm", "remove-item", "ri", "del", "erase"}
+# Removers that honour the regenerable-dir allowance: the general file/dir
+# removers plus the recursive dir removers (`rd /s` / `rmdir` is the Windows
+# equivalent of `rm -rf node_modules`). `unlink` (single named file) and
+# `shred` (secure-wipe) never get it — they always deny.
+_REGEN_OK_VERBS = {"rm", "remove-item", "ri", "del", "erase", "rd", "rmdir"}
+# cmd verbs whose operands can carry `/s /q`-style switches. Only these get the
+# cmd-switch filtering below — applying it to POSIX `rm` would wrongly drop a
+# real root path like `/e` from the operand list (and silently allow its
+# deletion when paired with a regenerable name).
+_CMD_SWITCH_VERBS = {"del", "erase", "rd", "rmdir"}
+# cmd-style switch (`/s`, `/q`, `/a:h`) — a flag, not a path operand.
+_CMD_SWITCH_RE = re.compile(r"/[A-Za-z](?::.*)?$")
+
+# Move/rename verbs (PowerShell + cmd). Relocating a file into a null sink
+# destroys it, so that specific shape is a hard deny.
+_MOVE_VERBS = {"move-item", "mi", "rename-item", "rni", "ren", "move"}
+_NULL_SINKS = {"nul", "nul:", "$null", "/dev/null"}
 
 # Regenerable build/dependency dirs: deleting them is routine dev work and
 # archiving them would copy gigabytes of reproducible junk. rm of these is
@@ -311,12 +351,24 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
     return decision
 
 
+def _named_arg(argv: list, flags: tuple) -> str:
+    """Value of the first `-Flag value` whose flag (lowered) is in `flags`."""
+    for i, a in enumerate(argv):
+        if a.lower() in flags and i + 1 < len(argv):
+            return argv[i + 1]
+    return ""
+
+
 def clobber_targets(command: str, cwd: str = "") -> list:
-    """Existing files a shell command would overwrite/truncate: `>` redirects
-    plus mv/cp/tee/dd/truncate/install destinations. Used by the adapter to
+    """Existing files a shell command would overwrite/truncate: `>` redirects,
+    POSIX mv/cp/tee/dd/truncate/install destinations, and the PowerShell/cmd
+    write forms (Set-Content/Out-File, Copy-Item/copy /y, Move-Item/move,
+    [IO.File]::WriteAllText) that carry no `>` token. Used by the adapter to
     pre-image-snapshot them before the command runs — the Bash equivalent of
-    the Write/Edit pre-image. Best-effort: never raises."""
+    the Write/Edit pre-image. Best-effort: never raises. Over-inclusion is
+    cheap (a redundant snapshot is deduped); a miss is silent data loss."""
     def _abs(tok):
+        tok = tok.strip("'\"")
         p = os.path.expanduser(tok)
         if not os.path.isabs(p):
             p = os.path.join(cwd or os.getcwd(), p)
@@ -336,6 +388,7 @@ def clobber_targets(command: str, cwd: str = "") -> list:
         for cmd in parsed.commands:
             ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
             name = cmd.name
+            argv_low = [a.lower() for a in cmd.argv]
             if name in ("mv", "cp", "install") and len(ops) >= 2:
                 dest = ops[-1]
                 dest_abs = _abs(dest)
@@ -352,6 +405,32 @@ def clobber_targets(command: str, cwd: str = "") -> list:
                         targets.add(_abs(a[3:]))
             elif name == "truncate":
                 targets.update(_abs(o) for o in ops)
+            # PowerShell in-place writers: Set-Content / Out-File (overwrite
+            # unless -Append). Target is -Path/-LiteralPath/-FilePath or the
+            # first positional.
+            elif name in ("set-content", "sc", "out-file") and "-append" not in argv_low:
+                tgt = _named_arg(cmd.argv[1:], ("-path", "-literalpath", "-filepath"))
+                if not tgt and ops:
+                    tgt = ops[0]
+                if tgt:
+                    targets.add(_abs(tgt))
+            # PowerShell Copy-Item/Move-Item: destination is -Destination or the
+            # last positional. cmd copy/move/ren: last non-switch operand.
+            elif name in ("copy-item", "cpi", "move-item", "mi"):
+                tgt = _named_arg(cmd.argv[1:], ("-destination", "-dest"))
+                if not tgt and len(ops) >= 2:
+                    tgt = ops[-1]
+                if tgt:
+                    targets.add(_abs(tgt))
+            elif name in ("copy", "move", "ren", "rename"):
+                pos = [a for a in cmd.argv[1:]
+                       if not a.startswith("-") and not _CMD_SWITCH_RE.fullmatch(a)]
+                if len(pos) >= 2:
+                    targets.add(_abs(pos[-1]))
+    # [IO.File]::WriteAllText("path", ...) in the raw line or a wrapper payload.
+    for text in [command] + (parsed.payloads if parsed else []):
+        for m in _WRITEALLTEXT_RE.finditer(text):
+            targets.add(_abs(m.group(1)))
     return [p for p in targets if os.path.isfile(p)]
 
 
@@ -418,6 +497,13 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
         decisions.append(Decision(DENY, "DELETE without WHERE is blocked.",
                                   "builtin:sql-delete"))
 
+    # PowerShell/.NET deletion that argv parsing can't reach (.NET methods,
+    # Clear-* cmdlets), in the raw line or in any decoded/inner wrapper payload.
+    if any(_PWSH_DESTRUCTIVE.search(t) for t in [raw] + parsed.payloads):
+        decisions.append(Decision(DENY, "PowerShell/.NET file deletion or content "
+                                        "wiping is blocked. " + ARCHIVE_REDIRECT,
+                                  "builtin:pwsh-delete"))
+
     # credential files anywhere in the command: ask; with a network tool in the
     # same command line, that's the exfiltration shape: deny. Tokens directly
     # after -i are identity-file *usage* (ssh -i key host), not access.
@@ -450,7 +536,11 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
 
     # content rules also see payloads the command would write (heredocs, echo)
+    # and the inner text of any wrapper we recursed (so secrets smuggled through
+    # a -EncodedCommand / cmd /c string are scanned, not just the argv).
     for payload in extract_payloads(event.command):
+        decisions.append(_snippet_check(payload, "", policy))
+    for payload in parsed.payloads:
         decisions.append(_snippet_check(payload, "", policy))
 
     return worst(decisions)
@@ -485,10 +575,16 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         # (rmdir/rd/unlink) and shred (secure-wipe, not cleanup) always deny.
         regen = cfg.get("regenerable")
         if name in _REGEN_OK_VERBS and regen:
-            ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
+            ops = [a for a in cmd.argv[1:]
+                   if not a.startswith("-")
+                   and not (name in _CMD_SWITCH_VERBS and _CMD_SWITCH_RE.fullmatch(a))]
             if ops and all(_is_regenerable(o, regen) for o in ops):
                 return Decision(ALLOW, "", "builtin:rm-regenerable")
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:rm")
+    if name in _MOVE_VERBS and any(
+            a.lower().strip("'\"") in _NULL_SINKS for a in cmd.argv[1:]):
+        return Decision(DENY, "Moving or renaming a file into a null sink (NUL/$null) "
+                              "destroys it. " + ARCHIVE_REDIRECT, "builtin:move-null")
     if name == "find" and ("-delete" in cmd.argv):
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:find-delete")
     if name == "dd" and any(a.startswith("of=/dev/") for a in cmd.argv):

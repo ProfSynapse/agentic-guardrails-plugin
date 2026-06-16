@@ -89,3 +89,21 @@ Run `python3 run_probe.py list` for the canonical, always-current checklist
   them with the same `agw archive` redirect as `rm`, while still allowing
   regenerable-dir cleanup (e.g. `Remove-Item -Recurse -Force node_modules`).
   Probe 14 now expects `deny` and stands as the regression guard.
+  The hardening also covers wrapper/obfuscation forms: `powershell -Command`,
+  `-EncodedCommand` (base64), `cmd /c`, `.NET` `[IO.File]::Delete` and instance
+  `.Delete()`, the `ForEach-Object { $_.Delete() }` idiom, scriptblock and
+  dot-source nesting, and `Move-Item ... NUL`. In-place overwrites
+  (`Set-Content`, `Out-File`, `copy /y`, `Copy-Item -Force`,
+  `[IO.File]::WriteAllText`) are pre-imaged so they stay recoverable, while
+  appends are left untouched.
+
+## Known limitations
+
+- **Command indirection** (`& $var x`, `& (Get-Command rm) x`): when a verb is
+  hidden behind a variable or command lookup the parser can't resolve, the
+  variable form asks (indirection) but the parenthesized-expression form
+  currently passes. This is the generic obfuscation class, not a visible
+  deletion; the OS sandbox remains the boundary.
+- **`.MoveTo("dest")` / `[IO.File]::Move` to a non-null path**: treated as a
+  relocation (the file persists under the new name), mirroring how POSIX `mv`
+  does not pre-image its source.
