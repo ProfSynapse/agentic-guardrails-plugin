@@ -34,6 +34,36 @@ Requires Python 3.9+ as `python3`. Optional: `pandoc` (docx↔markdown) and
 are checked out in plain-copy mode. Fleet rollout: see
 [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md).
 
+### Installing in Claude Cowork
+
+Cowork has no `/plugin` command — installs are UI-driven:
+**Customize → Plugins → Create plugin → Add marketplace**, then enter the repo
+(`ProfSynapse/agentic-guardrails-plugin`, or the full GitHub URL if the
+shorthand is rejected) and install **Agentic Guardrails** from the catalog.
+
+## Troubleshooting
+
+**Cowork still shows an old version after I pushed an update.** Cowork caches
+the marketplace catalog in its **backend, keyed to your account** — not in a
+local file. So the stale version follows you to other computers, and clearing
+local folders or re-pushing the repo won't move it. Two things are required:
+
+1. The repo's default branch must carry a **new `version`** (in both
+   `.claude-plugin/marketplace.json` and the plugin manifest). If the version
+   string doesn't change, clients keep the cached copy.
+2. **Remove the marketplace entry itself, then re-add it** — uninstalling the
+   *plugin* is not enough; the catalog stays pinned at the old version. The
+   remove control is buried:
+   **Customize → Plugins → Browse plugins → Personal tab → the plugin's tab →
+   the three-dots menu *on the tab itself* → Remove.** Then re-add the
+   marketplace (see above). The re-add re-fetches `marketplace.json` from the
+   default branch.
+
+If it still shows the old version after a full marketplace remove + re-add,
+that's a sticky server-side cache TTL on Cowork's side — wait it out or use the
+UI's refresh/update action; nothing in the repo or your local folders will
+change it.
+
 ## What's inside
 
 | Piece | Purpose |
