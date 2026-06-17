@@ -69,11 +69,16 @@ class SimpleCommand:
 
     @property
     def name(self) -> str:
-        """Basename of argv[0], lowered — '/bin/RM' -> 'rm'."""
+        """Basename of argv[0], lowered, with a Windows `.exe` suffix dropped:
+        '/bin/RM' -> 'rm', r'C:\\bin\\curl.exe' -> 'curl'. Stripping the suffix
+        and splitting on both separators means the POSIX-named command tables
+        match what a Windows host actually runs (curl.exe, python.exe)."""
         if not self.argv:
             return ""
-        head = self.argv[0]
-        return head.rsplit("/", 1)[-1].lower()
+        head = self.argv[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if head.endswith(".exe"):
+            head = head[:-4]
+        return head
 
     def joined(self) -> str:
         return " ".join(self.argv)
@@ -99,6 +104,41 @@ _DOWNLOADERS = {"curl", "wget"}
 
 _SUBST_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\1", re.DOTALL)
+
+# A backslash that precedes a path-like character. shlex(posix=True) treats `\`
+# as an escape, so an unquoted Windows path like `secrets\.env` tokenizes to
+# `secrets.env` — separator and leading-dot basename vanish, defeating
+# secret/placeholder/content detection. Codex and Cowork on Windows emit exactly
+# these (PowerShell `Get-Content secrets\.env`). Such a backslash is a Windows
+# separator, not a POSIX metachar-escape, so we double it: shlex then yields one
+# literal backslash and detection sees the real path. POSIX escapes of shell
+# metacharacters (`\ `, `\"`, `\;`, `\*`) are untouched, as are single-quoted
+# spans (no escaping happens there, so doubling would inject a real backslash).
+_WIN_PATH_CHAR = re.compile(r"[A-Za-z0-9._~-]")
+
+
+def _double_winpath_backslashes(s: str) -> str:
+    out, in_single, in_double = [], False, False
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif c == "\\" and not in_single and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "\\":            # an explicit escaped backslash: pass through
+                out.append("\\\\")
+                i += 2
+                continue
+            if _WIN_PATH_CHAR.match(nxt):  # Windows separator: double so shlex keeps it
+                out.append("\\\\")
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 # Truncating redirects (`>`, `>|`, fd-prefixed `1>`/`&>`) and their target.
 # Deliberately NOT `>>` (append: no data loss). Best-effort, for snapshotting
@@ -143,6 +183,9 @@ def extract_commands(command: str, depth: int = 0) -> ParseResult:
     work = _SUBST_RE.sub(_sub, work)
     if "$(" in work or "`" in work:
         raise ParseUncertain("unbalanced command substitution")
+
+    # Preserve Windows path separators so shlex doesn't strip them as escapes.
+    work = _double_winpath_backslashes(work)
 
     try:
         lex = shlex.shlex(work, posix=True, punctuation_chars=";|&()<>")

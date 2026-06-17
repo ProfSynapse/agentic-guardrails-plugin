@@ -51,9 +51,19 @@ _SECRET_NAMES = {"credentials", "credentials.json", "service_account.json",
 _SECRET_DIRS = {".ssh", ".aws", ".azure", ".kube", "gcloud"}
 _NOT_SECRET_SUFFIX = re.compile(r"\.(?:example|sample|template|dist|pub)$", re.IGNORECASE)
 
+# Network tools. The PowerShell web cmdlets/aliases are included because a
+# Windows host (Codex/Cowork on PowerShell) reaches the net through them, not
+# curl; `curl.exe`/`wget.exe` normalize to curl/wget via the .exe strip in
+# SimpleCommand.name. Without these the credential-exfil shape goes undetected.
 _NETWORK_CMDS = {"curl", "wget", "nc", "ncat", "netcat", "scp", "sftp", "rsync",
-                 "ssh", "ftp", "telnet", "socat"}
-_READER_CMDS = {"cat", "head", "tail", "less", "more", "bat", "strings"}
+                 "ssh", "ftp", "telnet", "socat",
+                 "invoke-webrequest", "iwr", "invoke-restmethod", "irm",
+                 "start-bitstransfer", "bitsadmin"}
+# Plain file readers. PowerShell's Get-Content and its aliases (gc, type) read
+# file contents exactly like cat, so the content-prescan must recognize them or
+# a Windows host reads secrets/confidential files with no prompt.
+_READER_CMDS = {"cat", "head", "tail", "less", "more", "bat", "strings",
+                "get-content", "gc", "type"}
 
 _HUNT_RE = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token|credential)")
 
@@ -70,6 +80,11 @@ _PRESCAN_MARKERS = (
         r"(?m)^[A-Za-z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_?KEY)[A-Za-z0-9_]*\s*=\s*\S{6,}")),
     ("a confidentiality marking", re.compile(
         r"(?i)\b(?:confidential|do not distribute|internal use only|trade secret)\b")),
+    ("embedded prompt-injection instructions", re.compile(
+        r"\b(?:ignore|disregard|forget)\b[^.\n]{0,40}"
+        r"\b(?:instructions|prompt|rules|guidance|directives)\b"
+        r"|\b(?:say|claim|pretend|tell them)\b[^.\n]{0,30}"
+        r"\b(?:already\s+)?approved\b", re.IGNORECASE)),
 )
 
 
@@ -180,20 +195,31 @@ _REGENERABLE = {"node_modules", "bower_components", ".venv", "venv", "__pycache_
 _ACCESS_ASK_RULES = {"builtin:secret-file", "builtin:content-prescan",
                      "builtin:credential-hunt", "builtin:placeholder-read"}
 
+# Subset of the above that `deny_secret_read` (strict level) upgrades ASK->DENY:
+# the credential-type reads. Placeholder reads are excluded (that guard is
+# about cloud-synced stub files, not secret exposure).
+_SECRET_READ_RULES = {"builtin:secret-file", "builtin:content-prescan",
+                      "builtin:credential-hunt"}
+
 # Named enforcement levels. Each expands to defaults for the individual knobs;
 # explicit settings/env knobs override. `standard` is the safe default.
 _LEVELS = {
     "strict":   {"enforcement": "enforce", "session_memory": False,
-                 "regenerable_rm": False, "relaxed_access": False},
+                 "regenerable_rm": False, "relaxed_access": False,
+                 "deny_secret_read": True},
     "standard": {"enforcement": "enforce", "session_memory": True,
-                 "regenerable_rm": True,  "relaxed_access": False},
+                 "regenerable_rm": True,  "relaxed_access": False,
+                 "deny_secret_read": False},
     "relaxed":  {"enforcement": "enforce", "session_memory": True,
-                 "regenerable_rm": True,  "relaxed_access": True},
+                 "regenerable_rm": True,  "relaxed_access": True,
+                 "deny_secret_read": False},
     "observe":  {"enforcement": "observe", "session_memory": True,
-                 "regenerable_rm": True,  "relaxed_access": False},
+                 "regenerable_rm": True,  "relaxed_access": False,
+                 "deny_secret_read": False},
 }
 _DEFAULT_LEVEL = "standard"
-_BOOL_KNOBS = {"session_memory", "regenerable_rm", "relaxed_access"}
+_BOOL_KNOBS = {"session_memory", "regenerable_rm", "relaxed_access",
+               "deny_secret_read"}
 
 
 def _as_bool(val):
@@ -218,7 +244,8 @@ def resolve_settings(policy: "Policy") -> dict:
         cfg["enforcement"] = str(s["enforcement"]).lower()
     # env overrides win last
     env_map = {"AGW_ENFORCEMENT": "enforcement", "AGW_SESSION_MEMORY": "session_memory",
-               "AGW_REGENERABLE_RM": "regenerable_rm", "AGW_RELAXED_ACCESS": "relaxed_access"}
+               "AGW_REGENERABLE_RM": "regenerable_rm", "AGW_RELAXED_ACCESS": "relaxed_access",
+               "AGW_DENY_SECRET_READ": "deny_secret_read"}
     for env, knob in env_map.items():
         if env in os.environ:
             cfg[knob] = (os.environ[env].lower() if knob == "enforcement"
@@ -337,6 +364,14 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
         decision = _eval_mcp(event, policy)
     else:
         decision = Decision()
+    # strict level: reading a credential-type file is a hard deny, not an ask.
+    # Symmetric to the relaxed downgrade below; applied first so deny wins if
+    # both knobs are somehow set. Scoped to the credential rules (not cloud
+    # placeholder reads, which are a different concern).
+    if cfg.get("deny_secret_read") and decision.action == ASK \
+            and decision.rule_id in _SECRET_READ_RULES:
+        decision = Decision(DENY, f"{decision.reason} [strict: secret reads are "
+                            f"blocked]", decision.rule_id, memo_key=decision.memo_key)
     # relaxed level: access-type asks (reading a sensitive resource) become
     # silent-with-audit. The hard denies (exfil, destruction) are untouched.
     if cfg.get("relaxed_access") and decision.action == ASK \
@@ -634,7 +669,7 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         for tok in cmd.argv[1:]:
             if tok.startswith("-") or checked >= 2:
                 continue
-            p = os.path.expanduser(tok)
+            p = os.path.expanduser(tok.replace("\\", os.sep))
             if not os.path.isabs(p):
                 p = os.path.join(event.cwd or os.getcwd(), p)
             if os.path.isfile(p):

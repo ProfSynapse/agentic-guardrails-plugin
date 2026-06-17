@@ -87,3 +87,24 @@ def test_heredoc_payload_extraction():
 
 def test_var_assignment_prefix():
     assert names("FOO=bar ls -la") == ["ls"]
+
+
+def test_windows_backslash_path_preserved():
+    # shlex(posix) would eat the backslash and collapse `secrets\.env` to
+    # `secrets.env`; the normalizer keeps it so path detection still works.
+    parsed = extract_commands(r"Get-Content secrets\.env")
+    assert parsed.commands[0].argv == ["Get-Content", r"secrets\.env"]
+    parsed = extract_commands(r"type confidential\board-notes.txt")
+    assert parsed.commands[0].argv[1] == r"confidential\board-notes.txt"
+
+
+def test_posix_backslash_escapes_still_work():
+    # A backslash before a shell metacharacter is a POSIX escape, not a Windows
+    # separator, and must keep its meaning.
+    assert extract_commands(r"cat my\ file.txt").commands[0].argv == ["cat", "my file.txt"]
+    assert "rm" in names("find . -name '*.tmp' -exec rm {} \\;")
+
+
+def test_exe_suffix_stripped_from_name():
+    assert names("curl.exe https://x") == ["curl"]
+    assert names(r"C:\tools\wget.exe url") == ["wget"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agw — the agent workspace CLI. The safe-verb vocabulary that replaces raw
+"""agw - the agent workspace CLI. The safe-verb vocabulary that replaces raw
 destructive primitives. Every verb is reversible by construction, dual-output
 (human line + JSON via --json), and self-logging.
 
@@ -14,8 +14,18 @@ import json
 import os
 import sys
 
+# Windows consoles default to a legacy code page (cp1252) that cannot encode
+# non-ASCII output; force UTF-8 so the CLI never dies with a UnicodeEncodeError
+# mid-operation (by print time it has often already mutated state - e.g. a
+# checkout that succeeded then crashed on its result line).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(_HERE))  # scripts/ → core importable
+sys.path.insert(0, os.path.dirname(_HERE))  # scripts/ -> core importable
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.dirname(_HERE))
 
 from core import profiles as prof          # noqa: E402
@@ -99,10 +109,10 @@ def cmd_checkout(args):
     if not os.path.isfile(src):
         _err("checkout takes a single file")
     if prof.is_gdoc_stub(src):
-        _err("this is a Google Docs pointer stub with no local content — export it "
+        _err("this is a Google Docs pointer stub with no local content - export it "
              "via the Drive connector instead (gdocs-bridge skill)")
     if prof.is_placeholder(src):
-        _err("file is a cloud-only placeholder — hydrate it first ('Always keep on "
+        _err("file is a cloud-only placeholder - hydrate it first ('Always keep on "
              "this device' / 'Available offline')")
     folder = os.path.dirname(src)
     ws = os.path.join(folder, "_workspace")
@@ -115,8 +125,8 @@ def cmd_checkout(args):
     store.state_save(state)
     store.oplog_append({"op": "checkout", "src": src, "working": result["dest"]})
     note = "" if result["mode"] == "converted" else \
-        " (no converter available — working copy is a plain copy)"
-    _out(args, f"checked out → {result['dest']}{note}",
+        " (no converter available - working copy is a plain copy)"
+    _out(args, f"checked out -> {result['dest']}{note}",
          {"src": src, **result})
 
 
@@ -124,7 +134,7 @@ def cmd_convert(args):
     src = _resolve(args.path)
     dest_dir = args.dest or os.path.join(os.path.dirname(src), "_workspace")
     result = converters.to_open_format(src, dest_dir)
-    _out(args, f"converted → {result['dest']} ({result['mode']})", result)
+    _out(args, f"converted -> {result['dest']} ({result['mode']})", result)
 
 
 def cmd_diff(args):
@@ -159,7 +169,7 @@ def cmd_publish(args):
     state = store.state_load()
     entry = state["checkouts"].get(src)
     if not entry:
-        _err(f"no checkout registered for {src} — use `agw checkout` first")
+        _err(f"no checkout registered for {src} - use `agw checkout` first")
     working = entry["working"]
     if not os.path.exists(working):
         _err(f"working copy missing: {working}")
@@ -169,7 +179,7 @@ def cmd_publish(args):
             _err("CONFLICT: the live file changed since checkout (someone else edited "
                  "it?). Review with `agw diff`, then publish --force to overwrite, or "
                  "re-checkout.", code=3)
-        # version-bump: current live file → archive
+        # version-bump: current live file -> archive
         store.archive_file(src, mode="copy", reason="pre-publish version bump",
                            actor="agw publish")
     profile = prof.detect(src)
@@ -188,16 +198,16 @@ def cmd_publish(args):
             except OSError:
                 _time.sleep(0.5 * (attempt + 1))
         else:
-            _err(f"could not replace {src} (sync client lock?) — converted output "
+            _err(f"could not replace {src} (sync client lock?) - converted output "
                  f"left at {tmp_out}")
     entry["base_sha256"] = store.file_sha256(src)
     store.state_save(state)
     store.oplog_append({"op": "publish", "src": src, "working": working,
                         "conversion": result["mode"]})
-    note = "" if result["mode"] == "converted" else " (copy mode — no format conversion)"
+    note = "" if result["mode"] == "converted" else " (copy mode - no format conversion)"
     versioning = f"; upstream: {profile.upstream_versioning}" if \
         profile.upstream_versioning else ""
-    _out(args, f"published {src}{note} — previous version archived"
+    _out(args, f"published {src}{note} - previous version archived"
                f" (restore with `agw restore {os.path.basename(src)}`){versioning}",
          {"src": src, "conversion": result["mode"]})
 
@@ -209,7 +219,7 @@ def cmd_archive(args):
         entry = store.archive_file(p, mode="move", reason=args.reason or "agw archive",
                                    actor="agw")
         results.append(entry)
-        print(f"archived {p} → {entry['dest']}")
+        print(f"archived {p} -> {entry['dest']}")
     if getattr(args, "json", False):
         print(json.dumps(results, default=str))
 
@@ -217,7 +227,7 @@ def cmd_archive(args):
 def cmd_move(args):
     src = _resolve(args.src)
     op = store.logged_move(src, os.path.abspath(os.path.expanduser(args.dest)))
-    _out(args, f"moved {op['src']} → {op['dest']} (undo with `agw undo`)", op)
+    _out(args, f"moved {op['src']} -> {op['dest']} (undo with `agw undo`)", op)
 
 
 def cmd_snapshot(args):
@@ -235,7 +245,7 @@ def cmd_snapshot(args):
              "preflight limit). Re-run with --force if you really want this.", code=3)
     entry = store.archive_file(folder, mode="copy", reason=args.reason or "agw snapshot",
                                actor="agw")
-    _out(args, f"snapshot of {folder} → {entry['dest']} ({total / 1e6:.1f} MB)", entry)
+    _out(args, f"snapshot of {folder} -> {entry['dest']} ({total / 1e6:.1f} MB)", entry)
 
 
 def cmd_restore(args):
@@ -262,7 +272,7 @@ def cmd_status(args):
         drift = ""
         if os.path.exists(src) and store.file_sha256(src) != entry["base_sha256"]:
             drift = "  [LIVE FILE CHANGED]"
-        lines.append(f"  {src} → {entry['working']}{drift}")
+        lines.append(f"  {src} -> {entry['working']}{drift}")
     _out(args, "\n".join(lines),
          {"archive_bytes": size, "checkouts": checkouts, "home": store.agw_home()})
 
@@ -297,7 +307,7 @@ def cmd_doctor(args):
     lines = [f"{'OK ' if v is not False and v is not None else 'MISSING '} {k}: {v}"
              for k, v in checks.items()]
     if not caps["pandoc"]:
-        lines.append("note: pandoc not found — Office checkouts degrade to copy-only "
+        lines.append("note: pandoc not found - Office checkouts degrade to copy-only "
                      "(archive safety unaffected). Install: https://pandoc.org")
     if budget and size > budget:
         lines.append(f"note: archive ({size} B) exceeds budget ({budget} B); "
@@ -355,7 +365,7 @@ def cmd_office(args):
             data = office.append_rows(path, args.sheet, rows, force_text=args.text)
             human = (f"appended {data['appended']} row(s) to {args.sheet} in {path} "
                      f"(pre-image archived as v{data['snapshot_version']})")
-        else:  # pragma: no cover — argparse restricts choices
+        else:  # pragma: no cover - argparse restricts choices
             _err(f"unknown office op: {args.op}")
     except office.MissingLibrary as exc:
         _err(str(exc), code=2)
@@ -378,7 +388,7 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable output")
     parser = argparse.ArgumentParser(prog="agw", parents=[common],
-                                     description="agent workspace — CRUA file safety")
+                                     description="agent workspace - CRUA file safety")
     sub = parser.add_subparsers(dest="verb", required=True)
 
     def add(name, fn, *specs, **kw):
