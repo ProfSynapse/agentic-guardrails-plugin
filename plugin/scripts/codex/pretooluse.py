@@ -135,28 +135,6 @@ def main():
             and store.session_approved(payload.get("session_id", ""), decision.memo_key):
         memoed = True
 
-    # Diagnostic (TEMPORARY - on by default this build, remove once confirmed):
-    # record how every event's paths resolve, even on DEFER. Content-prescan/
-    # snapshot are cwd-dependent, so when an expected ask "silently allows" this
-    # shows whether the cwd Codex sent let us find the file at all. Set
-    # AGW_DEBUG_CWD=0 to silence it.
-    if os.environ.get("AGW_DEBUG_CWD", "1") != "0":
-        probe = []
-        for ev in evlist:
-            raw = list(ev.paths) + ([ev.command] if ev.kind == events.EXEC else [])
-            probe.append({
-                "kind": ev.kind, "command": getattr(ev, "command", ""),
-                "paths": list(ev.paths),
-                "resolved": [{"raw": str(r), "abs": _abs(str(r), ev.cwd),
-                              "isfile": os.path.isfile(_abs(str(r), ev.cwd))}
-                             for r in ev.paths],
-            })
-        auditlog.log("pretooluse-debug", {
-            "tool": payload.get("tool_name", ""), "platform": "codex",
-            "payload_cwd": payload.get("cwd", ""), "process_cwd": os.getcwd(),
-            "decision": decision.action, "rule": decision.rule_id,
-            "events": probe, "session": payload.get("session_id", "")})
-
     # Audit the *real* engine decision (before observe/memory suppression).
     if decision.action != events.DEFER or decision.warnings:
         first_exec = next((e for e in evlist if e.kind == events.EXEC), None)
