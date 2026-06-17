@@ -135,11 +135,12 @@ def main():
             and store.session_approved(payload.get("session_id", ""), decision.memo_key):
         memoed = True
 
-    # Diagnostic (opt-in via AGW_DEBUG_CWD): record how every event's paths
-    # resolve, even on DEFER. Content-prescan/snapshot are cwd-dependent, so when
-    # an expected ask "silently allows" this shows whether the cwd Codex sent let
-    # us find the file at all. Remove once Codex cwd behavior is confirmed.
-    if os.environ.get("AGW_DEBUG_CWD"):
+    # Diagnostic (TEMPORARY - on by default this build, remove once confirmed):
+    # record how every event's paths resolve, even on DEFER. Content-prescan/
+    # snapshot are cwd-dependent, so when an expected ask "silently allows" this
+    # shows whether the cwd Codex sent let us find the file at all. Set
+    # AGW_DEBUG_CWD=0 to silence it.
+    if os.environ.get("AGW_DEBUG_CWD", "1") != "0":
         probe = []
         for ev in evlist:
             raw = list(ev.paths) + ([ev.command] if ev.kind == events.EXEC else [])
