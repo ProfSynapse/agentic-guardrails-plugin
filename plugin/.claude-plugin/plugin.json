@@ -1,7 +1,7 @@
 {
   "name": "agentic-guardrails",
-  "description": "Enterprise guardrails for agentic tools: CRUA (create/read/update/archive — never delete), agent workspace with checkout/publish, sync-aware safety for OneDrive/Drive/Dropbox folders, and policy-driven command/content blocking.",
-  "version": "0.2.6",
+  "description": "Enterprise guardrails for agentic tools: CRUA (create/read/update/archive - never delete), agent workspace with checkout/publish, sync-aware safety for OneDrive/Drive/Dropbox folders, and policy-driven command/content blocking.",
+  "version": "0.2.7",
   "author": {
     "name": "Synaptic Labs",
     "email": "joseph@synapticlabs.ai"
