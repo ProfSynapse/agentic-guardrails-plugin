@@ -141,11 +141,37 @@ def test_apply_patch_update_relative_path_snapshots_against_cwd(tmp_path):
                if not p.endswith(".jsonl"))
 
 
-def test_apply_patch_opaque_fails_to_ask():
-    # apply_patch invoked but the patch text is unreadable → fail closed to ask.
+def test_codex_ask_resolves_via_modal(monkeypatch, capsys):
+    # In-process: ASK is resolved by the native modal. Approve -> the tool runs
+    # (no deny emitted); deny/no-UI -> hard deny. Platform-independent because we
+    # stub the modal itself.
+    import io
+    from codex import pretooluse as ptu
+    payload = {"tool_name": "apply_patch", "tool_input": {"command": "???"},
+               "cwd": "/tmp", "session_id": "c1", "hook_event_name": "PreToolUse"}
+
+    monkeypatch.setattr(ptu, "_interactive_approve", lambda *a, **k: True)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main()
+    out = capsys.readouterr().out
+    data = json.loads(out) if out.strip() else {}
+    assert data.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+    monkeypatch.setattr(ptu, "_interactive_approve", lambda *a, **k: False)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main()
+    data = json.loads(capsys.readouterr().out)
+    assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_apply_patch_opaque_fails_closed_without_ui():
+    # apply_patch invoked but the patch text is unreadable -> engine ASK. Codex
+    # has no hook 'ask' prompt, so the adapter resolves ASK via a native modal;
+    # on a host with no approval UI (this CI box) that fails closed to a hard
+    # deny - never a silent allow.
     out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": "???"},
                     "cwd": "/tmp", "session_id": "c1"})
-    assert _decision(out) == "ask"
+    assert _decision(out) == "deny"
 
 
 def test_mcp_shell_exfil_through_patch_tool_still_evaluated():

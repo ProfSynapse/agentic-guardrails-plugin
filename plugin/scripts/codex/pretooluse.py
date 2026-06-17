@@ -34,6 +34,41 @@ FAIL_CLOSED = {
 from adapter_common import to_events  # noqa: E402
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
+# Codex has no hook-driven approval prompt (permissionDecision "ask" is parsed
+# but unsupported, so it silently proceeds). To realize an ASK we surface our
+# own native modal from the hook process and block on the user's choice. This
+# must finish inside the hook timeout (hooks-codex.json), so keep it under it.
+ASK_MODAL_TIMEOUT = int(os.environ.get("AGW_ASK_MODAL_TIMEOUT", 100))
+
+
+def _interactive_approve(title, message, timeout_s):
+    """Block on a native OS approval modal. Returns True (approve), False (deny),
+    or None (no UI available / error / timed out -> caller treats as deny).
+    Windows only for now; other platforms return None so the caller fails closed.
+    Runs the modal on a daemon thread so a no-response times out cleanly and the
+    orphaned dialog dies when the hook process exits."""
+    if os.name != "nt":
+        return None
+    import threading
+    out = {"v": None}
+
+    def _show():
+        try:
+            import ctypes
+            MB_YESNO, MB_ICONWARNING = 0x4, 0x30
+            MB_SETFOREGROUND, MB_TOPMOST, MB_SYSTEMMODAL = 0x10000, 0x40000, 0x1000
+            IDYES = 6
+            rv = ctypes.windll.user32.MessageBoxW(
+                0, str(message), str(title),
+                MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL)
+            out["v"] = (rv == IDYES)
+        except Exception:
+            out["v"] = None
+
+    t = threading.Thread(target=_show, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return out["v"]  # still None if the join timed out with no click
 
 
 def _abs(path, cwd):
@@ -160,6 +195,37 @@ def main():
                                     f"{decision.action.upper()} - {decision.reason}"},
                   sys.stdout)
         return
+
+    # Codex can't render a hook 'ask' prompt, so an emitted ASK would silently
+    # proceed. Resolve it ourselves: pop a blocking approval modal and turn the
+    # user's choice into allow (defer -> runs) or deny. No UI / timeout / error
+    # fails closed to deny.
+    if decision.action == events.ASK:
+        sid = payload.get("session_id", "")
+        approved = _interactive_approve(
+            "agentic-guardrails: approve this operation?",
+            (decision.reason or "This operation needs your approval.")
+            + "\n\nYes = allow it to run.   No = block it.",
+            ASK_MODAL_TIMEOUT)
+        outcome = ("approved" if approved else
+                   "denied" if approved is False else "no-ui-or-timeout")
+        auditlog.log("pretooluse-approval", {
+            "outcome": outcome, "rule": decision.rule_id, "reason": decision.reason,
+            "platform": "codex", "session": sid})
+        if approved:
+            if decision.memo_key and cfg.get("session_memory"):
+                try:
+                    store.session_approve(sid, decision.memo_key)
+                except Exception:
+                    pass
+            decision.action = events.DEFER  # approved -> let the tool run
+        else:
+            decision.action = events.DENY
+            if approved is None:
+                decision.reason = ((decision.reason + " | ") if decision.reason else "") + \
+                    ("No approval dialog was available (or it timed out), so this was "
+                     "blocked. Re-run in an interactive desktop session to approve, or "
+                     "perform the action deliberately via `agw`.")
 
     out = {}
     if decision.action in (events.ALLOW, events.ASK, events.DENY):

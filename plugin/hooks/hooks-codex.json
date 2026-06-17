@@ -8,7 +8,7 @@
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse",
             "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
-            "timeout": 15,
+            "timeout": 120,
             "statusMessage": "guardrails check"
           }
         ]
