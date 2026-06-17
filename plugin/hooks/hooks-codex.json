@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py pretooluse || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py pretooluse || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py pretooluse || python $PLUGIN_ROOT/scripts/codex/_dispatch.py pretooluse",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse",
+            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
             "timeout": 15,
             "statusMessage": "guardrails check"
           }
@@ -19,7 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py posttooluse || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py posttooluse || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py posttooluse || python $PLUGIN_ROOT/scripts/codex/_dispatch.py posttooluse",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse",
+            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" posttooluse",
             "timeout": 10
           }
         ]
@@ -31,7 +33,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "py %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py sessionstart || python %PLUGIN_ROOT%\\scripts\\codex\\_dispatch.py sessionstart || python3 $PLUGIN_ROOT/scripts/codex/_dispatch.py sessionstart || python $PLUGIN_ROOT/scripts/codex/_dispatch.py sessionstart",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart",
+            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" sessionstart",
             "timeout": 15
           }
         ]
