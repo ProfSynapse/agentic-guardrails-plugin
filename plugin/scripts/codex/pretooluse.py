@@ -36,6 +36,19 @@ from adapter_common import to_events  # noqa: E402
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 
 
+def _abs(path, cwd):
+    """Resolve a (possibly relative, possibly backslash) tool path to an absolute
+    path against the event's cwd. apply_patch carries paths relative to the
+    patch's working directory, so a bare os.path.isfile() would look in the hook
+    PROCESS's cwd and silently miss the file - no pre-image taken."""
+    if not path:
+        return path
+    p = os.path.expanduser(str(path).replace("\\", os.sep))
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    return p
+
+
 def _snapshot(targets, label, store):
     """Pre-image snapshot of files about to be clobbered. Returns
     (any_error, [too_big_basenames]). Files over the cap are skipped but
@@ -96,11 +109,11 @@ def main():
     targets = []
     for ev in evlist:
         if ev.kind in (events.WRITE, events.EDIT):
-            targets += list(ev.paths)
+            targets += [_abs(p, ev.cwd) for p in ev.paths]
         elif ev.kind == events.EXEC:
             targets += engine.clobber_targets(ev.command, ev.cwd)
         elif ev.extra.get("delete"):
-            targets += list(ev.paths)
+            targets += [_abs(p, ev.cwd) for p in ev.paths]
     targets = [t for t in dict.fromkeys(targets) if t]  # de-dupe, keep order
     label = payload.get("tool_name", "") or "modification"
     if targets and will_run:
@@ -122,6 +135,27 @@ def main():
             and store.session_approved(payload.get("session_id", ""), decision.memo_key):
         memoed = True
 
+    # Diagnostic (opt-in via AGW_DEBUG_CWD): record how every event's paths
+    # resolve, even on DEFER. Content-prescan/snapshot are cwd-dependent, so when
+    # an expected ask "silently allows" this shows whether the cwd Codex sent let
+    # us find the file at all. Remove once Codex cwd behavior is confirmed.
+    if os.environ.get("AGW_DEBUG_CWD"):
+        probe = []
+        for ev in evlist:
+            raw = list(ev.paths) + ([ev.command] if ev.kind == events.EXEC else [])
+            probe.append({
+                "kind": ev.kind, "command": getattr(ev, "command", ""),
+                "paths": list(ev.paths),
+                "resolved": [{"raw": str(r), "abs": _abs(str(r), ev.cwd),
+                              "isfile": os.path.isfile(_abs(str(r), ev.cwd))}
+                             for r in ev.paths],
+            })
+        auditlog.log("pretooluse-debug", {
+            "tool": payload.get("tool_name", ""), "platform": "codex",
+            "payload_cwd": payload.get("cwd", ""), "process_cwd": os.getcwd(),
+            "decision": decision.action, "rule": decision.rule_id,
+            "events": probe, "session": payload.get("session_id", "")})
+
     # Audit the *real* engine decision (before observe/memory suppression).
     if decision.action != events.DEFER or decision.warnings:
         first_exec = next((e for e in evlist if e.kind == events.EXEC), None)
@@ -132,7 +166,7 @@ def main():
             "reason": decision.reason,
             "command": first_exec.command if first_exec else "",
             "paths": all_paths, "level": cfg.get("level"), "observe": observe,
-            "platform": "codex",
+            "platform": "codex", "cwd": payload.get("cwd", ""),
             "suppressed": "memory" if memoed else ("observe" if observe and
                           decision.action in (events.ASK, events.DENY) else ""),
             "session": payload.get("session_id", "")})

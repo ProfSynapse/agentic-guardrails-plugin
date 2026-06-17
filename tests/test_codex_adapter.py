@@ -118,6 +118,29 @@ def test_apply_patch_update_snapshots_pre_image(tmp_path):
                if not p.endswith(".jsonl"))
 
 
+def test_apply_patch_update_relative_path_snapshots_against_cwd(tmp_path):
+    # Probe 13 regression: apply_patch carries paths RELATIVE to the patch cwd.
+    # The snapshot must resolve them against the event's cwd, not the hook
+    # process cwd, or no pre-image is taken and the original is lost on overwrite.
+    work = tmp_path / "workspace"
+    (work / "reports").mkdir(parents=True)
+    target = work / "reports" / "q3-summary.txt"
+    target.write_text("precious original")
+    home = tmp_path / "home"
+    patch = ("*** Begin Patch\n*** Update File: reports/q3-summary.txt\n"
+             "@@\n-precious original\n+rewritten\n*** End Patch\n")
+    out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch},
+                    "cwd": str(work), "session_id": "c1"},
+                   env_extra={"AGW_HOME": str(home)})
+    assert _decision(out) in ("defer", "allow")
+    archived = []
+    for dirpath, _dirs, files in os.walk(home / "archive"):
+        archived += [os.path.join(dirpath, f) for f in files if "q3-summary" in f]
+    assert archived, "pre-image snapshot missing for cwd-relative apply_patch path"
+    assert any(open(p).read() == "precious original" for p in archived
+               if not p.endswith(".jsonl"))
+
+
 def test_apply_patch_opaque_fails_to_ask():
     # apply_patch invoked but the patch text is unreadable → fail closed to ask.
     out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": "???"},
