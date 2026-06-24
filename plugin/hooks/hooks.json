@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch|mcp__.*",
+        "matcher": "Bash|PowerShell|Monitor|Write|Edit|NotebookEdit|Read|apply_patch|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -15,7 +15,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch",
+        "matcher": "Bash|PowerShell|Monitor|Write|Edit|NotebookEdit|Read|apply_patch",
         "hooks": [
           {
             "type": "command",

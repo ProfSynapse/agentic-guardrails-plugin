@@ -17,7 +17,15 @@ def to_event(payload):
     ti = payload.get("tool_input") or {}
     common = dict(cwd=payload.get("cwd", ""), session_id=payload.get("session_id", ""),
                   platform="claude", tool=tool)
-    if tool == "Bash":
+    if tool in ("Bash", "PowerShell", "Monitor"):
+        # Every host shell-exec tool must route through EXEC or it bypasses the
+        # guardrails entirely (no audit, no deny) — a tool-name matcher is an
+        # allowlist. `PowerShell` is the native Windows shell tool (rolls out
+        # when Git Bash is present); a bare `Remove-Item ...` arrives here with
+        # the same `command` field as Bash. `Monitor` runs background shell
+        # scripts and shares Bash's permission-rule format (`Bash(cmd *)` covers
+        # both), so its command field is `command` as well (inferred — confirm
+        # with a live Monitor probe).
         return events.ToolEvent(kind=events.EXEC, command=ti.get("command", ""), **common)
     if tool == "Write":
         return events.ToolEvent(kind=events.WRITE, paths=[ti.get("file_path", "")],

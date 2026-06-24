@@ -36,6 +36,35 @@ def test_hooks_config_runs_posttooluse_for_reads():
     assert "Read" in matcher.split("|"), "Read approvals are not persisted without this hook"
 
 
+def test_hooks_config_matches_shell_exec_tools():
+    # Every host shell-exec tool must be in the matchers or its commands run
+    # through an unmatched tool and the guardrails never fire (fail-open).
+    # PowerShell: native Windows shell tool (Git-Bash-present rollout).
+    # Monitor: runs background shell scripts, shares Bash's permission format.
+    hooks = json.loads(Path(REPO, "hooks", "hooks.json").read_text(encoding="utf-8"))
+    for ev in ("PreToolUse", "PostToolUse"):
+        matcher = hooks["hooks"][ev][0]["matcher"].split("|")
+        for tool in ("Bash", "PowerShell", "Monitor"):
+            assert tool in matcher, f"{ev} does not cover the {tool} shell-exec tool"
+
+
+def test_pretooluse_denies_bare_remove_item_via_shell_tools(tmp_path):
+    """Regression: a bare `Remove-Item <path>` arriving through a non-Bash shell
+    tool (PowerShell or Monitor, with tool_input.command) must be denied, not
+    fall through to OTHER. This is the exact fail-open observed on the Windows
+    desktop app where Remove-Item deleted a file with no audit entry."""
+    for tool in ("PowerShell", "Monitor"):
+        home = tmp_path / f"home-{tool}"
+        payload = {"tool_name": tool,
+                   "tool_input": {"command": "Remove-Item temp\\junk.log"},
+                   "cwd": str(tmp_path), "session_id": f"{tool}-1",
+                   "hook_event_name": "PreToolUse"}
+        out, dec = _decision(_run(PRE, payload, env_extra={"AGW_HOME": str(home)}))
+        assert dec == "deny", (tool, out)
+        # and the attempt is recorded, unlike the silent bypass before the fix
+        assert "pretooluse" in (home / "audit.jsonl").read_text()
+
+
 # --- PostToolUse: session-approval recording ---------------------------------
 
 def test_posttooluse_records_session_approval(tmp_path):
