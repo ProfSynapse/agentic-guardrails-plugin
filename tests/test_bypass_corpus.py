@@ -71,6 +71,8 @@ CORPUS = [
     "psql -c 'DROP TABLE users'",
     "mysql -e \"DELETE FROM orders\"",
     "echo 'TRUNCATE TABLE logs' | psql",
+    "printf 'DELETE FROM orders' | mysql shopdb",
+    "psql mydb <<SQL\nDROP TABLE users;\nSQL",
     # policy-pack rules
     "terraform destroy -auto-approve",
     "aws s3 rb s3://bucket --force",
@@ -118,6 +120,16 @@ BENIGN = [
     "cat .env.example",
     "grep password src/auth.py",
     "curl https://api.example.com/v1/data.key",
+    # searching for destructive text is not executing it (span-aware content scan)
+    "grep \"DROP TABLE users\" schema.sql",
+    "grep -n \"DELETE FROM orders\" migrations/001.sql",
+    "rg \"TRUNCATE TABLE\" .",
+    "grep -r \"Clear-Content\" scripts/",
+    "rg \"[IO.File]::Delete\" .",
+    "ack \"DROP DATABASE\" docs/",
+    # echoing destructive text with nothing to run it is just output
+    "echo 'next migration will DROP TABLE legacy' >> TODO.md",
+    "printf 'DELETE FROM audit\\n' > note.txt",
 ]
 
 
