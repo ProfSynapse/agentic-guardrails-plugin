@@ -21,8 +21,8 @@ from . import profiles as prof
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, READ, WRITE, \
     Decision, ToolEvent, worst
 from .shellparse import FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, FLAG_EVAL, \
-    FLAG_INDIRECT, ParseUncertain, SimpleCommand, extract_commands, extract_payloads, \
-    redirect_targets
+    FLAG_INDIRECT, ParseUncertain, SimpleCommand, _HEREDOC_RE, extract_commands, \
+    extract_payloads, redirect_targets
 
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
                     "instead — it moves files to the archive store and is fully reversible "
@@ -153,6 +153,51 @@ _WRITEALLTEXT_RE = re.compile(
 
 _SQL_DENY = re.compile(r"\b(DROP\s+(TABLE|DATABASE|SCHEMA)|TRUNCATE\s+TABLE?)\b", re.IGNORECASE)
 _SQL_DELETE = re.compile(r"\bDELETE\s+FROM\b(?![\s\S]*\bWHERE\b)", re.IGNORECASE)
+
+# The SQL / PowerShell content scans must fire on *executed* code, not on the
+# same text appearing as a search pattern or as echoed data. Scanning the raw
+# command string denied `grep "DROP TABLE" schema.sql` and
+# `rg "Clear-Content" scripts/` — the destructive text there is the thing being
+# searched for, never run. So we scan a "code view": the raw command with the
+# operands of pure data tools blanked out — search-tool patterns always, and
+# data-producer (echo/printf) output when nothing in the command line would run
+# it (no shell, interpreter, or SQL client to consume the pipe/heredoc). The
+# raw structure is otherwise preserved, so PowerShell's `.NET` method syntax
+# (`(Get-Item x).Delete()`) and wrapper payloads still match.
+#
+# Blanking operands can only remove matches, never add them, so this introduces
+# no new false positives — only removes the data-context ones. The class it
+# still can't disambiguate (`git commit -m "add DROP TABLE migration"`) stays as
+# before; that would need per-flag span typing.
+_SEARCH_TOOLS = {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"}
+_DATA_PRODUCERS = {"echo", "printf"}
+_SQL_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3", "sqlite", "mongo", "mongosh",
+                "cockroach", "clickhouse-client", "sqlplus", "sqlcmd", "cqlsh"}
+# Anything that consumes piped/heredoc text and executes it: shells, script
+# interpreters, and SQL clients. When one of these is present, echoed data and
+# heredoc bodies become executable code (e.g. `echo 'DROP TABLE x' | psql`).
+_CODE_CONSUMERS = _SQL_CLIENTS | {
+    "python", "python3", "perl", "ruby", "node", "php",
+    "bash", "sh", "zsh", "ksh", "dash", "ash",
+    "powershell", "pwsh", "cmd"}
+
+
+def _code_view(command: str, parsed) -> str:
+    """The command with pure-data-tool operands blanked, so the SQL / PowerShell
+    content scans see executed code, not search patterns or un-consumed echoed
+    data. See the note above _SEARCH_TOOLS for the rationale. Payloads (decoded
+    -EncodedCommand / inner wrapper text) are appended so smuggled deletions
+    still match."""
+    consumers = {c.name for c in parsed.commands} & _CODE_CONSUMERS
+    view = command
+    for cmd in parsed.commands:
+        drop = cmd.name in _SEARCH_TOOLS or (cmd.name in _DATA_PRODUCERS and not consumers)
+        if not drop:
+            continue
+        for tok in cmd.argv[1:]:
+            if len(tok) >= 2 and not tok.startswith("-"):
+                view = view.replace(tok, " " * len(tok), 1)  # blank first occurrence
+    return "\n".join([view] + parsed.payloads)
 
 _MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate"}
 
@@ -524,17 +569,19 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                                        "(indirection) — review carefully.",
                                   "builtin:indirect"))
 
-    raw = event.command
-    if _SQL_DENY.search(raw):
+    # Scan executed code only — not search patterns (`grep "DROP TABLE" x.sql`)
+    # or echoed data — so those don't false-deny. See _code_view.
+    code_view = _code_view(event.command, parsed)
+    if _SQL_DENY.search(code_view):
         decisions.append(Decision(DENY, "DROP/TRUNCATE statements are blocked.",
                                   "builtin:sql-drop"))
-    if _SQL_DELETE.search(raw):
+    if _SQL_DELETE.search(code_view):
         decisions.append(Decision(DENY, "DELETE without WHERE is blocked.",
                                   "builtin:sql-delete"))
 
     # PowerShell/.NET deletion that argv parsing can't reach (.NET methods,
-    # Clear-* cmdlets), in the raw line or in any decoded/inner wrapper payload.
-    if any(_PWSH_DESTRUCTIVE.search(t) for t in [raw] + parsed.payloads):
+    # Clear-* cmdlets). code_view already folds in decoded/inner wrapper payloads.
+    if _PWSH_DESTRUCTIVE.search(code_view):
         decisions.append(Decision(DENY, "PowerShell/.NET file deletion or content "
                                         "wiping is blocked. " + ARCHIVE_REDIRECT,
                                   "builtin:pwsh-delete"))
