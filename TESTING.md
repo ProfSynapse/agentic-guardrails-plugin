@@ -1,6 +1,8 @@
 # Testing Plan
 
-The split, in one line: **~80% of the system is testable programmatically in this repo (unit + hook-harness + headless Claude Code end-to-end); the manual ~20% is Cowork's runtime specifics, real sync clients, and enterprise distribution.** Because Cowork uses the Claude Code plugin format, everything proven in layers 1–3 carries over; layer 4 only validates the *differences*.
+The split, in one line: **~80% of the system is testable programmatically in this repo (unit + hook-harness + headless Claude Code end-to-end); the manual ~20% is Cowork's runtime specifics, real sync clients, and enterprise distribution.** Because Cowork uses the Claude Code plugin format, everything proven in layers 1–3 is expected to carry over; layer 4 only validates the *differences*.
+
+> **Status:** the supported hosts today are Claude Code and OpenAI Codex. Cowork enforcement is **not live yet** — plugin hooks don't fire there ([docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md)), so layer 4A below is a prerequisite spike to *get it working*, not just validation.
 
 ---
 

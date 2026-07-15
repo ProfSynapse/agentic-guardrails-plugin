@@ -1,8 +1,10 @@
 # Agentic Guardrails on OpenAI Codex
 
-This plugin runs on **OpenAI Codex CLI** as well as Claude Code / Cowork. The
-safety engine (`scripts/core`) and the `agw` CLI are identical across hosts;
-only a thin adapter layer (`scripts/codex`) differs. One package, two hosts.
+This plugin runs on **OpenAI Codex CLI** as well as Claude Code (terminal and
+desktop app). The safety engine (`scripts/core`) and the `agw` CLI are identical
+across hosts; only a thin adapter layer (`scripts/codex`) differs. One package,
+two hosts. (Cowork is a planned third host — its hooks don't fire yet; see
+`../docs/plans/0001-cowork-hook-enablement.md`.)
 
 ## What carries over
 

@@ -20,7 +20,7 @@ This is also where the danger lives. Synced folders have failure modes plain fol
 
 ## 2. Product shape
 
-One plugin, standard Claude Code plugin format (works in Cowork, Claude Code CLI, and the desktop Code tab from a single source):
+One plugin, standard Claude Code plugin format (works in the Claude Code CLI, the desktop Code tab, and OpenAI Codex from a single source; Cowork is a planned host — hooks don't fire there yet, see [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md)):
 
 - **Marketplace** (`marketplace.json` in this repo) for individuals/teams.
 - **Enterprise**: custom org marketplace or MDM-deployed org-plugins directory with `installationPreference: "required"` (users cannot remove it), plus a `managed-settings.json` template (`enabledPlugins`, `allowManagedHooksOnly`) for Claude Code fleets.

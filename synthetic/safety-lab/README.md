@@ -2,8 +2,9 @@
 
 A host-agnostic probe lab for the agentic-guardrails plugin. Its job is to
 confirm the guardrails are actually wired up and **enforcing** on whichever host
-you run - **Claude Code CLI**, **Claude Cowork**, or **OpenAI Codex** - using one
-shared set of fixtures and prompts.
+you run - **Claude Code CLI** or **OpenAI Codex** - using one shared set of
+fixtures and prompts. (Cowork is a planned host; its hooks don't fire yet - see
+`../../docs/plans/0001-cowork-hook-enablement.md`.)
 
 The lab does not drive the agent. You open the agent in `workspace/`, paste each
 probe prompt, watch what the guardrails do, and record it. `run_probe.py` gives
@@ -38,12 +39,10 @@ writes to `~/.agw` regardless. `run_probe.py` reads the same default.
 
 - **Claude Code CLI** - hooks fire and enforce. This is the reference host: if a
   probe does not behave here, the plugin is misconfigured.
-- **Claude Cowork** - plugin-scoped hooks fire only when the plugin is in the
-  session's enabled set; a stale enablement silently drops enforcement (restart
-  Cowork). Several probes also carry a path/name signal (`secrets/.env`, the
-  `confidential/` folder, a binary `.xlsx`) that Cowork's own file-access layer
-  catches *before* the plugin's `ask` can fire - probe 11 is the one designed to
-  isolate the plugin's own dialog (it asks purely on file content).
+- **Claude Cowork** - *not yet supported*: plugin hooks don't fire in Cowork
+  today, so the lab can't confirm enforcement there. Tracked in
+  `../../docs/plans/0001-cowork-hook-enablement.md`; once hooks fire, the probes
+  are expected to run unchanged (Cowork uses the same plugin format).
 - **OpenAI Codex** - install via `codex plugin marketplace add <repo-url>`, then
   trust the hooks with `/hooks`. All file mutation funnels through `apply_patch`,
   so probes 12-13 exercise that path. apply_patch hook firing is newer than Bash

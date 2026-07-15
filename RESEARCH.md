@@ -16,7 +16,7 @@ Cowork is the agentic mode in the Claude desktop app (GA on all paid plans since
 
 ### Extensibility surface
 - Cowork uses the **Claude Code plugin format**: `.claude-plugin/plugin.json` + `skills/`, `commands/`, `agents/`, `hooks/hooks.json`, `.mcp.json`, `scripts/`. Anthropic's own [knowledge-work-plugins](https://github.com/anthropics/knowledge-work-plugins) repo installs into both Cowork and Claude Code from one source.
-- **Hooks and sub-agents run in Cowork** (not in plain chat). ([Use plugins in Claude](https://support.claude.com/en/articles/13837440-use-plugins-in-claude))
+- **Hooks and sub-agents were expected to run in Cowork** (not in plain chat), per the docs ([Use plugins in Claude](https://support.claude.com/en/articles/13837440-use-plugins-in-claude)). **Update (later testing):** plugin hooks do **not** actually fire in Cowork yet — see [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md). So Cowork enforcement is not live; the supported hosts today are Claude Code and OpenAI Codex.
 - **Cowork does NOT surface `settings.json` permission rules, env vars, or CLI flags.** `CLAUDE.md` from connected folders is loaded, but there is no permissions engine exposed to users. → **Hooks shipped inside a plugin are the only programmatic enforcement surface in Cowork.** ([claude-code#44098](https://github.com/anthropics/claude-code/issues/44098), [extensions doc](https://claude.com/docs/cowork/3p/extensions))
 
 ### Enterprise distribution

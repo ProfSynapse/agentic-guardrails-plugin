@@ -5,7 +5,7 @@
     "url": "https://github.com/ProfSynapse/agentic-guardrails-plugin"
   },
   "metadata": {
-    "description": "Enterprise guardrails for agentic tools (Claude Code, Cowork): CRUA file safety, agent workspace, sync-aware protection for OneDrive/Drive/Dropbox."
+    "description": "Enterprise guardrails for agentic tools (Claude Code, OpenAI Codex): CRUA file safety, agent workspace, sync-aware protection for OneDrive/Drive/Dropbox."
   },
   "plugins": [
     {
