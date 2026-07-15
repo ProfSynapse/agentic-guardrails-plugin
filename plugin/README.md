@@ -1,8 +1,14 @@
 # agentic-guardrails
 
-Make agentic tools (Claude Code, Cowork) safe on a real computer, including
-the OneDrive/SharePoint/Google Drive/Dropbox folders synced to it, with one
-plugin install.
+Make agentic coding tools safe on a real computer, including the
+OneDrive/SharePoint/Google Drive/Dropbox folders synced to it, with one plugin
+install.
+
+**Supported hosts:** Claude Code (terminal and desktop app) and OpenAI Codex —
+the safety engine and the `agw` CLI are identical across both; only a thin
+adapter differs. Cowork support is planned but **not working yet**: its hooks
+don't fire there. Tracking:
+[../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
 **The core promise: nothing is ever destroyed.**
 
@@ -21,6 +27,8 @@ plugin install.
 
 ## Install
 
+### Claude Code (terminal and desktop app)
+
 ```
 /plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
 /plugin install agentic-guardrails@synaptic-guardrails
@@ -29,52 +37,45 @@ plugin install.
 If Claude's marketplace UI rejects `ProfSynapse/agentic-guardrails-plugin`, use
 the full GitHub URL above instead of the owner/repo shorthand.
 
-Requires Python 3.9+ as `python3`. Optional: `pandoc` (docx↔markdown) and
-`openpyxl` (xlsx→csv) for high-fidelity document checkout; without them files
-are checked out in plain-copy mode. Fleet rollout: see
+### OpenAI Codex
+
+```bash
+codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
+```
+
+Then run `/plugins` inside Codex, install **Agentic Guardrails**, and trust its
+hooks with `/hooks`. The full walkthrough — including the `apply_patch` deletion
+guard and a smoke test to confirm interception on your build — is in
+[CODEX.md](CODEX.md).
+
+### Requirements
+
+Python 3.9+ as `python3`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
+(xlsx→csv) for high-fidelity document checkout; without them files are checked
+out in plain-copy mode. Fleet rollout: see
 [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md).
 
-### Installing in Claude Cowork
+## Updating
 
-Cowork has no `/plugin` command — installs are UI-driven:
-**Customize → Plugins → Create plugin → Add marketplace**, then enter the repo
-(`ProfSynapse/agentic-guardrails-plugin`, or the full GitHub URL if the
-shorthand is rejected) and install **Agentic Guardrails** from the catalog.
+New versions ship as a `version` bump on the default branch. Clients cache by
+that string, so an update only lands once it changes:
 
-## Troubleshooting
-
-**Cowork still shows an old version after I pushed an update.** Cowork caches
-the marketplace catalog in its **backend, keyed to your account** — not in a
-local file. So the stale version follows you to other computers, and clearing
-local folders or re-pushing the repo won't move it. Two things are required:
-
-1. The repo's default branch must carry a **new `version`** (in both
-   `.claude-plugin/marketplace.json` and the plugin manifest). If the version
-   string doesn't change, clients keep the cached copy.
-2. **Remove the marketplace entry itself, then re-add it** — uninstalling the
-   *plugin* is not enough; the catalog stays pinned at the old version. The
-   remove control is buried:
-   **Customize → Plugins → Browse plugins → Personal tab → the plugin's tab →
-   the three-dots menu *on the tab itself* → Remove.** Then re-add the
-   marketplace (see above). The re-add re-fetches `marketplace.json` from the
-   default branch.
-
-If it still shows the old version after a full marketplace remove + re-add,
-that's a sticky server-side cache TTL on Cowork's side — wait it out or use the
-UI's refresh/update action; nothing in the repo or your local folders will
-change it.
+- **Claude Code:** `/plugin marketplace update synaptic-guardrails`, then
+  `/plugin install agentic-guardrails@synaptic-guardrails`.
+- **Codex:** `codex plugin marketplace upgrade`.
 
 ## What's inside
 
 | Piece | Purpose |
 |---|---|
-| `hooks/` | PreToolUse/PostToolUse/SessionStart wiring, the enforcement surface (works in Claude Code and Cowork) |
+| `hooks/` | PreToolUse/PostToolUse/SessionStart wiring, the enforcement surface (works in Claude Code and Codex) |
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
+| `scripts/codex/` | Thin Codex adapter: same `ToolEvent` contract, plus `apply_patch` envelope parsing (Add→write, Update→edit+snapshot, Delete→blocked under CRUA) |
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, audit log with secret redaction |
 | `scripts/agw/` + `bin/agw` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/` | Teach the agent the workflows: agent-workspace, synced-folders, gdocs-bridge, restore |
-| `commands/` | `/agw-status`, `/agw-publish`, `/agw-restore`, `/guardrails-report` |
+| `commands/` | `/agw-status`, `/agw-publish`, `/agw-restore`, `/guardrails-report` (Codex reads the equivalents from `codex-prompts/`) |
 | `enterprise/` | Managed-settings template + deployment guide |
 
 ## The agent's vocabulary
@@ -107,6 +108,10 @@ devices, `mkfs`, `sudo`, decode-to-shell and download-to-shell pipes,
 destructive SQL/interpreter one-liners, writes to `.gdoc` stubs, placeholders,
 protected zones, the plugin itself, and the archive store.
 
+Content scans are span-aware: a destructive string that only appears as a search
+pattern or echoed data (`grep "DROP TABLE" schema.sql`) is not treated as an
+executed command, so it isn't blocked.
+
 ## Customizing
 
 - **Block arbitrary code/content patterns:** drop a YAML file in
@@ -115,8 +120,8 @@ protected zones, the plugin itself, and the archive store.
 - **Zone a folder:** mark globs `no-access`, `read-only`, or `workspace` in
   `~/.agw/policies.d/*.yaml`.
 - **Archive location:** defaults to `~/.agw` (deliberately outside synced
-  trees); override with `AGW_HOME`. In Cowork, set it to a persistent volume;
-  the hook VM's home is wiped per session.
+  trees); override with `AGW_HOME`. On ephemeral or remote runners whose home
+  directory is wiped per session, point it at a mounted persistent volume.
 - **Enforcement level:** `AGW_LEVEL` (or `settings.level`) picks a bundle:
   `strict`, `standard` (default), `relaxed`, or `observe` (shadow mode: logs
   what it would do, blocks nothing). Safe by default; the company sets one knob.
@@ -128,17 +133,19 @@ protected zones, the plugin itself, and the archive store.
 ## Testing
 
 ```
-python3 -m pytest tests/   # 185 tests, no third-party deps beyond pytest
+python3 -m pytest tests/   # 241 tests, no third-party deps beyond pytest
 ```
 
-Includes a ~50-entry bypass corpus (nested `bash -c`, command substitution,
-xargs, wrapper commands, encode/decode pipes, interpreter one-liners) that
-must always resolve to deny/ask, golden subprocess tests of the actual hook
+Includes a bypass corpus (nested `bash -c`, command substitution, xargs, wrapper
+commands, encode/decode pipes, interpreter one-liners, PowerShell/cmd deletion)
+that must always resolve to deny/ask, golden subprocess tests of the actual hook
 (including the crash-fails-closed contract), and store concurrency tests. See
-[TESTING.md](TESTING.md) for the full plan including manual Cowork validation.
+[../TESTING.md](../TESTING.md) for the full plan.
 
 ## Roadmap
 
-Plan→apply transactions for bulk reorganization, `hydrate` verb, Codex and
-Cursor adapters on the same core engine, instruction compiler. Design notes in
-[PLAN.md](PLAN.md), research trail in [RESEARCH.md](RESEARCH.md).
+Cowork support (hooks don't fire there yet —
+[../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md)),
+plan→apply transactions for bulk reorganization, the `hydrate` verb, a Cursor
+adapter on the same core engine, and an instruction compiler. Design notes in
+[../PLAN.md](../PLAN.md), research trail in [../RESEARCH.md](../RESEARCH.md).

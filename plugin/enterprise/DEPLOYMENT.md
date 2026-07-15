@@ -105,9 +105,9 @@ newest version of anything. `agw doctor` reports current size and budget.
 - `bin/agw` on PATH is convenient but optional; the hook teaches the agent the
   full path via session context regardless.
 - **Persistent store location.** The archive/session store defaults to `~/.agw`.
-  Set `AGW_HOME` to a persistent, **non-cloud-synced** path. This matters most in
-  **Cowork**: hooks there run inside a per-session Linux VM whose home (`~`) is
-  wiped on teardown, so `~/.agw` would not survive the session — point `AGW_HOME`
+  Set `AGW_HOME` to a persistent, **non-cloud-synced** path. This matters most on
+  ephemeral or remote runners: if hooks run in a per-session VM whose home (`~`)
+  is wiped on teardown, `~/.agw` would not survive the session — point `AGW_HOME`
   at a mounted persistent volume so archives and approvals persist.
 
 ## 6. Verify a deployment
@@ -125,11 +125,11 @@ Claude for a readable audit summary.
 
 ## 7. What this does and does not cover
 
-Covered: Claude Code and Cowork tool calls (Bash, Write/Edit, Read, MCP tools)
+Covered: Claude Code and Codex tool calls (Bash, Write/Edit, Read, MCP tools)
 on the machine, machine-wide — including synced OneDrive/SharePoint/Drive/
 Dropbox folders.
 
-Not covered: actions outside the agent (the human's own shell), Cowork
-computer-use clicking inside other apps, and cloud-side operations done by
-connectors that bypass the local filesystem. Pair with provider-side retention
+Not covered: actions outside the agent (the human's own shell), computer-use
+clicking inside other apps, and cloud-side operations done by connectors that
+bypass the local filesystem. Pair with provider-side retention
 (Drive trash, SharePoint recycle bin, versioning) for those.
