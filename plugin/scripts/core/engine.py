@@ -30,16 +30,15 @@ ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archiv
                     "instead — it moves files to the archive store and is fully reversible "
                     "with `agw restore`.")
 
-# agw verbs the agent may run without Guardrails prompts. Archive and snapshot
-# are the reversible CRUA alternatives Guardrails itself recommends; a host
-# sandbox may still request its normal outside-workspace approval for ~/.agw.
+# Documented agw verbs are built to be reversible or non-destructive. Trust the
+# packaged safety vocabulary rather than adding a second Guardrails prompt; a
+# host sandbox may still request its normal outside-workspace approval for
+# ~/.agw. Permanent/special verbs remain in AGW_ASK_VERBS below.
 AGW_READ_ONLY_VERBS = {"scan", "diff", "status", "log", "doctor"}
-AGW_SAFETY_VERBS = {"archive", "snapshot"}
-AGW_MUTATING_VERBS = {
-    "init", "checkout", "convert", "move", "rename",
+AGW_SAFE_MUTATING_VERBS = {
+    "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
     "restore", "undo", "publish", "office",
 }
-AGW_OFFICE_READ_ONLY_VERBS = {"info", "get-text"}
 AGW_ASK_VERBS = {"prune": "prune permanently destroys archived versions (human decision)",
                  "apply": "bulk apply executes a stored plan — review the manifest",
                  "hydrate": "hydration downloads cloud-only content"}
@@ -57,6 +56,19 @@ _SECRET_NAMES = {"credentials", "credentials.json", "service_account.json",
                  "service-account.json", "secrets.json", "secrets.yaml", "secrets.yml"}
 _SECRET_DIRS = {".ssh", ".aws", ".azure", ".kube", "gcloud"}
 _NOT_SECRET_SUFFIX = re.compile(r"\.(?:example|sample|template|dist|pub)$", re.IGNORECASE)
+
+# These commands may mention a credential-named path while creating or updating
+# it, but do not read that file into the agent conversation. Nested reads are
+# parsed as their own commands and still prompt. Credential + network remains a
+# hard deny regardless of the command in this set.
+_NON_CONVERSATIONAL_FILE_COMMANDS = {
+    "new-item", "ni", "mkdir", "md",
+    "set-content", "sc", "out-file", "add-content", "ac",
+    "copy-item", "copy", "cpi", "cp",
+    "move-item", "move", "mi", "mv",
+    "remove-item", "del", "erase", "rd", "ri", "rm", "rmdir",
+    "touch",
+}
 
 # Network tools. The PowerShell web cmdlets/aliases are included because a
 # Windows host (Codex/Cowork on PowerShell) reaches the net through them, not
@@ -984,13 +996,16 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
     # credential files anywhere in the command: ask; with a network tool in the
     # same command line, that's the exfiltration shape: deny. Tokens directly
     # after -i are identity-file *usage* (ssh -i key host), not access.
-    secret_hits, prev = [], ""
+    secret_hits, secret_read_hits, prev = [], [], ""
     for cmd in parsed.commands:
         prev = ""
         for tok in cmd.argv[1:]:
             t = tok.lstrip("@")  # curl -d @.env
             if t and not t.startswith("-") and prev != "-i" and _is_secret_path(t):
-                secret_hits.append(os.path.basename(t))
+                name = os.path.basename(t)
+                secret_hits.append(name)
+                if cmd.name not in _NON_CONVERSATIONAL_FILE_COMMANDS:
+                    secret_read_hits.append(name)
             prev = tok
     if secret_hits:
         names = ", ".join(sorted(set(secret_hits)))
@@ -1001,12 +1016,13 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                       f"network tool ({', '.join(net)}) — that is the shape of "
                       "credential exfiltration, so it is blocked.",
                 "builtin:secret-exfil"))
-        else:
+        elif secret_read_hits:
+            names = ", ".join(sorted(set(secret_read_hits)))
             decisions.append(Decision(
                 ASK, f"Heads up: this reads credential-type file(s) ({names}), and "
                      "their contents would enter the conversation. Confirm this is "
                      "needed for the task.", "builtin:secret-file",
-                memo_key=f"secret-file:{'|'.join(sorted(set(secret_hits)))}",
+                memo_key=f"secret-file:{'|'.join(sorted(set(secret_read_hits)))}",
                 presentation_context=DecisionContext.SENSITIVE_READ))
 
     for cmd in parsed.commands:
@@ -1085,25 +1101,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 enforcement_class=NON_WAIVABLE_INVARIANT,
                 presentation_context=context,
             )
-        if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFETY_VERBS:
+        if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFE_MUTATING_VERBS:
             return Decision(ALLOW, "", "builtin:agw")
-        if verb == "office":
-            verb_index = args.index(verb)
-            office_verb = next(
-                (a for a in args[verb_index + 1:] if not a.startswith("-")), ""
-            )
-            if office_verb in AGW_OFFICE_READ_ONLY_VERBS:
-                return Decision(ALLOW, "", "builtin:agw")
-        if verb in AGW_MUTATING_VERBS:
-            context = (DecisionContext.RESTORE_FILES
-                       if verb in {"restore", "undo"}
-                       else DecisionContext.AGW_MUTATION)
-            return Decision(
-                ASK, "This Guardrails operation can change managed files.",
-                "builtin:agw-ask",
-                enforcement_class=NON_WAIVABLE_INVARIANT,
-                presentation_context=context,
-            )
         return Decision(
             ASK, "This Guardrails operation is not recognized.",
             "builtin:agw-unknown",

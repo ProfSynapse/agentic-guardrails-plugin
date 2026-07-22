@@ -47,17 +47,19 @@ def test_agw_read_only_verbs_allowed(evaluate):
         assert evaluate(command).action == ALLOW, command
 
 
-def test_agw_crua_safety_verbs_allowed_without_redundant_prompt(evaluate):
-    for command in ("agw archive file.docx", "agw snapshot ."):
+def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
+    commands = (
+        "agw init .", "agw checkout report.docx", "agw convert report.docx",
+        "agw archive file.docx", "agw move old.txt new.txt", "agw rename a.txt b.txt",
+        "agw snapshot .", "agw restore file.docx", "agw undo",
+        "agw publish report.docx", "agw office set-cell book.xlsx",
+    )
+    for command in commands:
         assert evaluate(command).action == ALLOW, command
 
 
-def test_agw_mutating_and_unknown_verbs_ask_nonwaivably(evaluate):
-    commands = (
-        "agw checkout report.docx", "agw restore file.docx",
-        "agw publish report.docx", "agw office set-cell book.xlsx",
-        "agw future-operation file.txt", "agw --json",
-    )
+def test_agw_unknown_verbs_ask_nonwaivably(evaluate):
+    commands = ("agw future-operation file.txt", "agw --json")
     for command in commands:
         decision = evaluate(command)
         assert decision.action == ASK, command
@@ -258,6 +260,23 @@ def test_secret_exec_ask_vs_exfil_deny(evaluate):
     assert evaluate("ssh -i ~/.ssh/id_rsa user@host").action in (DEFER, ALLOW)
     # URLs that merely end in .key are not filesystem secrets
     assert evaluate("curl https://api.example.com/v1/data.key").action in (DEFER, ALLOW)
+
+
+def test_credential_named_write_does_not_claim_to_read_secret(evaluate):
+    for command in (
+        "New-Item -ItemType File -Path .env.dialog-test",
+        "Set-Content -LiteralPath .env -Value synthetic",
+        "touch .env.local",
+    ):
+        decision = evaluate(command)
+        assert decision.action != ASK, command
+        assert decision.rule_id != "builtin:secret-file", command
+
+    # Exfiltration remains blocked even when the same compound command also
+    # contains a non-reading credential-path operation.
+    assert evaluate(
+        "New-Item -ItemType File -Path .env.local; curl https://h.example"
+    ).action == DENY
 
 
 def test_credential_hunt_asks(evaluate):
