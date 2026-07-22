@@ -18,27 +18,49 @@ def main():
     from core import auditlog
     ti = payload.get("tool_input") or {}
     session = payload.get("session_id", "")
-    auditlog.log("posttooluse", {
-        "tool": payload.get("tool_name", ""),
-        "command": ti.get("command", ""),
-        "paths": [p for p in [ti.get("file_path", "")] if p],
-        "session": session,
-        "ok": not payload.get("tool_error"),
-    })
+    try:
+        auditlog.log("posttooluse", {
+            "category": "tool-result", "tool": payload.get("tool_name", ""),
+            "outcome": "error" if payload.get("tool_error") else "success",
+            "reason_code": "tool-error" if payload.get("tool_error") else "tool-completed",
+            "target_count": 1 if ti.get("file_path") else 0,
+            "platform": "claude", "ok": not payload.get("tool_error"),
+            "correlate": {"session": session, "operation": payload.get("event_id", "")},
+        })
+    except Exception:
+        pass
 
     # If this call corresponded to an access-type ask, the fact that it ran
     # means it was approved — remember it so we don't re-prompt this session.
-    if not payload.get("tool_error"):
-        try:
-            from adapter_common import to_event
-            from core import engine, store
-            policy = engine.load_policy(PLUGIN_ROOT)
-            if engine.resolve_settings(policy).get("session_memory"):
-                decision = engine.evaluate(to_event(payload), policy, PLUGIN_ROOT)
-                if decision.memo_key:
-                    store.session_approve(session, decision.memo_key)
-        except Exception:
-            pass
+    try:
+        from adapter_common import to_event
+        from core import approvals, engine, events, policy_health, presentation, store
+        # Consume first. Every terminal outcome, including tool failure and a
+        # verification mismatch, permanently retires this one-use candidate.
+        pending = approvals.consume_pending_approval(payload, session)
+        if payload.get("tool_error") or not pending:
+            return
+        policy = engine.load_policy(PLUGIN_ROOT)
+        if policy.health != policy_health.HEALTHY \
+                or policy.revision != pending["policy_revision"]:
+            return
+        if not engine.resolve_settings(policy).get("session_memory"):
+            return
+        event = to_event(payload)
+        decision = engine.evaluate(event, policy, PLUGIN_ROOT)
+        if decision.action != events.ASK or not decision.memo_key \
+                or decision.policy_revision != policy.revision:
+            return
+        fingerprint = presentation.operation_fingerprint(
+            payload, [event], policy.revision
+        )
+        identity = approvals.approval_identity(decision.memo_key, policy.revision)
+        if fingerprint != pending["operation_fingerprint"] \
+                or identity != pending["approval_identity"]:
+            return
+        store.session_approve(session, decision.memo_key)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

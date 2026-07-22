@@ -1,10 +1,14 @@
 """Codex adapter contract tests: real subprocess, Codex hook JSON in, decision
 JSON out. Mirrors test_adapter.py but exercises the apply_patch path that has no
 Claude equivalent."""
+import base64
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+
+import pytest
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "codex", "pretooluse.py")
@@ -14,7 +18,8 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 def run_hook(payload, env_extra=None):
     # Codex sets PLUGIN_ROOT (and CLAUDE_PLUGIN_ROOT for compat); use the
     # Codex-native one so we exercise the same env the real host provides.
-    env = dict(os.environ, PLUGIN_ROOT=REPO, CODEX_HOME=os.path.expanduser("~/.codex"))
+    env = dict(os.environ, PLUGIN_ROOT=REPO, CODEX_HOME=os.path.expanduser("~/.codex"),
+               AGW_APPROVAL_PROVIDER="headless", AGW_TEST_MODE="1")
     if env_extra:
         env.update(env_extra)
     payload.setdefault("hook_event_name", "PreToolUse")
@@ -30,6 +35,25 @@ def _decision(out):
 
 def _reason(out):
     return out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+
+
+def _load_codex_pretooluse_isolated():
+    """Load the adapter without reusing Claude's top-level adapter_common."""
+    module_path = os.path.join(REPO, "scripts", "codex", "pretooluse.py")
+    previous_adapter = sys.modules.pop("adapter_common", None)
+    previous_path = list(sys.path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_agw_test_codex_pretooluse", module_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = previous_path
+        sys.modules.pop("adapter_common", None)
+        if previous_adapter is not None:
+            sys.modules["adapter_common"] = previous_adapter
 
 
 # --- apply_patch envelope parser ---------------------------------------------
@@ -81,6 +105,36 @@ def test_bash_benign_defers():
     out = run_hook({"tool_name": "Bash", "tool_input": {"command": "git status"},
                     "cwd": "/tmp", "session_id": "c1"})
     assert _decision(out) == "defer"
+
+
+def test_codex_project_keyword_search_is_allowed_without_prompt():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": r"Select-String -Path tests\*.py -Pattern credential -Recurse"
+        },
+        "cwd": os.path.dirname(REPO),
+        "session_id": "project-diagnostic",
+    })
+    assert _decision(out) == "allow"
+
+
+def test_codex_monitor_requires_literal_command_field():
+    out = run_hook({
+        "tool_name": "Monitor",
+        "tool_input": {"command": {"unexpected": "shape"}},
+        "cwd": os.path.dirname(REPO),
+        "session_id": "monitor-contract",
+    })
+    assert _decision(out) == "deny"
+
+
+@pytest.mark.parametrize("tool", ["PowerShell", "Monitor"])
+def test_codex_shell_surfaces_deny_destructive_commands(tool):
+    command = "Remove-Item important.txt" if tool == "PowerShell" else "rm important.txt"
+    out = run_hook({"tool_name": tool, "tool_input": {"command": command},
+                    "cwd": "/tmp", "session_id": "c-shell"})
+    assert _decision(out) == "deny"
 
 
 # --- apply_patch behaviour ----------------------------------------------------
@@ -141,34 +195,112 @@ def test_apply_patch_update_relative_path_snapshots_against_cwd(tmp_path):
                if not p.endswith(".jsonl"))
 
 
-def test_codex_ask_resolves_via_modal(monkeypatch, capsys):
-    # In-process: ASK is resolved by the native modal. Approve -> the tool runs
-    # (no deny emitted); deny/no-UI -> hard deny. Platform-independent because we
-    # stub the modal itself.
+def test_codex_ask_resolves_via_injected_provider(monkeypatch, capsys, tmp_path):
+    # In-process: ASK is resolved by an injected provider. No native UI is ever
+    # initialized by this test.
     import io
-    from codex import pretooluse as ptu
-    payload = {"tool_name": "apply_patch", "tool_input": {"command": "???"},
-               "cwd": "/tmp", "session_id": "c1", "hook_event_name": "PreToolUse"}
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+    target = tmp_path / "board-notes.txt"
+    target.write_text("CONFIDENTIAL: board planning material")
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(target)},
+               "cwd": str(tmp_path), "session_id": "c1",
+               "hook_event_name": "PreToolUse"}
 
-    monkeypatch.setattr(ptu, "_interactive_approve", lambda *a, **k: True)
+    class FixedProvider(ApprovalProvider):
+        def __init__(self, approved):
+            self.approved = approved
+
+        def request(self, request):
+            return ApprovalResponse(self.approved,
+                                    "approved" if self.approved else "denied")
+
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
-    ptu.main()
+    ptu.main(FixedProvider(True))
     out = capsys.readouterr().out
     data = json.loads(out) if out.strip() else {}
     assert data.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
 
-    monkeypatch.setattr(ptu, "_interactive_approve", lambda *a, **k: False)
+    payload["session_id"] = "c2"
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
-    ptu.main()
+    ptu.main(FixedProvider(False))
     data = json.loads(capsys.readouterr().out)
     assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = data["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Do not retry the same operation" in reason
+    assert "recommend the safest way to continue" in reason
+
+
+def test_codex_provider_receives_closed_human_prompt(monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+    canary = "PRIVATE-CANARY-client-path-command"
+    target = tmp_path / f"{canary}.txt"
+    target.write_text("CONFIDENTIAL: board planning material")
+    payload = {
+        "tool_name": "Read", "tool_input": {"file_path": str(target)},
+        "cwd": str(tmp_path), "session_id": "closed-prompt",
+        "hook_event_name": "PreToolUse",
+    }
+
+    class CapturingProvider(ApprovalProvider):
+        def __init__(self):
+            self.request_value = None
+
+        def request(self, request):
+            self.request_value = request
+            return ApprovalResponse(False, "denied")
+
+    provider = CapturingProvider()
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    capsys.readouterr()
+    request = provider.request_value
+    assert request is not None
+    rendered = request.action + "\n" + request.primary_text()
+    assert "potentially sensitive file" in rendered
+    assert "Cancel to make no changes" in rendered
+    assert request.allow_label == "Allow once"
+    assert request.cancel_label == "Cancel (recommended)"
+    assert canary not in rendered
+
+
+def test_unknown_target_patch_denies_without_provider(monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+
+    class WouldApproveProvider(ApprovalProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, request):
+            self.calls += 1
+            return ApprovalResponse(True, "approved")
+
+    provider = WouldApproveProvider()
+    payload = {"tool_name": "apply_patch", "tool_input": {"command": "???"},
+               "cwd": str(tmp_path), "session_id": "c1",
+               "hook_event_name": "PreToolUse"}
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    data = json.loads(capsys.readouterr().out)
+    assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = data["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Result: The requested action did not run" in reason
+    assert "Safe next step:" in reason
+    assert "file-specific operation" in reason
+    assert "User communication:" in reason
+    assert "toward the user's goal" in reason
+    assert provider.calls == 0
 
 
 def test_apply_patch_opaque_fails_closed_without_ui():
-    # apply_patch invoked but the patch text is unreadable -> engine ASK. Codex
-    # has no hook 'ask' prompt, so the adapter resolves ASK via a native modal;
-    # on a host with no approval UI (this CI box) that fails closed to a hard
-    # deny - never a silent allow.
+    # Unreadable patch targets are hard-denied before any approval provider.
     out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": "???"},
                     "cwd": "/tmp", "session_id": "c1"})
     assert _decision(out) == "deny"
@@ -180,6 +312,22 @@ def test_mcp_shell_exfil_through_patch_tool_still_evaluated():
                     "tool_input": {"command": "rm -rf /tmp/x"},
                     "cwd": "/tmp", "session_id": "c1"})
     assert _decision(out) == "deny"
+
+
+def test_connected_service_mutation_asks_without_local_preimage(tmp_path):
+    out = run_hook({
+        "tool_name": "mcp__github__create_pull_request",
+        "tool_input": {"head": "feature", "base": "main"},
+        "cwd": str(tmp_path),
+        "session_id": "connected-create",
+    }, env_extra={"AGW_HOME": str(tmp_path / "home")})
+    # The deterministic headless provider declines ASK decisions. The denial
+    # must come from missing human approval, not from an impossible local-file
+    # preimage requirement for remote service data.
+    assert _decision(out) == "deny"
+    reason = _reason(out)
+    assert "safely obtain approval" in reason.lower()
+    assert "local recovery" not in reason.lower()
 
 
 def test_crash_fails_to_ask(tmp_path):
@@ -197,3 +345,271 @@ def test_crash_fails_to_ask(tmp_path):
     # Either the engine still denies (policy loads with builtins) or it fails
     # closed to ask - never a silent allow/defer for an rm.
     assert _decision(out) in ("deny", "ask")
+
+
+def test_apply_patch_new_file_gets_verified_absent_tombstone(tmp_path):
+    target = tmp_path / "new.txt"
+    patch = "*** Begin Patch\n*** Add File: new.txt\n+hello\n*** End Patch\n"
+    out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch},
+                    "cwd": str(tmp_path), "session_id": "c-new"},
+                   env_extra={"AGW_HOME": str(tmp_path / "home")})
+    assert _decision(out) in ("defer", "allow")
+    assert not target.exists()
+
+
+def test_apply_patch_oversized_target_denies_in_observe_mode(tmp_path):
+    target = tmp_path / "large.txt"
+    target.write_text("12345")
+    patch = ("*** Begin Patch\n*** Update File: large.txt\n"
+             "@@\n-12345\n+new\n*** End Patch\n")
+    out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch},
+                    "cwd": str(tmp_path), "session_id": "c-large"},
+                   env_extra={"AGW_HOME": str(tmp_path / "home"),
+                              "AGW_LEVEL": "observe", "AGW_PRESNAP_MAX_BYTES": "4"})
+    assert _decision(out) == "deny"
+    assert "backup limit" in _reason(out)
+
+
+def test_prestate_failure_never_invokes_codex_provider(monkeypatch, capsys, tmp_path):
+    import io
+    from core import preimages
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+
+    class WouldApproveProvider(ApprovalProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, request):
+            self.calls += 1
+            return ApprovalResponse(True, "approved")
+
+    target = tmp_path / "important.txt"
+    target.write_text("original")
+    patch = ("*** Begin Patch\n*** Update File: important.txt\n"
+             "@@\n-original\n+new\n*** End Patch\n")
+    payload = {"tool_name": "apply_patch", "tool_input": {"command": patch},
+               "cwd": str(tmp_path), "session_id": "c-fail",
+               "hook_event_name": "PreToolUse"}
+    provider = WouldApproveProvider()
+
+    def fail_capture(*args, **kwargs):
+        raise OSError("simulated archive failure")
+
+    monkeypatch.setattr(preimages.store, "archive_file", fail_capture)
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    data = json.loads(capsys.readouterr().out)
+    assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert provider.calls == 0
+
+
+def test_codex_audit_failure_cannot_weaken_invariant_deny(tmp_path):
+    target = tmp_path / "large.txt"
+    target.write_text("12345")
+    unusable_home = tmp_path / "home-is-a-file"
+    unusable_home.write_text("not a directory")
+    patch = ("*** Begin Patch\n*** Update File: large.txt\n"
+             "@@\n-12345\n+new\n*** End Patch\n")
+    out = run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch},
+                    "cwd": str(tmp_path), "session_id": "c-audit"},
+                   env_extra={"AGW_HOME": str(unusable_home),
+                              "AGW_PRESNAP_MAX_BYTES": "4"})
+    assert _decision(out) == "deny"
+    assert "backup limit" in _reason(out)
+
+
+@pytest.mark.parametrize("case,expected,provider_calls", [
+    ("allow", "allow", 0), ("ask", "deny", 1), ("deny", "deny", 0),
+])
+def test_audit_exception_leaves_codex_outcomes_identical_without_native_ui(
+        case, expected, provider_calls, tmp_path, monkeypatch, capsys):
+    import io
+    from core import auditlog
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+
+    secret = tmp_path / ".env"
+    secret.write_text("PRIVATE=codex-parity-value")
+    payloads = {
+        "allow": {"tool_name": "Bash", "tool_input": {"command": "agw --help"}},
+        "ask": {"tool_name": "Read", "tool_input": {"file_path": str(secret)}},
+        "deny": {"tool_name": "apply_patch", "tool_input": {"command": "???"}},
+    }
+    payload = {**payloads[case], "cwd": str(tmp_path),
+               "session_id": f"codex-{case}", "event_id": f"event-{case}",
+               "hook_event_name": "PreToolUse"}
+
+    class CountingProvider(ApprovalProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, request):
+            self.calls += 1
+            return ApprovalResponse(False, "denied")
+
+    def invoke(home, logger, suffix):
+        provider = CountingProvider()
+        monkeypatch.setenv("AGW_HOME", str(home))
+        monkeypatch.setattr(auditlog, "log", logger)
+        current = {**payload, "event_id": f"event-{case}-{suffix}"}
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(current)))
+        ptu.main(provider)
+        text = capsys.readouterr().out
+        return (json.loads(text) if text.strip() else {}), provider.calls
+
+    baseline, baseline_calls = invoke(
+        tmp_path / "baseline", lambda *_args, **_kwargs: None, "baseline"
+    )
+
+    def fail(*_args, **_kwargs):
+        raise OSError("simulated audit outage")
+
+    failed, failed_calls = invoke(tmp_path / "failed", fail, "failed")
+    assert failed == baseline
+    assert _decision(failed) == expected
+    assert baseline_calls == failed_calls == provider_calls
+
+
+def test_observe_mode_keeps_known_and_unknown_patch_denies(tmp_path):
+    target = tmp_path / "important.txt"
+    target.write_text("verified preimage")
+    known = ("*** Begin Patch\n*** Delete File: important.txt\n"
+             "*** End Patch\n")
+    env = {"AGW_HOME": str(tmp_path / "home"), "AGW_LEVEL": "observe"}
+    for patch in (known, "???"):
+        out = run_hook({"tool_name": "apply_patch",
+                        "tool_input": {"command": patch},
+                        "cwd": str(tmp_path), "session_id": "observe-patch"},
+                       env_extra=env)
+        assert _decision(out) == "deny"
+    assert target.read_text() == "verified preimage"
+
+
+def test_codex_observe_still_resolves_nonwaivable_ask(monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+
+    class DenyProvider(ApprovalProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, request):
+            self.calls += 1
+            return ApprovalResponse(False, "denied")
+
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=secret-value")
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "observe-ask",
+               "hook_event_name": "PreToolUse"}
+    provider = DenyProvider()
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGW_LEVEL", "observe")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    data = json.loads(capsys.readouterr().out)
+    assert provider.calls == 1
+    assert _decision(data) == "deny"
+
+
+def test_codex_observe_shadows_explicit_custom_policy_deny(tmp_path):
+    home = tmp_path / "home"
+    policies = home / "policies.d"
+    policies.mkdir(parents=True)
+    (policies / "company.json").write_text(json.dumps({
+        "commands": [{"pattern": "company-block-me", "action": "deny",
+                      "reason": "organization policy"}]
+    }))
+    out = run_hook({"tool_name": "Bash",
+                    "tool_input": {"command": "company-block-me"},
+                    "cwd": str(tmp_path), "session_id": "observe-policy"},
+                   env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "observe"})
+    assert _decision(out) == "defer"
+    assert "observe mode" in out.get("systemMessage", "")
+
+
+def test_codex_powershell_named_value_is_not_preimage_target(tmp_path):
+    victim = tmp_path / "victim.txt"
+    changed = tmp_path / "changed"
+    victim.write_text("ORIGINAL")
+    changed.write_text("UNRELATED")
+    home = tmp_path / "home"
+    out = run_hook({"tool_name": "PowerShell",
+                    "tool_input": {"command":
+                                   "Set-Content -Encoding utf8 victim.txt changed"},
+                    "cwd": str(tmp_path), "session_id": "pwsh-binding"},
+                   env_extra={"AGW_HOME": str(home)})
+    assert _decision(out) in ("defer", "allow")
+    archived = [path.name for path in (home / "archive").rglob("*") if path.is_file()]
+    assert any("victim.txt" in name for name in archived)
+    assert not any(name.endswith("changed") for name in archived)
+    assert victim.read_text() == "ORIGINAL"
+    assert changed.read_text() == "UNRELATED"
+
+
+def test_codex_powershell_incomplete_binding_is_nonwaivable_deny(tmp_path):
+    out = run_hook({"tool_name": "PowerShell",
+                    "tool_input": {"command": "Set-Content -Pa victim.txt changed"},
+                    "cwd": str(tmp_path), "session_id": "pwsh-incomplete"},
+                   env_extra={"AGW_HOME": str(tmp_path / "home"),
+                              "AGW_LEVEL": "observe"})
+    assert _decision(out) == "deny"
+    assert "unknown or ambiguous" in _reason(out).lower()
+
+
+@pytest.mark.parametrize("form,observe", [
+    ("direct", False),
+    ("command", True),
+    ("positional", False),
+    ("encoded", True),
+])
+def test_codex_powershell_backtick_target_gets_exact_preimage(
+        form, observe, tmp_path):
+    script = "Set-Content victim`.txt changed"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    command = {
+        "direct": script,
+        "command": f'powershell -Command "{script}"',
+        "positional": f'pwsh "{script}"',
+        "encoded": f"pwsh -EncodedCommand {encoded}",
+    }[form]
+    victim = tmp_path / "victim.txt"
+    escaped_spelling = tmp_path / "victim`.txt"
+    changed = tmp_path / "changed"
+    victim.write_text("ORIGINAL")
+    escaped_spelling.write_text("UNRELATED ESCAPED SPELLING")
+    changed.write_text("UNRELATED CONTENT")
+    home = tmp_path / "home"
+    env = {"AGW_HOME": str(home)}
+    if observe:
+        env["AGW_LEVEL"] = "observe"
+    out = run_hook({"tool_name": "PowerShell", "tool_input": {"command": command},
+                    "cwd": str(tmp_path), "session_id": f"backtick-{form}"},
+                   env_extra=env)
+    assert _decision(out) in ("defer", "allow")
+    archived = [path.name for path in (home / "archive").rglob("*") if path.is_file()]
+    assert any(name.endswith("victim.txt") for name in archived)
+    assert not any(name.endswith("victim`.txt") or name.endswith("changed")
+                   for name in archived)
+    assert victim.read_text() == "ORIGINAL"
+    assert escaped_spelling.read_text() == "UNRELATED ESCAPED SPELLING"
+    assert changed.read_text() == "UNRELATED CONTENT"
+
+
+@pytest.mark.parametrize("script", [
+    "Set-Content victim`n.txt changed",
+    "Set-Content victim`$name changed",
+    "Set-Content 'victim`.txt' changed",
+])
+def test_codex_powershell_ambiguous_backtick_is_nonwaivable_deny(
+        script, tmp_path):
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    out = run_hook({"tool_name": "PowerShell",
+                    "tool_input": {"command": f"pwsh -EncodedCommand {encoded}"},
+                    "cwd": str(tmp_path), "session_id": "backtick-deny"},
+                   env_extra={"AGW_HOME": str(tmp_path / "home"),
+                              "AGW_LEVEL": "observe"})
+    assert _decision(out) == "deny"

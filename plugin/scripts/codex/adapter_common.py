@@ -20,6 +20,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.mcpshell import is_mcp_shell, mcp_command  # noqa: E402
 from codex.applypatch import parse_patch  # noqa: E402
 
+MONITOR_NORMALIZER_CONTRACT = (
+    "Monitor is accepted only as a shell-execution envelope whose literal "
+    "tool_input.command string is evaluated with the same rules as Bash."
+)
+
+
+def shell_command(tool, tool_input):
+    """Normalize the documented shell envelope without guessing other fields."""
+    if tool not in ("Bash", "PowerShell", "Monitor"):
+        return ""
+    command = tool_input.get("command", "")
+    return command if isinstance(command, str) else ""
+
 # Fields Codex may carry the patch under within an apply_patch tool_input. The
 # documented key is ``command`` (same as Bash); the others are defensive.
 _PATCH_FIELDS = ("command", "patch", "input", "content")
@@ -46,8 +59,10 @@ def to_events(payload):
     common = dict(cwd=payload.get("cwd", ""), session_id=payload.get("session_id", ""),
                   platform="codex", tool=tool)
 
-    if tool == "Bash":
-        return [events.ToolEvent(kind=events.EXEC, command=ti.get("command", ""), **common)]
+    if tool in ("Bash", "PowerShell", "Monitor"):
+        # All maintained host shell surfaces carry their executable text in
+        # tool_input.command and must traverse the same EXEC policy path.
+        return [events.ToolEvent(kind=events.EXEC, command=shell_command(tool, ti), **common)]
 
     if tool == "apply_patch":
         return _patch_events(ti, common, events)

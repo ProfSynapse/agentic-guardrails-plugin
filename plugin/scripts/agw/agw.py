@@ -55,6 +55,16 @@ def _resolve(path: str) -> str:
     return p
 
 
+def _require_archive_store():
+    if not store.archive_store_writable():
+        _err(
+            "Guardrails cannot write a recovery copy from this sandbox. "
+            "The original file was not moved or changed. Ask the agent to retry "
+            "the same Guardrails operation using the host's normal approval. "
+            "Do not change folder permissions or security settings."
+        )
+
+
 # --- verbs -------------------------------------------------------------------
 
 def cmd_init(args):
@@ -213,9 +223,10 @@ def cmd_publish(args):
 
 
 def cmd_archive(args):
+    paths = [_resolve(path) for path in args.paths]
+    _require_archive_store()
     results = []
-    for path in args.paths:
-        p = _resolve(path)
+    for p in paths:
         entry = store.archive_file(p, mode="move", reason=args.reason or "agw archive",
                                    actor="agw")
         results.append(entry)
@@ -243,6 +254,7 @@ def cmd_snapshot(args):
     if total > SNAPSHOT_MAX_BYTES and not args.force:
         _err(f"folder is {total / 1e9:.1f} GB (> {SNAPSHOT_MAX_BYTES / 1e9:.0f} GB "
              "preflight limit). Re-run with --force if you really want this.", code=3)
+    _require_archive_store()
     entry = store.archive_file(folder, mode="copy", reason=args.reason or "agw snapshot",
                                actor="agw")
     _out(args, f"snapshot of {folder} -> {entry['dest']} ({total / 1e6:.1f} MB)", entry)
@@ -287,11 +299,14 @@ def cmd_log(args):
 def cmd_doctor(args):
     from core import engine
     caps = converters.capabilities()
-    home = store.agw_home()
-    writable = os.access(home, os.W_OK)
+    home = store.agw_home_path()
+    writable = store.archive_store_writable()
     profile = prof.detect(os.getcwd())
     cfg = engine.resolve_settings(engine.load_policy(PLUGIN_ROOT))
-    size = store.archive_size_bytes()
+    try:
+        size = store.archive_size_bytes()
+    except OSError:
+        size = 0
     budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES", 0) or 0)
     checks = {
         "agw_home": home, "agw_home_writable": writable,
@@ -440,7 +455,15 @@ def main(argv=None):
     add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}))
 
     args = parser.parse_args(argv)
-    args.fn(args)
+    try:
+        args.fn(args)
+    except PermissionError:
+        _err(
+            "Guardrails was denied access by the host sandbox and stopped "
+            "without changing permissions or bypassing the sandbox. The requested "
+            "operation did not complete. Ask the agent to retry using the host's "
+            "normal approval."
+        )
 
 
 if __name__ == "__main__":

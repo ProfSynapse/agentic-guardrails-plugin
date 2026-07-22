@@ -2,12 +2,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch|mcp__.*",
+        "matcher": "Bash|PowerShell|Monitor|Write|Edit|NotebookEdit|Read|apply_patch|mcp__.*",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse",
-            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
             "timeout": 120,
             "statusMessage": "guardrails check"
           }
@@ -16,12 +16,12 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit|Read|apply_patch",
+        "matcher": "Bash|PowerShell|Monitor|Write|Edit|NotebookEdit|Read|apply_patch",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse",
-            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" posttooluse",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" posttooluse",
             "timeout": 10
           }
         ]
@@ -34,7 +34,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart",
-            "commandWindows": "py \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" sessionstart",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" sessionstart",
             "timeout": 15
           }
         ]

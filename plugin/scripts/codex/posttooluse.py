@@ -19,18 +19,20 @@ def main():
     from core import auditlog
     from adapter_common import to_events
     tool = payload.get("tool_name", "")
-    ti = payload.get("tool_input") or {}
     session = payload.get("session_id", "")
 
     events_list = to_events(payload)
     paths = [p for e in events_list for p in e.paths if p]
-    # For Bash the command is the shell line; for apply_patch `command` is the
-    # patch blob, so prefer a real EXEC command and otherwise leave it blank.
-    command = ti.get("command", "") if tool == "Bash" else ""
-    auditlog.log("posttooluse", {
-        "tool": tool, "command": command, "paths": paths,
-        "session": session, "platform": "codex",
-        "ok": not payload.get("tool_error")})
+    try:
+        auditlog.log("posttooluse", {
+            "category": "tool-result", "tool": tool,
+            "outcome": "error" if payload.get("tool_error") else "success",
+            "reason_code": "tool-error" if payload.get("tool_error") else "tool-completed",
+            "target_count": len(paths), "event_count": len(events_list),
+            "platform": "codex", "ok": not payload.get("tool_error"),
+            "correlate": {"session": session, "operation": payload.get("event_id", "")}})
+    except Exception:
+        pass
 
     # If this call corresponded to an access-type ask, the fact that it ran
     # means it was approved - remember it so we don't re-prompt this session.

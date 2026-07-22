@@ -7,9 +7,9 @@ of different kinds, so the payload maps to a *list* of neutral events. We
 evaluate each, then fold them into one decision (most severe wins) before
 emitting a single permissionDecision.
 
-CRASH POLICY (the most important rule in this codebase): any internal failure
-becomes ASK - never a silent allow (a nonzero exit would be non-blocking),
-never an unconditional deny (which would brick the session on our own bugs).
+CRASH POLICY: any internal failure becomes DENY. Codex does not safely enforce
+a hook-level ASK, and a nonzero hook exit would also be non-blocking, so either
+alternative could silently run an operation that guardrails failed to inspect.
 """
 import json
 import os
@@ -24,10 +24,16 @@ sys.path.insert(0, _HERE)                   # make `adapter_common` importable
 FAIL_CLOSED = {
     "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "ask",
-        "permissionDecisionReason":
-            "agentic-guardrails hit an internal error evaluating this call "
-            "(fail-closed). Review the operation manually.",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "Blocked: Guardrails hit an internal error while checking this operation.\n\n"
+            "Result: The requested action did not run; no requested target was changed.\n\n"
+            "Safe next step: Retry with one direct, file-specific operation. If the "
+            "error continues, stop and report the Guardrails failure.\n\n"
+            "User communication: Briefly explain the block in plain language and "
+            "recommend a safe way to continue toward the user's goal. Do not quote "
+            "the raw command or expose sensitive values."
+        ),
     }
 }
 
@@ -35,78 +41,17 @@ from adapter_common import to_events  # noqa: E402
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 # Codex has no hook-driven approval prompt (permissionDecision "ask" is parsed
-# but unsupported, so it silently proceeds). To realize an ASK we surface our
-# own native modal from the hook process and block on the user's choice. This
-# must finish inside the hook timeout (hooks-codex.json), so keep it under it.
+# but unsupported, so it silently proceeds). ASK is therefore resolved through
+# an injected approval provider. Tests always use the deterministic headless
+# provider; only core.approvals.NativeApprovalProvider may initialize UI.
 ASK_MODAL_TIMEOUT = int(os.environ.get("AGW_ASK_MODAL_TIMEOUT", 100))
 
 
-def _interactive_approve(title, message, timeout_s):
-    """Block on a native OS approval modal. Returns True (approve), False (deny),
-    or None (no UI available / error / timed out -> caller treats as deny).
-    Windows only for now; other platforms return None so the caller fails closed.
-    Runs the modal on a daemon thread so a no-response times out cleanly and the
-    orphaned dialog dies when the hook process exits."""
-    if os.name != "nt":
-        return None
-    import threading
-    out = {"v": None}
-
-    def _show():
-        try:
-            import ctypes
-            MB_YESNO, MB_ICONWARNING = 0x4, 0x30
-            MB_SETFOREGROUND, MB_TOPMOST, MB_SYSTEMMODAL = 0x10000, 0x40000, 0x1000
-            IDYES = 6
-            rv = ctypes.windll.user32.MessageBoxW(
-                0, str(message), str(title),
-                MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL)
-            out["v"] = (rv == IDYES)
-        except Exception:
-            out["v"] = None
-
-    t = threading.Thread(target=_show, daemon=True)
-    t.start()
-    t.join(timeout_s)
-    return out["v"]  # still None if the join timed out with no click
-
-
-def _abs(path, cwd):
-    """Resolve a (possibly relative, possibly backslash) tool path to an absolute
-    path against the event's cwd. apply_patch carries paths relative to the
-    patch's working directory, so a bare os.path.isfile() would look in the hook
-    PROCESS's cwd and silently miss the file - no pre-image taken."""
-    if not path:
-        return path
-    p = os.path.expanduser(str(path).replace("\\", os.sep))
-    if not os.path.isabs(p):
-        p = os.path.join(cwd or os.getcwd(), p)
-    return p
-
-
-def _snapshot(targets, label, store):
-    """Pre-image snapshot of files about to be clobbered. Returns
-    (any_error, [too_big_basenames]). Files over the cap are skipped but
-    reported, not turned into an ask."""
-    failed, too_big = False, []
-    for path in targets:
-        try:
-            if not (path and os.path.isfile(path)):
-                continue
-            if os.path.getsize(path) > PRESNAP_MAX_BYTES:
-                too_big.append(os.path.basename(path))
-                continue
-            store.archive_file(path, mode="copy", dedupe=True,
-                               reason=f"pre-image before {label}",
-                               actor="guardrails-hook")
-        except Exception:
-            failed = True
-    return failed, too_big
-
-
-def main():
+def main(approval_provider=None):
     payload = json.load(sys.stdin)
-    from core import auditlog, engine, events, store
+    from core import approvals, auditlog, enforcement, engine, events, mutations, preimages, \
+        presentation, store
+    from core.decisions import GuardrailDecision
 
     evlist = to_events(payload)
     policy = engine.load_policy(PLUGIN_ROOT)
@@ -127,114 +72,159 @@ def main():
                 f"Deleting {name} via apply_patch is disabled. Use "
                 f"`agw archive <path>` (reversible via `agw restore <path>`) "
                 f"instead of removing it.",
-                "builtin:patch-delete"))
+                "builtin:patch-delete",
+                enforcement_class=events.NON_WAIVABLE_INVARIANT))
         if ev.extra.get("opaque"):
             d = d.merge(engine.Decision(
                 events.ASK,
                 "apply_patch was invoked but its patch could not be parsed to "
                 "determine which files it touches - review the change manually.",
-                "builtin:patch-opaque"))
+                "builtin:patch-opaque",
+                enforcement_class=events.NON_WAIVABLE_INVARIANT,
+                presentation_context=events.DecisionContext.PATCH_UNKNOWN))
         decisions.append(d)
     decision = events.worst(decisions)
+    effective = enforcement.resolve(decision, observe)
 
-    # Pre-image snapshot of everything this call will mutate - writes, edits,
-    # shell clobbers, and patch deletes. In observe mode everything runs, so we
-    # still take the safety copy even while "not enforcing".
-    will_run = observe or decision.action != events.DENY
-    targets = []
-    for ev in evlist:
-        if ev.kind in (events.WRITE, events.EDIT):
-            targets += [_abs(p, ev.cwd) for p in ev.paths]
-        elif ev.kind == events.EXEC:
-            targets += engine.clobber_targets(ev.command, ev.cwd)
-        elif ev.extra.get("delete"):
-            targets += [_abs(p, ev.cwd) for p in ev.paths]
-    targets = [t for t in dict.fromkeys(targets) if t]  # de-dupe, keep order
+    will_run = effective.action != events.DENY
     label = payload.get("tool_name", "") or "modification"
-    if targets and will_run:
-        failed, too_big = _snapshot(targets, label, store)
-        if failed:
-            decision = decision.merge(engine.Decision(
-                events.ASK, "Could not snapshot the file before modification "
-                            "(archive store unavailable?) - proceed only if a copy "
-                            "exists elsewhere.", "builtin:snapshot-failed"))
-        if too_big:
-            decision.warnings.append(
-                f"note: {', '.join(too_big)} exceeds the {PRESNAP_MAX_BYTES // (1024*1024)}MB "
-                "auto-snapshot cap and was NOT backed up before this change")
+    # Prestate failures are safety invariants. Unlike advisory policy choices,
+    # they cannot be approved away or suppressed by observe mode.
+    mutation_plan = mutations.plan(evlist, engine.clobber_targets)
+    invariant_failure = ""
+    if mutation_plan.mutating and will_run:
+        if not mutation_plan.complete:
+            invariant_failure = (
+                "Guardrails blocked this change because it could not determine every file "
+                f"that would be modified: {mutation_plan.reason}. Nothing was changed by "
+                "this operation. Use a file-specific editing operation and try again."
+            )
+        else:
+            archive_budget = int(os.environ.get(
+                "AGW_ARCHIVE_MAX_BYTES", policy.settings.get("archive_max_bytes", 0)
+            ) or 0)
+            receipt = preimages.prepare(
+                mutation_plan.targets, label, PRESNAP_MAX_BYTES, archive_budget,
+                policy_revision=policy.revision,
+            )
+            if not receipt.ok:
+                invariant_failure = receipt.reason
+    if invariant_failure:
+        decision = engine.Decision(
+            events.DENY, invariant_failure, "invariant:prestate-unavailable",
+            policy_revision=policy.revision, policy_health=policy.health,
+            enforcement_class=events.NON_WAIVABLE_INVARIANT,
+        )
+        effective = enforcement.resolve(decision, observe)
+
+    def _audit(kind, data):
+        try:
+            auditlog.log(kind, data)
+        except Exception:
+            # Audit is evidence, not authority. Its availability must never
+            # upgrade, downgrade, or replace an enforcement decision.
+            pass
 
     # Session approval memory: a resource the user already okayed this session
     # doesn't prompt again. Convenience only - losing it just re-asks.
     memoed = False
-    if decision.action == events.ASK and decision.memo_key and cfg.get("session_memory") \
-            and store.session_approved(payload.get("session_id", ""), decision.memo_key):
-        memoed = True
+    if effective.action == events.ASK and decision.memo_key and cfg.get("session_memory"):
+        try:
+            memoed = store.session_approved(
+                payload.get("session_id", ""), decision.memo_key
+            )
+        except Exception:
+            memoed = False
 
     # Audit the *real* engine decision (before observe/memory suppression).
     if decision.action != events.DEFER or decision.warnings:
-        first_exec = next((e for e in evlist if e.kind == events.EXEC), None)
         all_paths = [p for e in evlist for p in e.paths]
-        auditlog.log("pretooluse", {
-            "tool": payload.get("tool_name", ""), "kind": evlist[0].kind,
-            "decision": decision.action, "rule": decision.rule_id,
-            "reason": decision.reason,
-            "command": first_exec.command if first_exec else "",
-            "paths": all_paths, "level": cfg.get("level"), "observe": observe,
-            "platform": "codex", "cwd": payload.get("cwd", ""),
-            "suppressed": "memory" if memoed else ("observe" if observe and
-                          decision.action in (events.ASK, events.DENY) else ""),
-            "session": payload.get("session_id", "")})
+        _audit("pretooluse", {
+            "category": "decision", "tool": payload.get("tool_name", ""),
+            "action": decision.action, "rule_code": decision.rule_id,
+            "reason_code": "prestate-unavailable" if invariant_failure else "decision",
+            "target_count": len(all_paths), "event_count": len(evlist),
+            "warning_count": len(decision.warnings),
+            "level": cfg.get("level"), "observe": observe,
+            "policy_health": decision.policy_health,
+            "policy_revision": decision.policy_revision,
+            "enforcement_class": decision.enforcement_class.value,
+            "platform": "codex", "memoed": memoed,
+            "suppression": "memory" if memoed else effective.suppression or "none",
+            "correlate": {"session": payload.get("session_id", ""),
+                          "operation": payload.get("event_id", "")}})
 
-    # Observe (shadow) mode: log, but never block. Memory: silently allow.
+    # Only explicit organization-policy findings shadow in observe mode.
+    # Advisory findings never prompt/block; safety invariants retain their
+    # ASK/DENY action at every enforcement level.
     if memoed:
         json.dump({"systemMessage": f"agentic-guardrails: already approved this session "
                                     f"({decision.rule_id}); not re-asking."}, sys.stdout)
         return
-    if observe and decision.action in (events.ASK, events.DENY):
-        json.dump({"systemMessage": f"agentic-guardrails (observe mode): would have "
+    if effective.shadowed:
+        label = "observe mode" if effective.suppression == "observe" else "advisory"
+        json.dump({"systemMessage": f"agentic-guardrails ({label}): would have "
                                     f"{decision.action.upper()} - {decision.reason}"},
                   sys.stdout)
         return
 
     # Codex can't render a hook 'ask' prompt, so an emitted ASK would silently
-    # proceed. Resolve it ourselves: pop a blocking approval modal and turn the
-    # user's choice into allow (defer -> runs) or deny. No UI / timeout / error
-    # fails closed to deny.
-    if decision.action == events.ASK:
+    # proceed. Resolve it through an injected provider. Provider absence,
+    # ineligibility, timeout, malformed response, or error always denies.
+    action = effective.action
+    approval_outcome = ""
+    if action == events.ASK:
         sid = payload.get("session_id", "")
-        approved = _interactive_approve(
-            "agentic-guardrails: approve this operation?",
-            (decision.reason or "This operation needs your approval.")
-            + "\n\nYes = allow it to run.   No = block it.",
-            ASK_MODAL_TIMEOUT)
-        outcome = ("approved" if approved else
-                   "denied" if approved is False else "no-ui-or-timeout")
-        auditlog.log("pretooluse-approval", {
-            "outcome": outcome, "rule": decision.rule_id, "reason": decision.reason,
-            "platform": "codex", "session": sid})
+        prompt_decision = GuardrailDecision.from_legacy(decision)
+        request = presentation.build_prompt(prompt_decision, payload, evlist)
+        try:
+            provider = approval_provider or approvals.default_provider(ASK_MODAL_TIMEOUT)
+            response = approvals.request_approval(prompt_decision, request, provider)
+        except Exception:
+            response = approvals.ApprovalResponse(False, "provider-error")
+        approved = response.authorizes()
+        outcome = response.outcome
+        approval_outcome = outcome
+        _audit("pretooluse-approval", {
+            "category": "approval", "outcome": outcome, "action": "ask",
+            "rule_code": decision.rule_id,
+            "reason_code": outcome if outcome in {
+                "provider-unavailable", "provider-timeout", "provider-error",
+                "headless-deny", "not-prompt-eligible", "policy-revision-unavailable"
+            } else "approval",
+            "policy_health": decision.policy_health,
+            "policy_revision": decision.policy_revision,
+            "enforcement_class": decision.enforcement_class.value,
+            "platform": "codex", "correlate": {"session": sid,
+                                                  "operation": payload.get("event_id", "")}})
         if approved:
             if decision.memo_key and cfg.get("session_memory"):
                 try:
                     store.session_approve(sid, decision.memo_key)
                 except Exception:
                     pass
-            decision.action = events.DEFER  # approved -> let the tool run
+            action = events.DEFER  # approved -> let the tool run
         else:
-            decision.action = events.DENY
-            if approved is None:
+            action = events.DENY
+            if outcome in {"provider-unavailable", "provider-timeout", "provider-error",
+                           "headless-deny", "not-prompt-eligible",
+                           "policy-revision-unavailable"}:
                 decision.reason = ((decision.reason + " | ") if decision.reason else "") + \
-                    ("No approval dialog was available (or it timed out), so this was "
-                     "blocked. Re-run in an interactive desktop session to approve, or "
-                     "perform the action deliberately via `agw`.")
+                    ("Approval could not be safely obtained, so this action was blocked.")
 
     out = {}
-    if decision.action in (events.ALLOW, events.ASK, events.DENY):
-        reason = decision.reason
+    if action in (events.ALLOW, events.ASK, events.DENY):
+        if action == events.DENY:
+            reason = presentation.build_denial_feedback(
+                GuardrailDecision.from_legacy(decision), approval_outcome
+            )
+        else:
+            reason = decision.reason
         if decision.warnings:
             reason = (reason + " | " if reason else "") + "; ".join(decision.warnings)
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": decision.action,
+            "permissionDecision": action,
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
