@@ -17,23 +17,23 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.3.0-rc.2`
+## Release gate for `0.3.0`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.3.0-rc.2` before that tag exists.
+   `v0.3.0` before that tag exists.
 
-2. Confirm all three versions are `0.3.0-rc.2`, then run:
+2. Confirm all three versions are `0.3.0`, then run:
 
    ```bash
    python -m pytest -q
    python -m pytest -q tests/test_packaging.py tests/test_host_conformance.py
    ```
 
-   For the Windows-first `0.3.0-rc.2` field test, Windows CI and the packed-
-   artifact tests are release-blocking. Linux and macOS remain in the matrix as
-   advisory preview signals; failures there must be documented but do not block
-   committing or locally installing this RC. Equivalent Linux/macOS validation
-   is required before promoting the candidate to stable `0.3.0`.
+   For the Windows-first `0.3.0` release, Windows CI and the packed-artifact
+   tests are release-blocking. Linux and macOS remain in the matrix as advisory
+   preview signals; failures there must be documented but do not block the
+   Windows release. Equivalent real-machine validation is required before
+   describing either preview platform as production-ready.
 
    Windows must use explicit literal shards rather than a monolithic pytest
    step. The workflow's timeout values are hard failure caps, not expected
@@ -95,24 +95,26 @@ release must bump the version.
    `Cancel (recommended)`, and no duplicated action. Close or cancel the test-only dialog; the
    script performs no underlying operation.
 
-3. Commit and push the verified candidate. Do not tag an unverified tree.
+3. Commit and push the verified release branch, then merge it through a ready
+   pull request. Do not tag an unverified or unmerged tree.
 
    ```bash
    git add plugin .claude-plugin/marketplace.json docs/HOST_PARITY.md RELEASING.md .github/workflows/conformance.yml
-   git commit -m "Release candidate v0.3.0-rc.2"
-   git push origin main
+   git commit -m "Release Agentic Guardrails 0.3.0"
+   git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.3.0-rc.2 --target <verified-commit-sha> \
-     --title "v0.3.0-rc.2" --prerelease --notes "..."
+   gh release create v0.3.0 --target <verified-main-commit-sha> \
+     --title "v0.3.0" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.3.0-rc.2`, rerun JSON and artifact conformance, and commit/push
-   the catalog pointer update. This tag-exists gate is mandatory.
+   `main` to `v0.3.0`, rerun JSON and artifact conformance, and merge the catalog
+   pointer update through a follow-up pull request. This tag-exists gate is
+   mandatory.
 
 ## How users update
 

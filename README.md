@@ -10,12 +10,12 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Development status:** `0.3.0-rc.2` is a Windows-first release candidate.
+> **Release status:** `0.3.0` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
-> the shared code is designed to be cross-platform, but this candidate has not
+> the shared code is designed to be cross-platform, but this release has not
 > yet received equivalent real-machine validation on those operating systems.
-> Use the RC there only for development testing and report platform-specific
+> Use it there only for development testing and report platform-specific
 > issues before relying on it for production work.
 
 **The core promise: preserve user work through CRUA instead of permanent deletion.**
