@@ -14,7 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.3.0-rc.1"
+VERSION = "0.3.0-rc.2"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -375,7 +375,9 @@ def test_windows_launcher_never_uses_file_association_and_preserves_exit(packed_
     launcher = packed_plugin / "bin" / "agw.cmd"
     text = launcher.read_text(encoding="utf-8").lower()
     assert "py.exe -3" in text
-    assert "python.exe" in text
+    assert "where python" in text
+    assert "call python" in text
+    assert text.index("where python") < text.index("where py.exe")
     assert "scripts\\agw\\agw.py" in text
     assert "start " not in text
     if os.name != "nt":

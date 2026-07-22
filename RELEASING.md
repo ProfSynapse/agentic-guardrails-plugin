@@ -17,19 +17,19 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.3.0-rc.1`
+## Release gate for `0.3.0-rc.2`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.3.0-rc.1` before that tag exists.
+   `v0.3.0-rc.2` before that tag exists.
 
-2. Confirm all three versions are `0.3.0-rc.1`, then run:
+2. Confirm all three versions are `0.3.0-rc.2`, then run:
 
    ```bash
    python -m pytest -q
    python -m pytest -q tests/test_packaging.py tests/test_host_conformance.py
    ```
 
-   For the Windows-first `0.3.0-rc.1` field test, Windows CI and the packed-
+   For the Windows-first `0.3.0-rc.2` field test, Windows CI and the packed-
    artifact tests are release-blocking. Linux and macOS remain in the matrix as
    advisory preview signals; failures there must be documented but do not block
    committing or locally installing this RC. Equivalent Linux/macOS validation
@@ -99,19 +99,19 @@ release must bump the version.
 
    ```bash
    git add plugin .claude-plugin/marketplace.json docs/HOST_PARITY.md RELEASING.md .github/workflows/conformance.yml
-   git commit -m "Release candidate v0.3.0-rc.1"
+   git commit -m "Release candidate v0.3.0-rc.2"
    git push origin main
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.3.0-rc.1 --target <verified-commit-sha> \
-     --title "v0.3.0-rc.1" --prerelease --notes "..."
+   gh release create v0.3.0-rc.2 --target <verified-commit-sha> \
+     --title "v0.3.0-rc.2" --prerelease --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.3.0-rc.1`, rerun JSON and artifact conformance, and commit/push
+   `main` to `v0.3.0-rc.2`, rerun JSON and artifact conformance, and commit/push
    the catalog pointer update. This tag-exists gate is mandatory.
 
 ## How users update

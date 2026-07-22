@@ -18,8 +18,9 @@ def _launcher(platform=None):
 
 _AGW = _launcher()
 _WINDOWS_PREREQUISITE = (
-    " On Windows, Guardrails hooks use the Python Launcher for Python 3 "
-    "(py.exe -3). If it is unavailable, explain that prerequisite in ordinary "
+    " On Windows, the packaged Guardrails CLI automatically selects an accessible "
+    "Python 3 interpreter (python, then py.exe -3). If neither works, explain "
+    "that prerequisite in ordinary "
     "language; do not change PATH or rely on a file association."
     if os.name == "nt" else ""
 )
