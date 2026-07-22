@@ -110,7 +110,7 @@ def test_distributable_manifest_versions_are_aligned():
     market = _manifest(ROOT / ".claude-plugin" / "marketplace.json")["plugins"][0]
     assert claude["version"] == codex["version"] == market["version"] == VERSION
     assert re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", VERSION)
-    assert market["source"]["ref"] == "main"
+    assert market["source"]["ref"] == f"v{VERSION}"
 
 
 def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugin):
