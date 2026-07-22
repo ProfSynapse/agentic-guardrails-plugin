@@ -185,3 +185,31 @@ def test_cli_doctor_runs(agw_home):
     result = run_agw("doctor", "--json")
     data = json.loads(result.stdout)
     assert data["agw_home_writable"] is True
+
+
+def test_cli_doctor_uses_real_archive_write_probe(tmp_path):
+    blocked_home = tmp_path / "blocked-home"
+    blocked_home.mkdir()
+    (blocked_home / "archive").write_text("not a directory")
+    result = run_agw("doctor", "--json", env={"AGW_HOME": str(blocked_home)})
+    data = json.loads(result.stdout)
+    assert data["agw_home_writable"] is False
+
+
+def test_cli_archive_permission_failure_is_plain_and_preserves_source(tmp_path):
+    blocked_home = tmp_path / "blocked-home"
+    blocked_home.mkdir()
+    (blocked_home / "archive").write_text("not a directory")
+    source = tmp_path / "keep-me.txt"
+    source.write_text("still here")
+
+    result = run_agw(
+        "archive", str(source), check=False, env={"AGW_HOME": str(blocked_home)}
+    )
+
+    assert result.returncode != 0
+    assert source.read_text() == "still here"
+    assert "original file was not moved or changed" in result.stderr.lower()
+    assert "host's normal approval" in result.stderr.lower()
+    assert "traceback" not in result.stderr.lower()
+    assert str(blocked_home).lower() not in result.stderr.lower()

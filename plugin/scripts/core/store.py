@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import time
 from datetime import datetime
 
@@ -25,10 +26,41 @@ from . import archive_transactions as archive_tx
 SCHEMA_VERSION = 1
 
 
+def agw_home_path() -> str:
+    """Return the configured recovery-store path without touching the filesystem."""
+    return os.environ.get("AGW_HOME") or os.path.join(os.path.expanduser("~"), ".agw")
+
+
 def agw_home() -> str:
-    home = os.environ.get("AGW_HOME") or os.path.join(os.path.expanduser("~"), ".agw")
+    home = agw_home_path()
     os.makedirs(home, exist_ok=True)
     return home
+
+
+def archive_store_writable() -> bool:
+    """Verify real write access to the recovery store used by archive operations.
+
+    ``os.access`` is not sufficient on sandboxed Windows hosts: the underlying
+    ACL may look writable even though the active sandbox token cannot create an
+    archive entry. Probe each internal write area with an empty temporary
+    directory and immediately remove only that probe. No user data is involved.
+    """
+    probes = []
+    try:
+        home = agw_home()
+        for name in ("archive", "transactions", "locks"):
+            directory = os.path.join(home, name)
+            os.makedirs(directory, exist_ok=True)
+            probes.append(tempfile.mkdtemp(prefix=".agw-write-probe-", dir=directory))
+        return True
+    except OSError:
+        return False
+    finally:
+        for probe in reversed(probes):
+            try:
+                os.rmdir(probe)
+            except OSError:
+                pass
 
 
 def _ts() -> str:

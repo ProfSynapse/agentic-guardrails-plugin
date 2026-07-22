@@ -30,10 +30,13 @@ ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archiv
                     "instead — it moves files to the archive store and is fully reversible "
                     "with `agw restore`.")
 
-# agw verbs the agent may run without prompts; everything else asks.
+# agw verbs the agent may run without Guardrails prompts. Archive and snapshot
+# are the reversible CRUA alternatives Guardrails itself recommends; a host
+# sandbox may still request its normal outside-workspace approval for ~/.agw.
 AGW_READ_ONLY_VERBS = {"scan", "diff", "status", "log", "doctor"}
+AGW_SAFETY_VERBS = {"archive", "snapshot"}
 AGW_MUTATING_VERBS = {
-    "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
+    "init", "checkout", "convert", "move", "rename",
     "restore", "undo", "publish", "office",
 }
 AGW_OFFICE_READ_ONLY_VERBS = {"info", "get-text"}
@@ -1082,7 +1085,7 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 enforcement_class=NON_WAIVABLE_INVARIANT,
                 presentation_context=context,
             )
-        if verb in AGW_READ_ONLY_VERBS:
+        if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFETY_VERBS:
             return Decision(ALLOW, "", "builtin:agw")
         if verb == "office":
             verb_index = args.index(verb)

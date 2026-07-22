@@ -116,6 +116,19 @@ def test_unknown_target_is_honest_and_cancel_is_recommended():
     assert request.default_choice == "cancel"
 
 
+def test_known_reversible_guardrails_change_recommends_allow():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:agw-ask",
+        policy_revision="revision-a",
+        presentation_context=events.DecisionContext.RESTORE_FILES,
+    )
+    event = events.ToolEvent(kind=events.EXEC, command="private raw text")
+    request = presentation.build_prompt(decision, {"event_id": "restore"}, [event])
+    assert request.allow_label == "Allow once (recommended)"
+    assert request.cancel_label == "Cancel"
+    assert request.default_choice == "allow"
+
+
 def test_hard_denial_feedback_is_actionable_and_tells_agent_to_explain():
     decision = GuardrailDecision(
         events.DENY,

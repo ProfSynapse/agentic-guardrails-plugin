@@ -31,7 +31,10 @@ launcher shown here, followed by a documented Guardrails operation: `{_AGW}`.\
 {_WINDOWS_PREREQUISITE} File-safety rules:
 - Deletion is disabled - both shell `rm` and `apply_patch` "Delete File" blocks. \
 Use `{_AGW} archive <path>` (reversible via `{_AGW} restore <path>`); `{_AGW} undo` reverts \
-the last operation.
+the last operation. On sandboxed hosts, the recovery store may require the host's \
+ordinary outside-workspace approval. Request that approval for the exact Guardrails \
+operation; never change ACLs, filesystem permissions, PATH, or security settings to \
+work around the sandbox.
 - To modify Office/proprietary documents, use the CRUA flow: `{_AGW} checkout <file>` \
 (creates an editable markdown/csv working copy in _workspace/), edit the working \
 copy, then `{_AGW} publish <file>` (archives the old version and replaces the original).

@@ -289,6 +289,13 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
     action, reason, consequence, safeguard = _copy(decision, evlist)
     event_id = str(payload.get("event_id") or payload.get("invocation_id") or
                    payload.get("tool_use_id") or "")
+    recommended_allow = (
+        decision.rule_id == "builtin:agw-ask"
+        and decision.presentation_context in {
+            events.DecisionContext.AGW_MUTATION,
+            events.DecisionContext.RESTORE_FILES,
+        }
+    )
     return PromptRequest(
         title="Agent safety check",
         action=action,
@@ -301,4 +308,7 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
             payload, evlist, decision.policy_revision
         ),
         policy_revision=decision.policy_revision,
+        allow_label=("Allow once (recommended)" if recommended_allow else "Allow once"),
+        cancel_label=("Cancel" if recommended_allow else "Cancel (recommended)"),
+        default_choice=("allow" if recommended_allow else "cancel"),
     )

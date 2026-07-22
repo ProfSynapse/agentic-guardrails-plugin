@@ -47,10 +47,15 @@ def test_agw_read_only_verbs_allowed(evaluate):
         assert evaluate(command).action == ALLOW, command
 
 
+def test_agw_crua_safety_verbs_allowed_without_redundant_prompt(evaluate):
+    for command in ("agw archive file.docx", "agw snapshot ."):
+        assert evaluate(command).action == ALLOW, command
+
+
 def test_agw_mutating_and_unknown_verbs_ask_nonwaivably(evaluate):
     commands = (
-        "agw archive file.docx", "agw checkout report.docx", "agw restore file.docx",
-        "agw snapshot .", "agw publish report.docx", "agw office set-cell book.xlsx",
+        "agw checkout report.docx", "agw restore file.docx",
+        "agw publish report.docx", "agw office set-cell book.xlsx",
         "agw future-operation file.txt", "agw --json",
     )
     for command in commands:

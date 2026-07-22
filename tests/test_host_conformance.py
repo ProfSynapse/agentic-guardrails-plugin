@@ -94,6 +94,18 @@ def test_sessionstart_uses_platform_native_launcher():
             assert "`agw <cmd>`" not in module.CONTEXT
 
 
+def test_sessionstart_uses_host_approval_without_security_workarounds():
+    from claude import sessionstart as claude_start
+    from codex import sessionstart as codex_start
+
+    for module in (claude_start, codex_start):
+        context = module.CONTEXT.lower()
+        assert "outside-workspace approval" in context
+        assert "never change acls" in context
+        assert "filesystem permissions" in context
+        assert "path" in context
+
+
 def test_host_registry_marks_only_maintained_hosts_release_blocking():
     text = (ROOT / "docs" / "HOST_PARITY.md").read_text(encoding="utf-8").lower()
     assert "| claude code | supported | yes |" in text
