@@ -6,7 +6,7 @@ import shutil
 
 from core import engine
 from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, POLICY_ENFORCEMENT, \
-    READ, WRITE, ToolEvent
+    READ, WRITE, DecisionContext, ToolEvent
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
@@ -354,6 +354,18 @@ def test_mcp_destructive_token_takes_precedence(policy):
     decision = engine.evaluate(
         _ev(MCP, tool="mcp__drive__get_and_delete_file"), policy, REPO)
     assert decision.action == DENY
+
+
+def test_mcp_non_destructive_mutation_asks(policy):
+    for tool in (
+        "mcp__github__create_pull_request",
+        "mcp__drive__update_file",
+        "mcp__store__upload_document",
+    ):
+        decision = engine.evaluate(_ev(MCP, tool=tool), policy, REPO)
+        assert decision.action == ASK, tool
+        assert decision.rule_id == "builtin:mcp-mutation", tool
+        assert decision.presentation_context == DecisionContext.CONNECTED_SERVICE
 
 
 def test_trusted_agw_path_rejects_sibling_prefix(tmp_path):

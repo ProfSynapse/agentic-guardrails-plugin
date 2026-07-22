@@ -314,6 +314,22 @@ def test_mcp_shell_exfil_through_patch_tool_still_evaluated():
     assert _decision(out) == "deny"
 
 
+def test_connected_service_mutation_asks_without_local_preimage(tmp_path):
+    out = run_hook({
+        "tool_name": "mcp__github__create_pull_request",
+        "tool_input": {"head": "feature", "base": "main"},
+        "cwd": str(tmp_path),
+        "session_id": "connected-create",
+    }, env_extra={"AGW_HOME": str(tmp_path / "home")})
+    # The deterministic headless provider declines ASK decisions. The denial
+    # must come from missing human approval, not from an impossible local-file
+    # preimage requirement for remote service data.
+    assert _decision(out) == "deny"
+    reason = _reason(out)
+    assert "safely obtain approval" in reason.lower()
+    assert "local recovery" not in reason.lower()
+
+
 def test_crash_fails_to_ask(tmp_path):
     bad_root = tmp_path / "bad-plugin"
     bad_root.mkdir()

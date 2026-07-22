@@ -79,6 +79,8 @@ def test_closed_prompt_copy_uses_safe_categories_not_raw_inputs():
          "requested search scope", "search broadly"),
         ("builtin:git-restore", events.DecisionContext.RESTORE_FILES,
          "selected working file", "restore working files"),
+        ("builtin:mcp-mutation", events.DecisionContext.CONNECTED_SERVICE,
+         "connected service", "change information"),
     )
     for rule_id, context, target_text, action_text in cases:
         decision = GuardrailDecision(

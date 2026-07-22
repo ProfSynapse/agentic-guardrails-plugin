@@ -339,14 +339,15 @@ def test_archive_failure_is_hard_deny(tmp_path):
     assert "recovery" in out["hookSpecificOutput"]["permissionDecisionReason"].lower()
 
 
-def test_external_mutation_without_local_recovery_is_denied(tmp_path):
+def test_external_mutation_asks_instead_of_requiring_local_recovery(tmp_path):
     out = run_hook({"tool_name": "mcp__drive__update_file",
                     "tool_input": {"id": "remote"}, "cwd": str(tmp_path),
                     "session_id": "t-external", "hook_event_name": "PreToolUse"},
                    env_extra={"AGW_HOME": str(tmp_path / "home")})
-    assert _decision(out) == "deny"
-    assert "outside the local recovery store" in \
-        out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert _decision(out) == "ask"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "connected service" in reason.lower()
+    assert "local recovery store" not in reason.lower()
 
 
 @pytest.mark.parametrize("command,reason", [

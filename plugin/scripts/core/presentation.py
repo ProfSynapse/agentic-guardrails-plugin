@@ -71,6 +71,11 @@ _COPY_BY_RULE = {
         "Removing or unlinking a connected item needs confirmation.",
         "Information in the connected service may no longer be available here.",
     ),
+    "builtin:mcp-mutation": (
+        "The agent wants to change information in a connected service.",
+        "This external change needs your approval before it continues.",
+        "The service may create or update an item.",
+    ),
     "builtin:git-checkout": (
         "The agent wants to replace uncommitted working-file changes.",
         "This source-control operation can discard local edits.",

@@ -1397,6 +1397,10 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
 _MCP_DESTROY_VERBS = {"delete", "destroy", "purge", "trash", "erase", "wipe",
                       "shred", "rm", "rmdir", "truncate", "drop"}
 _MCP_REMOVE_VERBS = {"remove", "unlink", "discard", "detach"}
+_MCP_MUTATION_VERBS = {
+    "add", "copy", "create", "edit", "move", "rename", "replace",
+    "truncate", "update", "upload", "write",
+}
 # Safe verbs that neutralize a destructive-sounding token, so read-only or
 # recovery tools aren't blocked: restore_from_trash, list_deleted_files,
 # undelete_item, get_trash.
@@ -1434,6 +1438,18 @@ def _eval_mcp(event: ToolEvent, policy: Policy) -> Decision:
                                            "(CRUA: archive instead of deleting).",
                                      "builtin:mcp-delete"))
         elif tokens & _MCP_REMOVE_VERBS:
-            verdicts.append(Decision(ASK, "This connector tool performs a remove/unlink "
-                                          "operation — confirm intent.", "builtin:mcp-remove"))
+            verdicts.append(Decision(
+                ASK,
+                "This connector tool performs a remove/unlink operation — confirm intent.",
+                "builtin:mcp-remove",
+                presentation_context=DecisionContext.CONNECTED_SERVICE,
+            ))
+        elif tokens & _MCP_MUTATION_VERBS:
+            verdicts.append(Decision(
+                ASK,
+                "This action creates or changes information in a connected service. "
+                "Confirm that the external change is intended.",
+                "builtin:mcp-mutation",
+                presentation_context=DecisionContext.CONNECTED_SERVICE,
+            ))
     return worst(verdicts) if verdicts else Decision()

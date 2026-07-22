@@ -148,11 +148,14 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                         "the command may change local files, but every target could not be identified"
                     )
                 continue
-            if ev.kind == events.MCP and (_tool_words(ev.tool) & _MUTATION_WORDS):
-                result.mutating = True
-                raise ValueError(
-                    "this connected-service operation changes data outside the local recovery store"
-                )
+            if ev.kind == events.MCP:
+                # This planner protects local filesystem targets by taking
+                # pre-change recovery copies. Connected-service actions do not
+                # have local files to snapshot; the engine applies their own
+                # consent/CRUA policy instead. MCP shell tools are routed to
+                # EXEC before reaching this planner, so local mutations issued
+                # through a connector still receive normal preimage coverage.
+                continue
             if ev.kind == events.OTHER and (_tool_words(ev.tool) & _MUTATION_WORDS):
                 result.mutating = True
                 raise ValueError(
