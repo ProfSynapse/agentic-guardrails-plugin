@@ -73,6 +73,13 @@ _SPECS = {
         frozenset(_COMMON_VALUES | {"path", "literalpath", "stream"}),
         {"literalpath": "path"},
     ),
+    "new-item": CommandSpec(
+        frozenset({"new-item", "mkdir", "md", "ni"}),
+        ("path",), frozenset({"path"}),
+        frozenset(_COMMON_SWITCHES),
+        frozenset(_COMMON_VALUES | {"path", "literalpath", "itemtype", "value"}),
+        {"literalpath": "path"},
+    ),
 }
 
 _ALIASES = {

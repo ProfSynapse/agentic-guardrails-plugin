@@ -6,6 +6,7 @@ import os
 import re
 
 from . import events
+from .shellparse import ParseUncertain, extract_commands
 
 
 _LOCAL_MUTATION = re.compile(
@@ -19,6 +20,55 @@ _MUTATION_WORDS = {
     "add", "copy", "create", "delete", "edit", "move", "remove", "rename",
     "replace", "truncate", "update", "upload", "write",
 }
+_LOCAL_MUTATION_NAMES = {
+    "rm", "del", "erase", "rmdir", "remove-item", "mkdir", "md", "ni",
+    "touch", "new-item", "set-content", "out-file", "copy-item", "move-item",
+    "copy", "move", "ren", "rename", "cp", "mv", "install", "tee", "dd",
+    "truncate",
+}
+
+
+def _unquoted_surface(command: str) -> str:
+    """Preserve executable syntax while blanking quoted data arguments."""
+    out = []
+    quote = ""
+    escaped = False
+    for char in str(command or ""):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char in {"\\", "`"} and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = ""
+            out.append(" ")
+        elif char in {"'", '"'}:
+            quote = char
+            out.append(" ")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
+    """Detect mutation command heads without treating quoted search data as code."""
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return bool(_LOCAL_MUTATION.search(_unquoted_surface(command)))
+    for cmd in parsed.commands:
+        name = cmd.name
+        if name in _LOCAL_MUTATION_NAMES:
+            return True
+        if name == "git" and len(cmd.argv) > 1 \
+                and cmd.argv[1].lower() in {"clean", "reset", "checkout", "restore"}:
+            return True
+        if name == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in cmd.argv[1:]):
+            return True
+        if name == "perl" and any(arg.startswith("-") and "i" in arg[1:]
+                                  for arg in cmd.argv[1:]):
+            return True
+    return False
 
 
 @dataclass
@@ -82,8 +132,9 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                 targets = clobber_resolver(
                     ev.command, ev.cwd, include_absent=True, dialect=dialect
                 )
-                looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(ev.command or "")) \
-                    or bool(_LOCAL_MUTATION.search(ev.command or ""))
+                surface = _unquoted_surface(ev.command)
+                looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
+                    or _looks_locally_mutating(ev.command, dialect=dialect)
                 if not getattr(targets, "complete", True):
                     result.mutating = True
                     raise ValueError(getattr(targets, "reason", "") or

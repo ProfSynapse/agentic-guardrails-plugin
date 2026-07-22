@@ -360,3 +360,33 @@ def test_powershell_ambiguous_backtick_target_is_incomplete(script, tmp_path):
     ], engine.clobber_targets)
     assert plan.mutating
     assert not plan.complete
+
+
+def test_literal_new_item_directory_has_complete_target(tmp_path):
+    target = tmp_path / "new-directory"
+    event = ToolEvent(
+        kind=EXEC,
+        tool="PowerShell",
+        command=f"New-Item -ItemType Directory -Path '{target}' -Force",
+        cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating
+    assert plan.complete
+    assert plan.targets == [os.path.normcase(os.path.realpath(str(target)))]
+
+
+def test_quoted_diagnostic_pattern_is_not_treated_as_mutation(tmp_path):
+    event = ToolEvent(
+        kind=EXEC,
+        tool="PowerShell",
+        command=(
+            "rg -n 'New-Item|mkdir|remove-item' plugin tests "
+            "| Select-Object -First 20"
+        ),
+        cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert not plan.mutating
+    assert plan.complete
+    assert plan.targets == []
