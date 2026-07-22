@@ -193,6 +193,11 @@ def _config_problem(config, buttons) -> str:
     return ""
 
 
+def _default_button_id(request: PromptRequest, allow_id: int, cancel_id: int) -> int:
+    """Map the reviewed recommendation to the native dialog's focused button."""
+    return allow_id if request.default_choice == "allow" else cancel_id
+
+
 @contextmanager
 def _common_controls_v6(kernel32):
     if not os.path.isfile(_COMMON_CONTROLS_MANIFEST):
@@ -276,7 +281,9 @@ class NativeApprovalProvider(ApprovalProvider):
         config.pszContent = request.primary_text()
         config.cButtons = 2
         config.pButtons = buttons
-        config.nDefaultButton = self.CANCEL_ID
+        config.nDefaultButton = _default_button_id(
+            request, self.ALLOW_ID, self.CANCEL_ID
+        )
         problem = _config_problem(config, buttons)
         if problem:
             return ApprovalResponse(

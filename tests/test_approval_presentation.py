@@ -127,6 +127,13 @@ def test_known_reversible_guardrails_change_recommends_allow():
     assert request.allow_label == "Allow once (recommended)"
     assert request.cancel_label == "Cancel"
     assert request.default_choice == "allow"
+    assert approvals._default_button_id(request, 100, 101) == 100
+
+
+def test_cancel_recommendation_is_native_dialog_default():
+    _decision, request = _request()
+    assert request.default_choice == "cancel"
+    assert approvals._default_button_id(request, 100, 101) == 101
 
 
 def test_hard_denial_feedback_is_actionable_and_tells_agent_to_explain():
