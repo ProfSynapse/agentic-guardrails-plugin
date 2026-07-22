@@ -1,8 +1,9 @@
 """Shell parser unit tests."""
 import pytest
 
-from core.shellparse import (FLAG_DECODE_PIPE, FLAG_INDIRECT, ParseUncertain,
-                             extract_commands, extract_payloads)
+from core.shellparse import (DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_INDIRECT,
+                             FLAG_INNER_UNCERTAIN, ParseUncertain, extract_commands,
+                             extract_payloads)
 
 
 def names(command):
@@ -89,6 +90,25 @@ def test_var_assignment_prefix():
     assert names("FOO=bar ls -la") == ["ls"]
 
 
+def test_powershell_subexpression_not_posix_unbalanced():
+    parsed = extract_commands("Write-Host $(Get-Date)")
+    assert {c.name for c in parsed.commands} >= {"write-host", "get-date"}
+    assert FLAG_INDIRECT not in parsed.flags
+
+
+def test_powershell_literal_variable_invocation_resolves():
+    parsed = extract_commands("$cmd = 'Get-Date'; & $cmd")
+    assert "get-date" in [c.name for c in parsed.commands]
+    assert FLAG_INDIRECT not in parsed.flags
+
+
+def test_powershell_env_assignment_prefix_is_data():
+    parsed = extract_commands(
+        "$env:AGW_TEST_MODE='1'; $env:AGW_APPROVAL_PROVIDER='headless'; python -m pytest")
+    assert [c.name for c in parsed.commands] == ["python"]
+    assert FLAG_INDIRECT not in parsed.flags
+
+
 def test_windows_backslash_path_preserved():
     # shlex(posix) would eat the backslash and collapse `secrets\.env` to
     # `secrets.env`; the normalizer keeps it so path detection still works.
@@ -108,3 +128,52 @@ def test_posix_backslash_escapes_still_work():
 def test_exe_suffix_stripped_from_name():
     assert names("curl.exe https://x") == ["curl"]
     assert names(r"C:\tools\wget.exe url") == ["wget"]
+
+
+def test_powershell_wrapper_and_encoded_payload_preserve_dialect():
+    direct = extract_commands('powershell -Command "Set-Content victim.txt changed"')
+    inner = next(cmd for cmd in direct.commands if cmd.name == "set-content")
+    assert inner.dialect == DIALECT_POWERSHELL
+
+
+@pytest.mark.parametrize("escaped,canonical", [
+    ("victim`.txt", "victim.txt"),
+    ("victim`-old.txt", "victim-old.txt"),
+    ("victim`_old.txt", "victim_old.txt"),
+    ("dir`/victim.txt", "dir/victim.txt"),
+    (r"dir`\victim.txt", r"dir\victim.txt"),
+])
+def test_powershell_static_backtick_escape_table(escaped, canonical):
+    parsed = extract_commands(
+        f"Set-Content {escaped} changed", dialect=DIALECT_POWERSHELL
+    )
+    assert parsed.commands[0].argv == ["Set-Content", canonical, "changed"]
+
+
+@pytest.mark.parametrize("script", [
+    "Set-Content victim`$name changed",
+    'Set-Content victim`"name changed',
+    "Set-Content victim`n.txt changed",
+    "Set-Content victim` changed",
+    "Set-Content victim`\n.txt changed",
+])
+def test_powershell_ambiguous_backtick_escapes_are_uncertain(script):
+    with pytest.raises(ParseUncertain):
+        extract_commands(script, dialect=DIALECT_POWERSHELL)
+
+
+def test_encoded_powershell_inner_failure_preserves_payload_provenance():
+    import base64
+    script = "Set-Content victim`n.txt changed"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    parsed = extract_commands(f"pwsh -EncodedCommand {encoded}")
+    assert FLAG_INNER_UNCERTAIN in parsed.flags
+    assert script in parsed.payloads
+
+    import base64
+    encoded = base64.b64encode(
+        "Set-Content victim.txt changed".encode("utf-16-le")
+    ).decode()
+    parsed = extract_commands(f"pwsh -EncodedCommand {encoded}")
+    inner = next(cmd for cmd in parsed.commands if cmd.name == "set-content")
+    assert inner.dialect == DIALECT_POWERSHELL

@@ -1,9 +1,12 @@
 """Engine behavior beyond the corpus: redirects, tiers, write/read guards."""
 import json
+import json
 import os
+import shutil
 
 from core import engine
-from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, READ, WRITE, ToolEvent
+from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, POLICY_ENFORCEMENT, \
+    READ, WRITE, ToolEvent
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
@@ -37,13 +40,70 @@ def test_windows_delete_regenerable_allowed(evaluate):
     assert evaluate("shred node_modules").action == DENY
 
 
-def test_agw_verbs_allowed(evaluate):
-    assert evaluate("agw archive file.docx").action == ALLOW
-    assert evaluate("agw checkout report.docx").action == ALLOW
+def test_agw_read_only_verbs_allowed(evaluate):
+    for command in ("agw scan .", "agw diff report.docx", "agw status",
+                    "agw log", "agw doctor", "agw office info report.docx",
+                    "agw office get-text report.docx"):
+        assert evaluate(command).action == ALLOW, command
+
+
+def test_agw_mutating_and_unknown_verbs_ask_nonwaivably(evaluate):
+    commands = (
+        "agw archive file.docx", "agw checkout report.docx", "agw restore file.docx",
+        "agw snapshot .", "agw publish report.docx", "agw office set-cell book.xlsx",
+        "agw future-operation file.txt", "agw --json",
+    )
+    for command in commands:
+        decision = evaluate(command)
+        assert decision.action == ASK, command
+        assert decision.enforcement_class.name == "NON_WAIVABLE_INVARIANT"
+
+
+def test_agw_help_has_no_empty_unknown_verb(evaluate):
+    for command in ("agw --help", "agw -h", "agw.py --version"):
+        decision = evaluate(command)
+        assert decision.action == ALLOW
+        assert "unknown" not in (decision.reason or "").lower()
 
 
 def test_agw_prune_always_asks(evaluate):
     assert evaluate("agw prune --yes-i-am-a-human").action == ASK
+
+
+def test_packaged_agw_cmd_requires_exact_trusted_origin(policy, tmp_path, monkeypatch):
+    packaged = os.path.join(REPO, "bin", "agw.cmd")
+    trusted = _ev("exec", tool="PowerShell", command=f'"{packaged}" status',
+                  cwd=str(tmp_path))
+    assert engine.evaluate(trusted, policy, REPO).action == ALLOW
+
+    for wrapper in (
+        f'cmd /c "\\"{packaged}\\" status"',
+        f'powershell -Command "& \'{packaged}\' status"',
+    ):
+        decision = engine.evaluate(
+            _ev("exec", tool="PowerShell", command=wrapper, cwd=str(tmp_path)),
+            policy, REPO,
+        )
+        assert decision.action == ALLOW, wrapper
+
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: packaged)
+    assert engine.evaluate(
+        _ev("exec", tool="PowerShell", command="agw.cmd status", cwd=str(tmp_path)),
+        policy, REPO,
+    ).action == ALLOW
+
+
+def test_workspace_or_path_agw_cmd_shim_is_never_privileged(policy, tmp_path, monkeypatch):
+    shim = tmp_path / "agw.cmd"
+    shim.write_text("not the packaged launcher")
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: str(shim))
+    for command in ("agw.cmd status", f'"{shim}" status'):
+        decision = engine.evaluate(
+            _ev("exec", tool="PowerShell", command=command, cwd=str(tmp_path)),
+            policy, REPO,
+        )
+        assert decision.action == DENY
+        assert decision.rule_id == "builtin:agw-impostor"
 
 
 def test_git_checkout_branch_vs_discard(evaluate):
@@ -60,7 +120,19 @@ def test_deeply_nested_fails_closed(evaluate):
     cmd = "echo hi"
     for _ in range(10):
         cmd = f"echo $({cmd})"
-    assert evaluate(cmd).action in (ASK, DENY)
+    assert evaluate(cmd).action in (DEFER, ALLOW)
+
+
+def test_unresolved_mutating_indirection_denies_without_prompt(evaluate):
+    decision = evaluate('powershell -Command "& $cmd -Recurse -Force important.txt"')
+    assert decision.action == DENY
+    assert "direct command name" in decision.reason.lower()
+
+
+def test_unresolved_nonmutating_indirection_does_not_prompt(evaluate):
+    decision = evaluate('powershell -Command "& $cmd"')
+    assert decision.action in (DEFER, ALLOW)
+    assert getattr(decision, "prompt_eligible", False) is False
 
 
 def test_write_protected_plugin_path(policy):
@@ -88,7 +160,11 @@ def _sparse(path, size):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         f.truncate(size)
-    if os.stat(path).st_blocks != 0:  # filesystem doesn't support sparse files
+    import pytest
+    blocks = getattr(os.stat(path), "st_blocks", None)
+    if blocks is None:
+        pytest.skip("this platform does not expose POSIX allocated-block metadata")
+    if blocks != 0:  # filesystem doesn't support sparse files
         import pytest
         pytest.skip("no sparse-file support on this filesystem")
 
@@ -145,11 +221,14 @@ def test_zone_rules(tmp_path, agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)
     with open(os.path.join(pol_dir, "zones.yaml"), "w") as f:
-        f.write(f"paths:\n  - glob: \"{tmp_path}/secret/**\"\n    zone: no-access\n")
+        path_glob = str(tmp_path / "secret" / "**")
+        f.write(f"paths:\n  - glob: {json.dumps(path_glob)}\n    zone: no-access\n")
     policy = engine.load_policy(REPO)
     target = str(tmp_path / "secret" / "f.txt")
-    assert engine.evaluate(_ev(WRITE, paths=[target], content="x"),
-                           policy, REPO).action == DENY
+    write_decision = engine.evaluate(_ev(WRITE, paths=[target], content="x"),
+                                     policy, REPO)
+    assert write_decision.action == DENY
+    assert write_decision.enforcement_class == POLICY_ENFORCEMENT
     assert engine.evaluate(_ev(READ, tool="Read", paths=[target]),
                            policy, REPO).action == DENY
 
@@ -183,6 +262,30 @@ def test_credential_hunt_asks(evaluate):
     assert evaluate("grep password src/auth.py").action in (DEFER, ALLOW)
 
 
+def test_project_local_recursive_keyword_searches_are_routine(evaluate):
+    commands = (
+        "rg password tests",
+        "grep -R credential plugin/scripts",
+        r"Select-String -Path tests\*.py -Pattern api_key -Recurse",
+    )
+    for command in commands:
+        decision = evaluate(command)
+        assert decision.action == ALLOW, command
+        assert decision.rule_id == "builtin:project-diagnostic-search"
+
+
+def test_keyword_search_exemption_rejects_unsafe_scope_or_effect(evaluate):
+    commands = (
+        "rg password ~",
+        "grep -R credential /home",
+        "rg secret tests > findings.log",
+        r"Select-String -Path $target -Pattern token -Recurse",
+        r"Select-String -Path C:\Users -Pattern password -Recurse",
+    )
+    for command in commands:
+        assert evaluate(command).action in (ASK, DENY), command
+
+
 def test_content_prescan_on_read(policy, tmp_path):
     memo = tmp_path / "memo.txt"
     memo.write_text("Q3 plan. CONFIDENTIAL — do not distribute outside the company.")
@@ -213,6 +316,41 @@ def test_mcp_delete_denied(policy):
     assert d.action == DENY
 
 
+def test_mcp_safe_name_not_destructive_by_substring(policy):
+    safe_tools = (
+        "mcp__drive__get_deleted_files",
+        "mcp__drive__restore_from_trash",
+        "mcp__drive__get_trash",
+    )
+    for tool in safe_tools:
+        assert engine.evaluate(_ev(MCP, tool=tool), policy, REPO).action == DEFER
+
+
+def test_mcp_destructive_token_takes_precedence(policy):
+    decision = engine.evaluate(
+        _ev(MCP, tool="mcp__drive__get_and_delete_file"), policy, REPO)
+    assert decision.action == DENY
+
+
+def test_trusted_agw_path_rejects_sibling_prefix(tmp_path):
+    plugin_root = tmp_path / "plugin"
+    impostor_root = tmp_path / "plugin-evil"
+    plugin_root.mkdir()
+    (plugin_root / "policies").mkdir()
+    shutil.copyfile(
+        os.path.join(REPO, "policies", "core.yaml"),
+        plugin_root / "policies" / "core.yaml",
+    )
+    impostor_root.mkdir()
+    impostor = impostor_root / "agw"
+    impostor.write_text("not trusted")
+    policy = engine.load_policy(str(plugin_root))
+    event = _ev("exec", tool="Bash", command=f'"{impostor}" status', cwd=str(tmp_path))
+    decision = engine.evaluate(event, policy, str(plugin_root))
+    assert decision.action == DENY
+    assert decision.rule_id == "builtin:agw-impostor"
+
+
 def test_mcp_read_defers(policy):
     d = engine.evaluate(_ev(MCP, tool="mcp__google_drive__search_files"), policy, REPO)
     assert d.action == DEFER
@@ -225,7 +363,9 @@ def test_corrupt_policy_pack_degrades_with_warning(agw_home):
         f.write("commands:\n  - pattern: [unclosed\n      ::bad")
     policy = engine.load_policy(REPO)
     assert "broken.yaml" in policy.degraded
+    assert policy.health == "DEGRADED"
     # builtin guards still work
     d = engine.evaluate(ToolEvent(kind="exec", tool="Bash", command="rm -rf x"),
                         policy, REPO)
     assert d.action == DENY
+    assert d.rule_id == "policy:health-degraded"

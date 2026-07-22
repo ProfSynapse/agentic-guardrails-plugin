@@ -18,6 +18,9 @@ import shlex
 from dataclasses import dataclass, field
 
 MAX_DEPTH = 6
+DIALECT_POSIX = "posix"
+DIALECT_POWERSHELL = "powershell"
+DIALECT_CMD = "cmd"
 
 # Wrappers that pass through to the real command. Mirrors Claude Code's own
 # strip list; env-runners (npx, docker) are deliberately NOT stripped — rules
@@ -66,6 +69,7 @@ class ParseUncertain(Exception):
 class SimpleCommand:
     argv: list
     raw: str = ""
+    dialect: str = DIALECT_POSIX
 
     @property
     def name(self) -> str:
@@ -98,12 +102,95 @@ FLAG_INDIRECT = "indirect-command"    # command name comes from a variable/subst
 FLAG_DECODE_PIPE = "decode-pipe"      # base64/xxd/openssl output piped into a shell
 FLAG_DOWNLOAD_PIPE = "download-pipe"  # curl/wget piped into a shell
 FLAG_SUBSTITUTION = "substitution"    # contained $(...) or backticks (also recursed)
+FLAG_INNER_UNCERTAIN = "inner-parse-uncertain"
 
 _DECODERS = {"base64", "base32", "xxd", "openssl"}
 _DOWNLOADERS = {"curl", "wget"}
 
 _SUBST_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
+_PWSH_SUBEXPRESSION_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)")
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\1", re.DOTALL)
+_PWSH_LITERAL_ASSIGN_RE = re.compile(
+    r"(?im)(?P<prefix>^|[;\n])\s*\$(?P<name>(?:env:)?[A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*=\s*(?P<value>'[^']*'|\"[^\"]*\"|[^\s;\n]+)\s*(?=;|\n|$)")
+_PWSH_LITERAL_COMMAND_RE = re.compile(r"[A-Za-z0-9_.:/\\-]+$")
+_PWSH_INDIRECT_PREFIX = "PS_INDIRECT_"
+
+# PowerShell's grave accent escapes the following character. For target
+# recovery, accept only punctuation whose canonical form is a static path
+# character and has no expansion, quoting, control, or statement semantics.
+_PWSH_LITERAL_BACKTICK_ESCAPES = frozenset("._-/\\")
+
+
+def _canonicalize_powershell_backticks(command: str) -> str:
+    """Canonicalize the explicit safe subset of PowerShell backtick escapes."""
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == "'" and not in_double:
+            in_single = not in_single
+            out.append(char)
+            i += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            out.append(char)
+            i += 1
+            continue
+        if char != "`" or in_single:
+            out.append(char)
+            i += 1
+            continue
+        if i + 1 >= len(command):
+            raise ParseUncertain("trailing PowerShell backtick escape")
+        escaped = command[i + 1]
+        if escaped in "\r\n":
+            raise ParseUncertain("PowerShell backtick line continuation is not static")
+        if escaped not in _PWSH_LITERAL_BACKTICK_ESCAPES:
+            raise ParseUncertain(
+                f"PowerShell backtick escape for {escaped!r} is not a static path escape"
+            )
+        out.append(escaped)
+        i += 2
+    if in_single or in_double:
+        raise ParseUncertain("unterminated PowerShell quoted string")
+    return "".join(out)
+
+
+def _detect_dialect(command: str) -> str:
+    if re.search(r"(?i)\$env:[A-Za-z_]", command):
+        return DIALECT_POWERSHELL
+    if re.search(r"(?m)(?:^|[;\n])\s*\$[A-Za-z_]\w*\s*=", command):
+        return DIALECT_POWERSHELL
+    if re.search(r"\b[A-Z][A-Za-z]+-[A-Z][A-Za-z]+\b", command):
+        return DIALECT_POWERSHELL
+    return DIALECT_POSIX
+
+
+def _prepare_powershell(command: str) -> str:
+    """Resolve only inspectable literal command variables; strip assignments."""
+    literals = {}
+
+    def assignment(match):
+        name = match.group("name").lower()
+        value = match.group("value")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if not name.startswith("env:") and _PWSH_LITERAL_COMMAND_RE.fullmatch(value):
+            literals[name] = value
+        return match.group("prefix")
+
+    work = _PWSH_LITERAL_ASSIGN_RE.sub(assignment, command)
+
+    def invocation(match):
+        name = match.group(1).lower()
+        return literals.get(name, _PWSH_INDIRECT_PREFIX + name)
+
+    return re.sub(r"&\s*\$([A-Za-z_][A-Za-z0-9_]*)\b", invocation, work,
+                  flags=re.IGNORECASE)
 
 # A backslash that precedes a path-like character. shlex(posix=True) treats `\`
 # as an escape, so an unquoted Windows path like `secrets\.env` tokenizes to
@@ -161,28 +248,39 @@ def redirect_targets(command: str) -> list:
     return out
 
 
-def extract_commands(command: str, depth: int = 0) -> ParseResult:
+def extract_commands(command: str, depth: int = 0, dialect: str = None) -> ParseResult:
     if depth > MAX_DEPTH:
         raise ParseUncertain("substitution nesting too deep")
     result = ParseResult()
+    dialect = dialect or _detect_dialect(command)
+
+    if dialect == DIALECT_POWERSHELL:
+        command = _canonicalize_powershell_backticks(command)
 
     # Pull out heredoc bodies so shlex doesn't choke; bodies are inspected by
     # the engine's content rules via extract_payloads().
     work = _HEREDOC_RE.sub(lambda m: f"<<{m.group(1)} HEREDOC_BODY", command)
+    if dialect == DIALECT_POWERSHELL:
+        work = _prepare_powershell(work)
 
     # Recurse into $(...) / `...` and replace with a plain placeholder.
     def _sub(match):
         inner = match.group(1) if match.group(1) is not None else match.group(2)
         if inner.strip():
             result.flags.add(FLAG_SUBSTITUTION)
-            sub_result = extract_commands(inner, depth + 1)
+            sub_result = extract_commands(inner, depth + 1, dialect=dialect)
             result.commands.extend(sub_result.commands)
             result.flags.update(sub_result.flags)
         return "SUBST_OUT"
 
-    work = _SUBST_RE.sub(_sub, work)
-    if "$(" in work or "`" in work:
-        raise ParseUncertain("unbalanced command substitution")
+    if dialect == DIALECT_POSIX:
+        work = _SUBST_RE.sub(_sub, work)
+        if "$(" in work or "`" in work:
+            raise ParseUncertain("unbalanced command substitution")
+    elif dialect == DIALECT_POWERSHELL:
+        work = _PWSH_SUBEXPRESSION_RE.sub(_sub, work)
+        if "$(" in work:
+            raise ParseUncertain("unbalanced PowerShell subexpression")
 
     # Preserve Windows path separators so shlex doesn't strip them as escapes.
     work = _double_winpath_backslashes(work)
@@ -209,7 +307,7 @@ def extract_commands(command: str, depth: int = 0) -> ParseResult:
 
     prev_name = ""
     for seg in segments:
-        cmds = _analyze_segment(seg, result, depth)
+        cmds = _analyze_segment(seg, result, depth, dialect)
         for cmd in cmds:
             cmd.raw = command
             result.commands.append(cmd)
@@ -221,7 +319,7 @@ def extract_commands(command: str, depth: int = 0) -> ParseResult:
     return result
 
 
-def _analyze_segment(tokens, result: ParseResult, depth: int):
+def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
     """Turn one pipeline segment into SimpleCommand(s), recursing wrappers."""
     toks = list(tokens)
 
@@ -256,21 +354,26 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
     # $_ / $PSItem are the pipeline current-object (e.g. `| % { $_.Name }`), not
     # a command name from a variable, so property access on them is not
     # indirection — a destructive `$_.Delete()` is caught by the content scan.
+    if toks[0].startswith(_PWSH_INDIRECT_PREFIX):
+        result.flags.add(FLAG_INDIRECT)
+        return [SimpleCommand(argv=toks, dialect=dialect)]
+    if dialect == DIALECT_POWERSHELL and toks[0].startswith("$"):
+        return []
     if toks[0].startswith("$") or toks[0] == "SUBST_OUT":
         if not re.match(r"\$(_|psitem)\b", toks[0], re.IGNORECASE):
             result.flags.add(FLAG_INDIRECT)
-        return [SimpleCommand(argv=toks)]
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     if head_base == "eval" or (head_base == "source" and len(toks) > 1):
         result.flags.add(FLAG_EVAL)
-        return [SimpleCommand(argv=toks)]
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # PowerShell dynamic-eval / scriptblock invokers (iex, Invoke-Expression,
     # icm, Invoke-Command): the real command hides in a string/scriptblock we
     # can't tokenize, so treat like `eval` — reviewed, not silently run.
     if head_base in ("iex", "invoke-expression", "icm", "invoke-command"):
         result.flags.add(FLAG_EVAL)
-        return [SimpleCommand(argv=toks)]
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # PowerShell block / pipeline invokers: the real command sits after a
     # dot-source / ForEach / Where invoker (`. cmd`, `% cmd`, `foreach cmd`).
@@ -278,7 +381,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
     # recurse so a deletion buried behind it is still evaluated.
     if head_base in (".", "%", "foreach", "foreach-object", "?", "where",
                      "where-object") and len(toks) > 1:
-        return _analyze_segment(toks[1:], result, depth)
+        return _analyze_segment(toks[1:], result, depth, dialect)
 
     # PowerShell scriptblock `{ ... }` (e.g. after `&`, `%`, or a dot-source).
     # shlex makes `{` the argv0, hiding the verb inside the braces — strip the
@@ -289,38 +392,46 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
         inner[-1] = inner[-1].rstrip("}")
         inner = [t for t in inner if t]
         if inner and inner != toks:
-            return _analyze_segment(inner, result, depth)
+            return _analyze_segment(inner, result, depth, dialect)
 
     # bash -c "string" → recurse into the string
     if head_base in _SHELLS:
         for i, tok in enumerate(toks[1:], start=1):
             if tok == "-c" and i + 1 < len(toks):
-                inner = extract_commands(toks[i + 1], depth + 1)
+                inner = extract_commands(toks[i + 1], depth + 1,
+                                         dialect=DIALECT_POSIX)
                 result.flags.update(inner.flags)
-                return [SimpleCommand(argv=toks)] + inner.commands
-        return [SimpleCommand(argv=toks)]
+                return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # Windows interpreters. Strip a trailing .exe so 'cmd.exe'/'powershell.exe'
     # match. A destructive command can hide in their inner command line exactly
     # as it does in `bash -c`, so we recurse it and record the inner text.
     wname = head_base[:-4] if head_base.endswith(".exe") else head_base
 
-    def _recurse_inner(inner_text: str):
+    def _recurse_inner(inner_text: str, inner_dialect: str):
         if not inner_text.strip():
-            return [SimpleCommand(argv=toks)]
-        inner = extract_commands(inner_text, depth + 1)
-        result.flags.update(inner.flags)
+            return [SimpleCommand(argv=toks, dialect=dialect)]
         result.payloads.append(inner_text)
+        try:
+            inner = extract_commands(inner_text, depth + 1, dialect=inner_dialect)
+        except ParseUncertain:
+            # Keep recovered wrapper/encoded provenance even when inner syntax
+            # is uncertain. Downstream mutation planning can then deny rather
+            # than treating the opaque outer wrapper as harmless.
+            result.flags.add(FLAG_INNER_UNCERTAIN)
+            return [SimpleCommand(argv=toks, dialect=dialect)]
+        result.flags.update(inner.flags)
         result.payloads.extend(inner.payloads)
-        return [SimpleCommand(argv=toks)] + inner.commands
+        return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
 
     # cmd /c <command> / cmd /k <command> → the real command follows the switch
     if wname in _WIN_CMD:
         rest = toks[1:]
         for i, tok in enumerate(rest):
             if tok.lower() in ("/c", "/k", "/r"):
-                return _recurse_inner(" ".join(rest[i + 1:]))
-        return [SimpleCommand(argv=toks)]
+                return _recurse_inner(" ".join(rest[i + 1:]), DIALECT_CMD)
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # powershell / pwsh -Command "..." / -EncodedCommand <b64> / positional
     if wname in _PWSH:
@@ -335,11 +446,11 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
                     decoded = _decode_pwsh_encoded(rest[i + 1])
                     if decoded is None:
                         raise ParseUncertain("undecodable PowerShell -EncodedCommand")
-                    return _recurse_inner(decoded)
+                    return _recurse_inner(decoded, DIALECT_POWERSHELL)
                 break
             if stripped and _PWSH_COMMAND_RE.fullmatch(stripped):
                 # -Command consumes the remainder of the line as the script.
-                return _recurse_inner(" ".join(rest[i + 1:]))
+                return _recurse_inner(" ".join(rest[i + 1:]), DIALECT_POWERSHELL)
             if stripped and _PWSH_FILE_RE.fullmatch(stripped):
                 break  # -File <script>: a path we cannot inspect
             if stripped and _PWSH_VALUE_FLAG_RE.fullmatch(stripped):
@@ -347,9 +458,9 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
                 continue
             if not tok.startswith("-"):
                 # first positional arg is the implicit -Command body
-                return _recurse_inner(" ".join(rest[i:]))
+                return _recurse_inner(" ".join(rest[i:]), DIALECT_POWERSHELL)
             i += 1  # an unrecognized boolean switch (-NoProfile, ...)
-        return [SimpleCommand(argv=toks)]
+        return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # xargs [flags] CMD ... → the real command is what xargs runs
     if head_base == "xargs":
@@ -359,13 +470,13 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
             if flag in ("-I", "-n", "-P", "-d", "-a", "-E", "-s") and rest:
                 rest.pop(0)
         if rest:
-            inner = _analyze_segment(rest, result, depth)
-            return [SimpleCommand(argv=toks)] + inner
+            inner = _analyze_segment(rest, result, depth, dialect)
+            return [SimpleCommand(argv=toks, dialect=dialect)] + inner
         raise ParseUncertain("bare xargs with unknown command")
 
     # find ... -exec CMD ... ; → extract the -exec command
     if head_base == "find":
-        cmds = [SimpleCommand(argv=toks)]
+        cmds = [SimpleCommand(argv=toks, dialect=dialect)]
         i = 0
         while i < len(toks):
             if toks[i] in ("-exec", "-execdir", "-ok", "-okdir"):
@@ -375,11 +486,11 @@ def _analyze_segment(tokens, result: ParseResult, depth: int):
                     sub.append(toks[i])
                     i += 1
                 if sub:
-                    cmds.extend(_analyze_segment(sub, result, depth))
+                    cmds.extend(_analyze_segment(sub, result, depth, dialect))
             i += 1
         return cmds
 
-    return [SimpleCommand(argv=toks)]
+    return [SimpleCommand(argv=toks, dialect=dialect)]
 
 
 def extract_payloads(command: str) -> list:

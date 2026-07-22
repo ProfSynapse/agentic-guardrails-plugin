@@ -6,8 +6,9 @@ import os
 
 import pytest
 
-from core import engine, store
-from core.events import ALLOW, ASK, DEFER, DENY, EXEC, ToolEvent
+from core import enforcement, engine, mutations, preimages, store
+from core.events import ADVISORY, ALLOW, ASK, DEFER, DENY, EDIT, EXEC, \
+    NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, ToolEvent
 
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
@@ -15,6 +16,40 @@ REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 def _exec(command, cwd=None):
     return ToolEvent(kind=EXEC, tool="Bash", command=command, cwd=cwd or os.getcwd())
+
+
+def test_enforcement_class_defaults_fail_closed_and_merge_strongest():
+    from core.decisions import GuardrailDecision
+
+    missing = Decision(DENY, "legacy deny", "legacy", policy_revision="rev-1",
+                       enforcement_class=None)
+    unknown = Decision(DENY, "corrupt deny", "corrupt", enforcement_class="unknown")
+    policy = Decision(DENY, "company deny", "company",
+                      enforcement_class=POLICY_ENFORCEMENT)
+    assert missing.enforcement_class == NON_WAIVABLE_INVARIANT
+    assert unknown.enforcement_class == NON_WAIVABLE_INVARIANT
+    merged = missing.merge(policy)
+    assert merged.enforcement_class == NON_WAIVABLE_INVARIANT
+    assert merged.policy_revision == "rev-1"
+    structured = GuardrailDecision.from_legacy(merged)
+    assert structured.enforcement_class == NON_WAIVABLE_INVARIANT
+    assert structured.policy_revision == "rev-1"
+    assert enforcement.resolve(unknown, observe=True).action == DENY
+
+
+def test_effective_enforcement_observe_matrix():
+    policy_deny = Decision(DENY, enforcement_class=POLICY_ENFORCEMENT)
+    policy_ask = Decision(ASK, enforcement_class=POLICY_ENFORCEMENT)
+    invariant_deny = Decision(DENY, enforcement_class=NON_WAIVABLE_INVARIANT)
+    invariant_ask = Decision(ASK, enforcement_class=NON_WAIVABLE_INVARIANT)
+    advisory_deny = Decision(DENY, enforcement_class=ADVISORY)
+    advisory_ask = Decision(ASK, enforcement_class=ADVISORY)
+    assert enforcement.resolve(policy_deny, observe=True).action == DEFER
+    assert enforcement.resolve(policy_ask, observe=True).action == DEFER
+    assert enforcement.resolve(invariant_deny, observe=True).action == DENY
+    assert enforcement.resolve(invariant_ask, observe=True).action == ASK
+    assert enforcement.resolve(advisory_deny, observe=False).action == DEFER
+    assert enforcement.resolve(advisory_ask, observe=False).action == DEFER
 
 
 # --- item 1: shell clobber pre-snapshot detection ----------------------------
@@ -37,6 +72,103 @@ def test_clobber_targets_only_existing_files(tmp_path):
     # A redirect that creates a brand-new file has no pre-image to save.
     fresh = tmp_path / "brand-new.txt"
     assert engine.clobber_targets(f"echo hi > {fresh}", cwd=str(tmp_path)) == []
+
+
+def test_clobber_targets_can_plan_absent_target(tmp_path):
+    fresh = tmp_path / "brand-new.txt"
+    targets = engine.clobber_targets(
+        f"echo hi > {fresh}", cwd=str(tmp_path), include_absent=True
+    )
+    assert str(fresh) in targets
+
+
+def test_mutation_plan_rejects_ambiguous_wildcard(tmp_path):
+    event = ToolEvent(kind=EDIT, tool="Edit", paths=["*.txt"], cwd=str(tmp_path))
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating and not plan.complete
+    assert "wildcard" in plan.reason
+
+
+def test_present_and_absent_preimage_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    present = tmp_path / "present.txt"
+    absent = tmp_path / "absent.txt"
+    present.write_text("original")
+    result = preimages.prepare(
+        [str(present), str(absent)], "test edit", 1024 * 1024,
+        policy_revision="test-revision",
+    )
+    assert result.ok
+    by_target = {r.target: r for r in result.receipts}
+    assert by_target[str(present)].state == "PRESENT"
+    assert os.path.isfile(by_target[str(present)].artifact)
+    assert by_target[str(absent)].state == "ABSENT"
+    assert all(r.policy_revision == "test-revision" for r in result.receipts)
+    assert all(preimages.receipt_valid(r, "test-revision") for r in result.receipts)
+    assert all(not preimages.receipt_valid(r, "changed-revision") for r in result.receipts)
+
+
+def test_preimage_capture_requires_policy_revision(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    target = tmp_path / "target.txt"
+    target.write_text("original")
+    result = preimages.prepare([str(target)], "test edit", 1024)
+    assert not result.ok
+    assert "policy revision" in result.reason.lower()
+
+
+def test_allocated_size_does_not_require_posix_st_blocks():
+    class WindowsStat:
+        st_size = 37
+
+    assert preimages.allocated_size("unused", WindowsStat()) == 37
+
+
+def test_preimage_capacity_failure_is_hard_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    target = tmp_path / "large-enough.txt"
+    target.write_text("content")
+    result = preimages.prepare(
+        [str(target)], "test edit", 1024, max_archive_bytes=1,
+        policy_revision="test-revision",
+    )
+    assert not result.ok
+    assert "configured capacity" in result.reason
+
+
+def test_preimage_hash_read_failure_is_hard_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    target = tmp_path / "unreadable.txt"
+    target.write_text("content")
+
+    def fail_hash(path):
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(preimages.store, "file_sha256", fail_hash)
+    result = preimages.prepare(
+        [str(target)], "test edit", 1024, policy_revision="test-revision"
+    )
+    assert not result.ok
+    assert "recovery copy could not be completed" in result.reason
+
+
+def test_preimage_identity_change_during_capture_is_hard_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    target = tmp_path / "changing.txt"
+    target.write_text("original")
+    archive_file = preimages.store.archive_file
+
+    def capture_then_change(path, **kwargs):
+        entry = archive_file(path, **kwargs)
+        target.write_text("changed during capture")
+        return entry
+
+    monkeypatch.setattr(preimages.store, "archive_file", capture_then_change)
+    result = preimages.prepare(
+        [str(target)], "test edit", 1024, policy_revision="test-revision"
+    )
+    assert not result.ok
+    assert "changed while" in result.reason
 
 
 def test_clobber_targets_mv_cp_tee(tmp_path):

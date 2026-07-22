@@ -10,6 +10,14 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
+> **Development status:** `0.3.0-rc.1` is a Windows-first release candidate.
+> It has extensive automated and hands-on validation on Windows, which is the
+> current client deployment target. macOS and Linux support remains in preview:
+> the shared code is designed to be cross-platform, but this candidate has not
+> yet received equivalent real-machine validation on those operating systems.
+> Use the RC there only for development testing and report platform-specific
+> issues before relying on it for production work.
+
 **The core promise: nothing is ever destroyed.**
 
 - `rm` and every destructive equivalent is blocked and redirected to
@@ -71,7 +79,7 @@ that string, so an update only lands once it changes:
 | `hooks/` | PreToolUse/PostToolUse/SessionStart wiring, the enforcement surface (works in Claude Code and Codex) |
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
 | `scripts/codex/` | Thin Codex adapter: same `ToolEvent` contract, plus `apply_patch` envelope parsing (Add→write, Update→edit+snapshot, Delete→blocked under CRUA) |
-| `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, audit log with secret redaction |
+| `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, recovery metadata, and policy health |
 | `scripts/agw/` + `bin/agw` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/` | Teach the agent the workflows: agent-workspace, synced-folders, gdocs-bridge, restore |
@@ -131,10 +139,27 @@ executed command, so it isn't blocked.
   oldest redundant pre-image copies are evicted first, never the sole copy of an
   archived file.
 
+### Activity history and recovery metadata
+
+Claude or Codex task history is the human activity log. Guardrails does not
+create a second command/event ledger, key, migration journal, provenance file,
+or quarantine. Existing `audit.jsonl` and legacy-quarantine files are left
+completely untouched and unread.
+
+`/guardrails-report` uses only privacy-safe CRUA metadata already needed for
+recovery: archive-store health and recovery-copy totals, open checkout status,
+and policy health/revision. It never reconstructs raw commands or reads legacy
+audit material. If command-level decision counts or trends are requested, the
+report says plainly that Guardrails does not keep that metric.
+
+This change does not affect pre-image snapshots, archive transactions, restore,
+pending approvals, or policy revisions. Activity-history availability never
+changes an allow, ask, or deny decision.
+
 ## Testing
 
 ```
-python3 -m pytest tests/   # 241 tests, no third-party deps beyond pytest
+python3 -m pytest tests/   # Office tests run when openpyxl/python-docx are installed
 ```
 
 Includes a bypass corpus (nested `bash -c`, command substitution, xargs, wrapper

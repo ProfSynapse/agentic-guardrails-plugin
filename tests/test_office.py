@@ -96,10 +96,14 @@ def test_cli_missing_flags_fail_clean(workbook, agw_home):
     assert result.returncode == 1 and "--sheet" in result.stderr
 
 
-def test_engine_allows_office_verb(evaluate):
-    from core.events import ALLOW
-    d = evaluate('agw office set-cell budget.xlsx --sheet Q3 --cell B2 --value 5')
-    assert d.action == ALLOW
+def test_engine_asks_before_mutating_office_verb(evaluate):
+    from core.events import ASK
+    launcher = os.path.join(REPO, "bin", "agw.cmd").replace("\\", "/")
+    d = evaluate(
+        f'"{launcher}" office set-cell budget.xlsx --sheet Q3 --cell B2 --value 5'
+    )
+    assert d.action == ASK
+    assert d.rule_id == "builtin:agw-ask"
 
 
 # --- docx ----------------------------------------------------------------------

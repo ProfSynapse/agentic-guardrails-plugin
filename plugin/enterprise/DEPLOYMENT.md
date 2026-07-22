@@ -76,10 +76,20 @@ default: omit everything and you get `standard`. Set `AGW_LEVEL` in the managed
 | `relaxed` | yes | allowed | allowed, audited only | on |
 | `observe` | **logs only, blocks nothing** | n/a | n/a | n/a |
 
-`observe` is the trial mode: deploy it first to see what the guardrails *would*
-do (everything lands in `~/.agw/audit.jsonl` with `"observe": true`) without
-disrupting anyone, then graduate to `standard`. Every level keeps taking
-pre-image snapshots, so "nothing is destroyed" holds even in `observe`.
+`observe` is the trial mode: deploy it first to see organization-policy notices
+in normal Claude or Codex task history without disrupting anyone, then graduate
+to `standard`. Every level keeps taking pre-image snapshots, so “nothing is
+destroyed” still holds in `observe`.
+
+Claude or Codex task history is the human activity log. Guardrails does not
+create or migrate a separate command/event ledger, key, provenance record, or
+quarantine. Existing legacy audit and quarantine files are left untouched and
+unread. Their availability never changes an allow, ask, or deny decision.
+
+Reports use only privacy-safe CRUA indexes and manifests already needed for
+archive recovery, checkout state, and policy health. They do not inspect legacy
+audit material or reconstruct commands. Command-level audit counts are
+unavailable by design and reports say so plainly.
 
 Override individual knobs when needed: `AGW_SESSION_MEMORY`,
 `AGW_REGENERABLE_RM`, `AGW_RELAXED_ACCESS`, `AGW_ENFORCEMENT`. A policy pack can
@@ -104,6 +114,9 @@ newest version of anything. `agw doctor` reports current size and budget.
   `python-pptx` (pptx). `agw doctor` reports which are available.
 - `bin/agw` on PATH is convenient but optional; the hook teaches the agent the
   full path via session context regardless.
+- Hooks and SessionStart do not modify the process, user, or machine PATH. Both
+  host manifests dispatch through their host-provided plugin root, and the
+  Windows launcher works with only Python and Windows System32 available.
 - **Persistent store location.** The archive/session store defaults to `~/.agw`.
   Set `AGW_HOME` to a persistent, **non-cloud-synced** path. This matters most on
   ephemeral or remote runners: if hooks run in a per-session VM whose home (`~`)
@@ -119,9 +132,9 @@ agw doctor --json          # store writable, converters found, packs loaded
 claude                     # then ask it to: rm some test file
 ```
 
-Expected: the delete is denied with a message redirecting to `agw archive`,
-and the attempt appears in `~/.agw/audit.jsonl`. Run `/guardrails-report` in
-Claude for a readable audit summary.
+Expected: the delete is denied with a plain-language message explaining how to
+preserve the file instead. The denial remains visible in the Claude or Codex task
+history. Run `/guardrails-report` for a readable recovery and policy summary.
 
 ## 7. What this does and does not cover
 

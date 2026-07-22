@@ -1,0 +1,64 @@
+name: host-and-artifact-conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install pytest pyyaml
+      - name: Validate JSON manifests
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          for path in (
+              Path("plugin/hooks/hooks.json"),
+              Path("plugin/hooks/hooks-codex.json"),
+              Path("plugin/.claude-plugin/plugin.json"),
+              Path("plugin/.codex-plugin/plugin.json"),
+              Path(".claude-plugin/marketplace.json"),
+          ):
+              json.loads(path.read_text(encoding="utf-8"))
+      - name: Run Windows packed-artifact shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        run: python -m pytest -q tests/test_packaging.py
+      - name: Run Windows no-persistence shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        run: python -m pytest -q tests/test_audit_disabled.py
+      - name: Run Windows Claude adapter shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_adapter.py
+      - name: Run Windows Codex adapter shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_codex_adapter.py
+      - name: Run Windows presentation and host-contract shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        run: python -m pytest -q tests/test_approval_presentation.py tests/test_windows_native_approval.py tests/test_host_conformance.py tests/test_lifecycle_adapters.py
+      - name: Run Windows engine and shell shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_engine_rules.py tests/test_shellparse.py tests/test_windows_shell.py tests/test_classification_regressions.py tests/test_bypass_corpus.py
+      - name: Run Windows store and policy shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_store_agw.py tests/test_policy_health.py tests/test_levels.py tests/test_archive_transactions.py tests/test_office.py
+      - name: Run source and packed-artifact conformance on Unix
+        if: runner.os != 'Windows'
+        run: python -m pytest -q

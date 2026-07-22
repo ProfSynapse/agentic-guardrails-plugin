@@ -10,6 +10,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # imported these names from the Claude adapter.
 from core.mcpshell import is_mcp_shell, mcp_command  # noqa: E402,F401
 
+MONITOR_NORMALIZER_CONTRACT = (
+    "Monitor is accepted only as a shell-execution envelope whose literal "
+    "tool_input.command string is evaluated with the same rules as Bash."
+)
+
+
+def shell_command(tool, tool_input):
+    """Normalize the documented shell envelope without guessing other fields."""
+    if tool not in ("Bash", "PowerShell", "Monitor"):
+        return ""
+    command = tool_input.get("command", "")
+    return command if isinstance(command, str) else ""
+
 
 def to_event(payload):
     from core import events
@@ -23,10 +36,9 @@ def to_event(payload):
         # allowlist. `PowerShell` is the native Windows shell tool (rolls out
         # when Git Bash is present); a bare `Remove-Item ...` arrives here with
         # the same `command` field as Bash. `Monitor` runs background shell
-        # scripts and shares Bash's permission-rule format (`Bash(cmd *)` covers
-        # both), so its command field is `command` as well (inferred — confirm
-        # with a live Monitor probe).
-        return events.ToolEvent(kind=events.EXEC, command=ti.get("command", ""), **common)
+        # scripts. The maintained contract accepts only a literal `command`
+        # field and intentionally makes no claim of live-host validation.
+        return events.ToolEvent(kind=events.EXEC, command=shell_command(tool, ti), **common)
     if tool == "Write":
         return events.ToolEvent(kind=events.WRITE, paths=[ti.get("file_path", "")],
                                 content=ti.get("content", ""), **common)

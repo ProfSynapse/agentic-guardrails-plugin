@@ -20,6 +20,8 @@ import shutil
 import time
 from datetime import datetime
 
+from . import archive_transactions as archive_tx
+
 SCHEMA_VERSION = 1
 
 
@@ -87,29 +89,87 @@ def _append_jsonl(path: str, record: dict):
     record.setdefault("schema_version", SCHEMA_VERSION)
     record.setdefault("ts", _ts())
     line = json.dumps(record, ensure_ascii=False)
+    needs_boundary = False
+    if os.path.exists(path) and os.path.getsize(path):
+        with open(path, "rb") as existing:
+            existing.seek(-1, os.SEEK_END)
+            needs_boundary = existing.read(1) not in (b"\n", b"\r")
     with open(path, "a", encoding="utf-8") as f:
+        if needs_boundary:
+            f.write("\n")
         f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _preserve_malformed_jsonl(path: str, line_number: int, raw: str,
+                              error: Exception) -> dict:
+    evidence = {
+        "evidence_id": hashlib.sha256(
+            f"{os.path.abspath(path)}:{line_number}:{raw}".encode("utf-8", "replace")
+        ).hexdigest(),
+        "source": os.path.abspath(path),
+        "line_number": line_number,
+        "raw": raw,
+        "error": str(error),
+    }
+    evidence_path = path + ".malformed.jsonl"
+    known = set()
+    if os.path.exists(evidence_path):
+        with open(evidence_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    known.add(json.loads(line).get("evidence_id"))
+                except json.JSONDecodeError:
+                    continue
+    if evidence["evidence_id"] not in known:
+        _append_jsonl(evidence_path, evidence)
+    return {"status": "malformed_compatibility", "path": path,
+            "line_number": line_number, "evidence": evidence_path,
+            "error": str(error)}
+
+
+def _read_jsonl_resilient(path: str) -> tuple[list, list]:
+    records, malformed = [], []
+    if not os.path.exists(path):
+        return records, malformed
+    with open(path, encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                value = json.loads(stripped)
+                if not isinstance(value, dict):
+                    raise ValueError("JSONL record is not an object")
+                records.append(value)
+            except (json.JSONDecodeError, ValueError) as exc:
+                malformed.append(_preserve_malformed_jsonl(
+                    path, line_number, raw.rstrip("\r\n"), exc
+                ))
+    return records, malformed
+
+
+def _append_jsonl_unique(path: str, record: dict) -> tuple[bool, list]:
+    records, malformed = _read_jsonl_resilient(path)
+    transaction_id = record.get("transaction_id")
+    if transaction_id and any(
+            item.get("transaction_id") == transaction_id for item in records):
+        return False, malformed
+    _append_jsonl(path, record)
+    return True, malformed
 
 
 def oplog_append(op: dict):
     with Lock("oplog"):
-        _append_jsonl(os.path.join(agw_home(), "oplog.jsonl"), op)
+        return _append_jsonl_unique(os.path.join(agw_home(), "oplog.jsonl"), op)
 
 
 def oplog_read() -> list:
     path = os.path.join(agw_home(), "oplog.jsonl")
     if not os.path.exists(path):
         return []
-    out = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    return out
+    return _read_jsonl_resilient(path)[0]
 
 
 def _folder_key(folder: str) -> str:
@@ -141,7 +201,7 @@ def _next_version(file_dir: str) -> int:
 
 
 def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "agent",
-                 dedupe: bool = False) -> dict:
+                 dedupe: bool = False, _crash_after: str = None) -> dict:
     """Archive one file or directory. mode='move' (delete-replacement) or
     'copy' (pre-image snapshot, leaves the original)."""
     src = os.path.abspath(src)
@@ -153,32 +213,17 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     with Lock(_folder_key(os.path.dirname(src))):
         if dedupe and digest:
             last = latest_version(src)
-            if last and last.get("sha256") == digest:
+            if last and last.get("sha256") == digest \
+                    and archive_tx.entry_is_verified(agw_home(), last, src):
                 return {**last, "deduped": True}
         version = _next_version(file_dir)
         name = os.path.basename(src)
         dest = os.path.join(file_dir, f"v{version:03d}_{_ts()}_{name}")
-        if mode == "move":
-            shutil.move(src, dest)
-        else:
-            if os.path.isdir(src):
-                # The archive store may live inside the tree being copied
-                # (e.g. `agw snapshot ~` with AGW_HOME at ~/.agw) — skip it,
-                # or copytree recurses into its own output forever.
-                skip = {os.path.realpath(agw_home()), os.path.realpath(dest)}
-
-                def _ignore(d, entries):
-                    rd = os.path.realpath(d)
-                    return [e for e in entries
-                            if os.path.realpath(os.path.join(rd, e)) in skip]
-
-                shutil.copytree(src, dest, symlinks=True, ignore=_ignore)
-            else:
-                shutil.copy2(src, dest)
-        entry = {"op": "archive", "mode": mode, "src": src, "dest": dest,
-                 "version": version, "sha256": digest, "reason": reason, "actor": actor}
-        _append_jsonl(os.path.join(file_dir, "manifest.jsonl"), entry)
-    oplog_append(entry)
+        entry = archive_tx.create_archive(
+            agw_home(), src, dest, mode, version, reason, actor,
+            crash_after=_crash_after,
+        )
+    _materialize_committed_transaction(entry["transaction_id"], _crash_after)
     return entry
 
 
@@ -190,18 +235,85 @@ def latest_version(src: str):
 def list_versions(src: str) -> list:
     file_dir = _file_dir(src)
     manifest = os.path.join(file_dir, "manifest.jsonl")
-    if not os.path.exists(manifest):
-        return []
     out = []
-    with open(manifest, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    return out
+    if os.path.exists(manifest):
+        out.extend(_read_jsonl_resilient(manifest)[0])
+    # A committed transaction remains authoritative and discoverable even if a
+    # crash happened before the compatibility JSONL index was appended.
+    for item in archive_tx.discover(agw_home()):
+        record = item.get("record")
+        if not record or record.get("kind") != "archive" \
+                or record.get("state") != archive_tx.COMMITTED:
+            continue
+        if os.path.abspath(record.get("src", "")) == os.path.abspath(src):
+            out.append(archive_tx.entry_from_record(record))
+    unique = {}
+    for entry in out:
+        key = entry.get("transaction_id") or entry.get("dest")
+        unique[key] = entry
+    return sorted(unique.values(), key=lambda entry: int(entry.get("version") or 0))
+
+
+def discover_archive_transactions() -> list:
+    return archive_tx.discover(agw_home())
+
+
+def _materialize_committed_transaction(transaction_id: str,
+                                       crash_after: str = None) -> list:
+    record = archive_tx.load(agw_home(), transaction_id)
+    if record.get("kind") != "archive" or record.get("state") != archive_tx.COMMITTED:
+        return []
+    entry = archive_tx.entry_from_record(record)
+    file_dir = _file_dir(record["src"])
+    manifest = os.path.join(file_dir, "manifest.jsonl")
+    malformed = []
+    with Lock(_folder_key(os.path.dirname(record["src"]))):
+        _appended, issues = _append_jsonl_unique(manifest, entry)
+        malformed.extend(issues)
+    if crash_after == "DERIVED_INDEX_APPENDED":
+        raise archive_tx.SimulatedCrash("simulated crash after DERIVED_INDEX_APPENDED")
+    archive_tx.update(agw_home(), transaction_id, derived_index=True)
+
+    _appended, issues = oplog_append(entry)
+    malformed.extend(issues)
+    if crash_after == "DERIVED_OPLOG_APPENDED":
+        raise archive_tx.SimulatedCrash("simulated crash after DERIVED_OPLOG_APPENDED")
+    archive_tx.update(agw_home(), transaction_id, derived_oplog=True)
+    return malformed
+
+
+def recover_archive_transactions() -> list:
+    results = archive_tx.recover_all(agw_home())
+    malformed = []
+    for result in results:
+        record = result.get("record")
+        if not record or record.get("kind") != "archive" \
+                or record.get("state") != archive_tx.COMMITTED:
+            continue
+        malformed.extend(_materialize_committed_transaction(record["transaction_id"]))
+    return results + malformed
+
+
+def record_absent_tombstone(target: str, identity: tuple, reason: str = "") -> dict:
+    return archive_tx.create_absent_tombstone(agw_home(), target, identity, reason)
+
+
+def rollback_absent_tombstone(transaction_id: str) -> dict:
+    record = archive_tx.load(agw_home(), transaction_id)
+    if record.get("kind") != "absent_tombstone" or record.get("state") != archive_tx.COMMITTED:
+        raise ValueError("rollback requires a committed ABSENT tombstone")
+    target = record["src"]
+    archived = None
+    if os.path.lexists(target):
+        archived = archive_file(
+            target, mode="move", reason="rollback of ABSENT prestate",
+            actor="guardrails-recovery",
+        )
+    archive_tx.update(
+        agw_home(), transaction_id, rollback_committed=True,
+        rollback_archive_transaction=(archived or {}).get("transaction_id", ""),
+    )
+    return {"target": target, "restored": "ABSENT", "archived": archived}
 
 
 def restore(src: str, version: int = 0, overwrite: bool = False) -> dict:
@@ -213,18 +325,13 @@ def restore(src: str, version: int = 0, overwrite: bool = False) -> dict:
         (e for e in entries if e.get("version") == version), None)
     if entry is None:
         raise FileNotFoundError(f"no version {version} of {src}")
-    if os.path.exists(src) and not overwrite:
-        # never clobber a live file: archive it first (copy), then restore
-        archive_file(src, mode="copy", reason="pre-restore safety copy", actor="agw")
-        if os.path.isdir(src):
-            shutil.rmtree(src)
-        else:
-            os.unlink(src)
-    if os.path.isdir(entry["dest"]):
-        shutil.copytree(entry["dest"], src, symlinks=True)
-    else:
-        os.makedirs(os.path.dirname(src), exist_ok=True)
-        shutil.copy2(entry["dest"], src)
+    if not archive_tx.entry_is_verified(agw_home(), entry, src):
+        raise ValueError("restore refused: the selected archive artifact is not verified")
+    if os.path.lexists(src):
+        # Moving the live target into its own verified transaction eliminates
+        # the former copy-then-unlink crash window.
+        archive_file(src, mode="move", reason="pre-restore safety archive", actor="agw")
+    archive_tx.publish_restore(agw_home(), entry, src)
     op = {"op": "restore", "src": src, "from": entry["dest"], "version": entry["version"]}
     oplog_append(op)
     return op

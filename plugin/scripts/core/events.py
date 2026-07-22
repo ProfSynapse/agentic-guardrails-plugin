@@ -7,6 +7,7 @@ import platform-specific shapes; adapters translate into these and back.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 # Event kinds
 EXEC = "exec"      # shell command execution
@@ -26,6 +27,63 @@ DENY = "deny"
 _SEVERITY = {DEFER: 0, ALLOW: 1, ASK: 2, DENY: 3}
 
 
+class EnforcementClass(str, Enum):
+    """Whether an engine finding may be shadowed by an enforcement level.
+
+    This is explicit decision data.  Adapters must not reconstruct it from a
+    rule id or another naming convention.
+    """
+
+    ADVISORY = "advisory"
+    POLICY_ENFORCEMENT = "policy-enforcement"
+    NON_WAIVABLE_INVARIANT = "non-waivable-invariant"
+
+
+class DecisionContext(str, Enum):
+    """Closed, privacy-safe context for approval presentation.
+
+    Values describe categories, never commands, paths, filenames, exceptions,
+    or free-form policy reasons. The audit schema does not include this field.
+    """
+
+    UNKNOWN = "unknown"
+    AGW_ARCHIVE = "agw-archive"
+    AGW_MUTATION = "agw-mutation"
+    AGW_UNKNOWN = "agw-unknown"
+    PATCH_UNKNOWN = "patch-unknown"
+    RESTORE_FILES = "restore-files"
+    SENSITIVE_READ = "sensitive-read"
+    CREDENTIAL_SEARCH = "credential-search"
+    FILE_CHANGE = "file-change"
+    CONNECTED_SERVICE = "connected-service"
+
+
+ADVISORY = EnforcementClass.ADVISORY
+POLICY_ENFORCEMENT = EnforcementClass.POLICY_ENFORCEMENT
+NON_WAIVABLE_INVARIANT = EnforcementClass.NON_WAIVABLE_INVARIANT
+
+_ENFORCEMENT_STRENGTH = {
+    ADVISORY: 0,
+    POLICY_ENFORCEMENT: 1,
+    NON_WAIVABLE_INVARIANT: 2,
+}
+
+
+def normalize_enforcement_class(value, action: str = DEFER) -> EnforcementClass:
+    """Normalize legacy/untrusted class data with fail-closed deny semantics."""
+    try:
+        return value if isinstance(value, EnforcementClass) else EnforcementClass(value)
+    except (TypeError, ValueError):
+        # Missing/unknown ASK and DENY classifications are safety findings.
+        # Routine ALLOW/DEFER decisions are inert and therefore advisory.
+        return NON_WAIVABLE_INVARIANT if action in (ASK, DENY) else ADVISORY
+
+
+def strongest_enforcement_class(*values) -> EnforcementClass:
+    normalized = [normalize_enforcement_class(value) for value in values]
+    return max(normalized, key=_ENFORCEMENT_STRENGTH.get, default=ADVISORY)
+
+
 @dataclass
 class ToolEvent:
     kind: str
@@ -36,6 +94,9 @@ class ToolEvent:
     cwd: str = ""
     session_id: str = ""
     platform: str = ""
+    # Optional host-provided identity. Adapters that do not receive one leave
+    # this blank; approval de-duplication must never invent a broad substitute.
+    event_id: str = ""
     extra: dict = field(default_factory=dict)   # adapter passthrough (mcp input, etc.)
 
 
@@ -49,12 +110,33 @@ class Decision:
     # session approval memory ("you already okayed reading this file").
     # Only set on access-type asks; None means "never remember, re-ask".
     memo_key: str = None
+    policy_revision: str = ""
+    policy_health: str = ""
+    enforcement_class: EnforcementClass = None
+    presentation_context: DecisionContext = DecisionContext.UNKNOWN
+
+    def __post_init__(self):
+        self.enforcement_class = normalize_enforcement_class(
+            self.enforcement_class, self.action
+        )
+        try:
+            self.presentation_context = DecisionContext(self.presentation_context)
+        except (TypeError, ValueError):
+            self.presentation_context = DecisionContext.UNKNOWN
 
     def merge(self, other: "Decision") -> "Decision":
         """Combine two decisions: highest severity wins; warnings accumulate."""
         winner = self if _SEVERITY[self.action] >= _SEVERITY[other.action] else other
-        merged = Decision(winner.action, winner.reason, winner.rule_id,
-                          self.warnings + other.warnings, winner.memo_key)
+        merged = Decision(
+            winner.action, winner.reason, winner.rule_id,
+            self.warnings + other.warnings, winner.memo_key,
+            winner.policy_revision or self.policy_revision or other.policy_revision,
+            winner.policy_health or self.policy_health or other.policy_health,
+            strongest_enforcement_class(
+                self.enforcement_class, other.enforcement_class
+            ),
+            winner.presentation_context,
+        )
         return merged
 
 

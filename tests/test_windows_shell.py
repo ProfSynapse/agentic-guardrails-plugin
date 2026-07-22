@@ -9,8 +9,12 @@ PowerShell is not over-blocked.
 import base64
 import os
 
-from core import engine
-from core.events import ALLOW, ASK, DENY, DEFER
+import pytest
+
+from core import engine, mutations, preimages
+from core.events import ALLOW, ASK, DENY, DEFER, EXEC, ToolEvent
+
+REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
 
 def _enc(script: str) -> str:
@@ -233,3 +237,126 @@ def test_append_forms_are_not_snapshot_targets(tmp_path):
     # appends do not lose the original, so they should not be pre-imaged
     assert not clobbers('powershell -Command "Out-File -FilePath log.txt -Append"')
     assert not clobbers('powershell -Command "Add-Content log.txt \'x\'"')
+
+
+def test_powershell_binding_does_not_treat_named_values_as_targets(tmp_path):
+    victim = tmp_path / "victim.txt"
+    changed = tmp_path / "changed"
+    victim.write_text("ORIGINAL")
+    changed.write_text("UNRELATED")
+    targets = engine.clobber_targets(
+        'powershell -Command "Set-Content -Encoding utf8 victim.txt changed"',
+        str(tmp_path), include_absent=True,
+    )
+    assert targets.complete
+    assert os.path.normpath(str(victim)) in targets
+    assert os.path.normpath(str(changed)) not in targets
+
+
+def test_powershell_copy_move_binding_named_positional_alias_and_abbreviation(tmp_path):
+    source = tmp_path / "source.txt"
+    victim = tmp_path / "victim.txt"
+    source.write_text("SOURCE")
+    victim.write_text("ORIGINAL")
+    expected = os.path.normpath(str(victim))
+    commands = [
+        "Copy-Item -Destination victim.txt -Path source.txt",
+        "Copy-Item -Path source.txt victim.txt",
+        "Move-Item -Force -Destination victim.txt -LiteralPath source.txt",
+        "cpi source.txt -Dest victim.txt",
+        "mi -Lit source.txt -Dest victim.txt",
+    ]
+    for inner in commands:
+        targets = engine.clobber_targets(
+            f'powershell -Command "{inner}"', str(tmp_path), include_absent=True
+        )
+        assert targets.complete, inner
+        assert expected in targets, inner
+
+
+def test_powershell_binding_wrapper_encoded_and_alias_are_equivalent(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("ORIGINAL")
+    expected = os.path.normpath(str(victim))
+    script = "sc -Encoding utf8 victim.txt changed"
+    for command in (
+        f'powershell -Command "{script}"',
+        f"pwsh -EncodedCommand {_enc(script)}",
+    ):
+        targets = engine.clobber_targets(command, str(tmp_path), include_absent=True)
+        assert targets.complete
+        assert targets == [expected]
+
+
+@pytest.mark.parametrize("script", [
+    "Set-Content -Pa victim.txt changed",
+    "Set-Content -Bogus value victim.txt changed",
+    "Set-Content -Path",
+    "Set-Content -Path $target -Value changed",
+    "Set-Content @args",
+    "Set-Content -Path victim.txt,other.txt -Value changed",
+    "Set-Content --% -Path victim.txt changed",
+])
+def test_powershell_dynamic_or_ambiguous_binding_is_incomplete(script, tmp_path):
+    targets = engine.clobber_targets(
+        f'powershell -Command "{script}"', str(tmp_path), include_absent=True
+    )
+    assert not targets.complete
+    assert targets.reason
+
+
+def test_powershell_aliases_are_not_bound_in_posix_dialect(tmp_path):
+    targets = engine.clobber_targets(
+        "sc query victim.txt", str(tmp_path), include_absent=True, dialect="posix"
+    )
+    assert targets == []
+
+
+@pytest.mark.parametrize("command", [
+    "Set-Content victim`.txt changed",
+    'powershell -Command "Set-Content victim`.txt changed"',
+    'pwsh "Set-Content victim`.txt changed"',
+    "encoded",
+])
+def test_powershell_escaped_dot_target_gets_present_receipt(
+        command, tmp_path, monkeypatch):
+    victim = tmp_path / "victim.txt"
+    escaped_spelling = tmp_path / "victim`.txt"
+    changed = tmp_path / "changed"
+    victim.write_text("ORIGINAL")
+    escaped_spelling.write_text("UNRELATED ESCAPED SPELLING")
+    changed.write_text("UNRELATED CONTENT TOKEN")
+    if command == "encoded":
+        command = f"pwsh -EncodedCommand {_enc('Set-Content victim`.txt changed')}"
+    event = ToolEvent(kind=EXEC, tool="PowerShell", command=command,
+                      cwd=str(tmp_path))
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete
+    assert plan.targets == [os.path.normcase(os.path.realpath(str(victim)))]
+    result = preimages.prepare(
+        plan.targets, "PowerShell escaped target", 1024 * 1024,
+        policy_revision="backtick-test-revision",
+    )
+    assert result.ok
+    assert len(result.receipts) == 1
+    assert result.receipts[0].state == "PRESENT"
+    assert result.receipts[0].target == os.path.normcase(os.path.realpath(str(victim)))
+    assert victim.read_text() == "ORIGINAL"
+    assert escaped_spelling.read_text() == "UNRELATED ESCAPED SPELLING"
+    assert changed.read_text() == "UNRELATED CONTENT TOKEN"
+
+
+@pytest.mark.parametrize("script", [
+    "Set-Content victim`n.txt changed",
+    "Set-Content victim`$name changed",
+    "Set-Content 'victim`.txt' changed",
+])
+def test_powershell_ambiguous_backtick_target_is_incomplete(script, tmp_path):
+    encoded = f"pwsh -EncodedCommand {_enc(script)}"
+    targets = engine.clobber_targets(encoded, str(tmp_path), include_absent=True)
+    assert not targets.complete
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="PowerShell", command=encoded, cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating
+    assert not plan.complete

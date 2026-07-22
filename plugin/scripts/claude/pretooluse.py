@@ -31,98 +31,124 @@ from adapter_common import to_event  # noqa: E402
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 
 
-def _snapshot(targets, event, store):
-    """Pre-image snapshot of files about to be clobbered. Returns
-    (any_error, [too_big_basenames]). Files over the cap are skipped (a huge
-    legit write shouldn't be blocked or silently duplicate gigabytes) but
-    reported, not turned into an ask."""
-    failed, too_big = False, []
-    for path in targets:
-        try:
-            if not (path and os.path.isfile(path)):
-                continue
-            if os.path.getsize(path) > PRESNAP_MAX_BYTES:
-                too_big.append(os.path.basename(path))
-                continue
-            store.archive_file(path, mode="copy", dedupe=True,
-                               reason=f"pre-image before {event.tool}",
-                               actor="guardrails-hook")
-        except Exception:
-            failed = True
-    return failed, too_big
-
-
 def main():
     payload = json.load(sys.stdin)
-    from core import auditlog, engine, events, store
+    from core import approvals, auditlog, enforcement, engine, events, mutations, preimages, \
+        presentation, store
+    from core.decisions import GuardrailDecision
 
     event = to_event(payload)
     policy = engine.load_policy(PLUGIN_ROOT)
     cfg = engine.resolve_settings(policy)
     decision = engine.evaluate(event, policy, PLUGIN_ROOT)
     observe = cfg.get("enforcement") == "observe"
+    effective = enforcement.resolve(decision, observe)
 
-    # Pre-image snapshot — nothing is destroyed, even by native tools or by a
-    # shell `>`/mv/cp/tee that bypasses the Write tool entirely. We snapshot
-    # whenever the operation will actually run (in observe mode everything runs,
-    # so we still take the safety copy even while "not enforcing").
-    will_run = observe or decision.action != events.DENY
-    targets = []
-    if event.kind in (events.WRITE, events.EDIT):
-        targets = list(event.paths)
-    elif event.kind == events.EXEC:
-        targets = engine.clobber_targets(event.command, event.cwd)
-    if targets and will_run:
-        failed, too_big = _snapshot(targets, event, store)
-        if failed:
-            decision = decision.merge(engine.Decision(
-                events.ASK, "Could not snapshot the file before modification "
-                            "(archive store unavailable?) — proceed only if a copy "
-                            "exists elsewhere.", "builtin:snapshot-failed"))
-        if too_big:
-            decision.warnings.append(
-                f"note: {', '.join(too_big)} exceeds the {PRESNAP_MAX_BYTES // (1024*1024)}MB "
-                "auto-snapshot cap and was NOT backed up before this change")
+    will_run = effective.action != events.DENY
+    # Prestate failures are safety invariants. Unlike advisory policy choices,
+    # they cannot be approved away or suppressed by observe mode.
+    mutation_plan = mutations.plan([event], engine.clobber_targets)
+    invariant_failure = ""
+    if mutation_plan.mutating and will_run:
+        if not mutation_plan.complete:
+            invariant_failure = (
+                "Guardrails blocked this change because it could not determine every file "
+                f"that would be modified: {mutation_plan.reason}. Nothing was changed by "
+                "this operation. Use a file-specific editing operation and try again."
+            )
+        else:
+            archive_budget = int(os.environ.get(
+                "AGW_ARCHIVE_MAX_BYTES", policy.settings.get("archive_max_bytes", 0)
+            ) or 0)
+            receipt = preimages.prepare(
+                mutation_plan.targets, event.tool or "modification", PRESNAP_MAX_BYTES,
+                archive_budget, policy_revision=policy.revision,
+            )
+            if not receipt.ok:
+                invariant_failure = receipt.reason
+    if invariant_failure:
+        decision = engine.Decision(
+            events.DENY, invariant_failure, "invariant:prestate-unavailable",
+            policy_revision=policy.revision, policy_health=policy.health,
+            enforcement_class=events.NON_WAIVABLE_INVARIANT,
+        )
+        effective = enforcement.resolve(decision, observe)
+
+    def _audit(kind, data):
+        try:
+            auditlog.log(kind, data)
+        except Exception:
+            # Audit is evidence, not authority. Its availability must never
+            # upgrade, downgrade, or replace an enforcement decision.
+            pass
 
     # Session approval memory: a resource the user already okayed this session
     # doesn't prompt again. Convenience only — losing it just re-asks.
     memoed = False
-    if decision.action == events.ASK and decision.memo_key and cfg.get("session_memory") \
-            and store.session_approved(event.session_id, decision.memo_key):
-        memoed = True
+    if effective.action == events.ASK and decision.memo_key and cfg.get("session_memory"):
+        try:
+            memoed = store.session_approved(event.session_id, decision.memo_key)
+        except Exception:
+            memoed = False
 
     # Audit the *real* engine decision (before observe/memory suppression), so
     # the trail shows what enforcement would have done.
     if decision.action != events.DEFER or decision.warnings:
-        auditlog.log("pretooluse", {
-            "tool": event.tool, "kind": event.kind, "decision": decision.action,
-            "rule": decision.rule_id, "reason": decision.reason,
-            "command": event.command, "paths": event.paths,
+        _audit("pretooluse", {
+            "category": "decision", "tool": event.tool, "action": decision.action,
+            "rule_code": decision.rule_id,
+            "reason_code": "prestate-unavailable" if invariant_failure else "decision",
+            "target_count": len(event.paths), "event_count": 1,
+            "warning_count": len(decision.warnings),
             "level": cfg.get("level"), "observe": observe,
-            "suppressed": "memory" if memoed else ("observe" if observe and
-                          decision.action in (events.ASK, events.DENY) else ""),
-            "session": event.session_id})
+            "policy_health": decision.policy_health,
+            "policy_revision": decision.policy_revision,
+            "enforcement_class": decision.enforcement_class.value,
+            "suppression": "memory" if memoed else effective.suppression or "none",
+            "platform": "claude", "memoed": memoed,
+            "correlate": {"session": event.session_id, "operation": event.event_id}})
 
-    # Observe (shadow) mode: log, but never block. Memory: silently allow.
+    # Only explicit organization-policy findings shadow in observe mode.
+    # Advisory findings never prompt/block; safety invariants retain their
+    # ASK/DENY action at every enforcement level.
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
         json.dump(out, sys.stdout)
         return
-    if observe and decision.action in (events.ASK, events.DENY):
-        json.dump({"systemMessage": f"agentic-guardrails (observe mode): would have "
+    if effective.shadowed:
+        label = "observe mode" if effective.suppression == "observe" else "advisory"
+        json.dump({"systemMessage": f"agentic-guardrails ({label}): would have "
                                     f"{decision.action.upper()} — {decision.reason}"},
                   sys.stdout)
         return
 
+    if effective.action == events.ASK and decision.memo_key and cfg.get("session_memory"):
+        fingerprint = presentation.operation_fingerprint(
+            payload, [event], decision.policy_revision
+        )
+        approvals.record_pending_approval(
+            payload, event.session_id, decision.memo_key,
+            decision.policy_revision, fingerprint,
+        )
+
     out = {}
-    if decision.action in (events.ALLOW, events.ASK, events.DENY):
-        reason = decision.reason
+    if effective.action in (events.ALLOW, events.ASK, events.DENY):
+        if effective.action == events.ASK:
+            prompt_decision = GuardrailDecision.from_legacy(decision)
+            request = presentation.build_prompt(prompt_decision, payload, [event])
+            reason = request.action + "\n\n" + request.primary_text()
+        elif effective.action == events.DENY:
+            reason = presentation.build_denial_feedback(
+                GuardrailDecision.from_legacy(decision)
+            )
+        else:
+            reason = decision.reason
         if decision.warnings:
             reason = (reason + " | " if reason else "") + "; ".join(decision.warnings)
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": decision.action,
+            "permissionDecision": effective.action,
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
