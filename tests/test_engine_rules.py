@@ -345,6 +345,8 @@ def test_mcp_safe_name_not_destructive_by_substring(policy):
         "mcp__drive__get_deleted_files",
         "mcp__drive__restore_from_trash",
         "mcp__drive__get_trash",
+        "mcp__canva__resolve_shortlink",
+        "mcp__gmail__archive_emails",
     )
     for tool in safe_tools:
         assert engine.evaluate(_ev(MCP, tool=tool), policy, REPO).action == DEFER
@@ -359,7 +361,12 @@ def test_mcp_destructive_token_takes_precedence(policy):
 def test_mcp_non_destructive_mutation_asks(policy):
     for tool in (
         "mcp__github__create_pull_request",
+        "mcp__github__merge_pull_request",
+        "mcp__github__resolve_review_thread",
         "mcp__drive__update_file",
+        "mcp__drive__share_file",
+        "mcp__gmail__send_email",
+        "mcp__slack__schedule_message",
         "mcp__store__upload_document",
     ):
         decision = engine.evaluate(_ev(MCP, tool=tool), policy, REPO)

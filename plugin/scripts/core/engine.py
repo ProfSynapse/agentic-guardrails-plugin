@@ -1398,9 +1398,18 @@ _MCP_DESTROY_VERBS = {"delete", "destroy", "purge", "trash", "erase", "wipe",
                       "shred", "rm", "rmdir", "truncate", "drop"}
 _MCP_REMOVE_VERBS = {"remove", "unlink", "discard", "detach"}
 _MCP_MUTATION_VERBS = {
-    "add", "copy", "create", "edit", "move", "rename", "replace",
-    "truncate", "update", "upload", "write",
+    "add", "approve", "assign", "close", "convert", "copy", "create",
+    "disable", "edit", "enable", "forward", "grant", "invite", "lock",
+    "mark", "merge", "move", "publish", "react", "rename", "reopen",
+    "replace", "reply", "revoke", "schedule", "send", "set", "share",
+    "submit", "truncate", "unassign", "unlock", "unresolve", "update",
+    "upload", "write",
 }
+_MCP_MUTATION_TOKEN_GROUPS = (
+    # `resolve_shortlink` is a read-only lookup, while resolving a review
+    # thread changes remote state. Require the complete side-effect shape.
+    {"resolve", "review", "thread"},
+)
 # Safe verbs that neutralize a destructive-sounding token, so read-only or
 # recovery tools aren't blocked: restore_from_trash, list_deleted_files,
 # undelete_item, get_trash.
@@ -1444,7 +1453,8 @@ def _eval_mcp(event: ToolEvent, policy: Policy) -> Decision:
                 "builtin:mcp-remove",
                 presentation_context=DecisionContext.CONNECTED_SERVICE,
             ))
-        elif tokens & _MCP_MUTATION_VERBS:
+        elif (tokens & _MCP_MUTATION_VERBS) or any(
+                group <= tokens for group in _MCP_MUTATION_TOKEN_GROUPS):
             verdicts.append(Decision(
                 ASK,
                 "This action creates or changes information in a connected service. "
