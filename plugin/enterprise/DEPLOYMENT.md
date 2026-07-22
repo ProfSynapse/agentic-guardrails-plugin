@@ -74,12 +74,13 @@ default: omit everything and you get `standard`. Set `AGW_LEVEL` in the managed
 | `strict` | yes | archived, never rm'd | ask every time | off |
 | `standard` (default) | yes | allowed (pointless to archive) | ask, remembered per session | on |
 | `relaxed` | yes | allowed | allowed, audited only | on |
-| `observe` | **logs only, blocks nothing** | n/a | n/a | n/a |
+| `observe` | non-waivable invariants only | allowed | policy asks shadowed | on |
 
-`observe` is the trial mode: deploy it first to see organization-policy notices
-in normal Claude or Codex task history without disrupting anyone, then graduate
-to `standard`. Every level keeps taking pre-image snapshots, so “nothing is
-destroyed” still holds in `observe`.
+`observe` is the trial mode: it shadows ordinary organization-policy asks and
+denies while leaving non-waivable safety invariants active. Any notices the host
+surfaces remain in normal Claude or Codex task history; Guardrails does not
+create a separate log. Every level keeps taking pre-image snapshots for local
+changes.
 
 Claude or Codex task history is the human activity log. Guardrails does not
 create or migrate a separate command/event ledger, key, provenance record, or
@@ -106,17 +107,20 @@ newest version of anything. `agw doctor` reports current size and budget.
 
 ## 5. Requirements per machine
 
-- Python 3.9+ on PATH as `python3` (no third-party packages required;
-  PyYAML and pandoc/openpyxl are used when present and improve conversion
-  fidelity — install them for the full docx/xlsx checkout experience).
+- Python 3.9+ (no third-party packages required). Windows hooks require it on
+  PATH as `python`; `agw.cmd` also falls back to `py.exe -3`. POSIX hooks try
+  `python3` and then `python`. PyYAML and pandoc/openpyxl are used when present
+  and improve conversion fidelity — install them for the full docx/xlsx
+  checkout experience.
 - For the `agw office` in-place editing verbs, install the libraries for the
   formats your users touch: `openpyxl` (xlsx), `python-docx` (docx),
   `python-pptx` (pptx). `agw doctor` reports which are available.
-- `bin/agw` on PATH is convenient but optional; the hook teaches the agent the
-  full path via session context regardless.
+- `bin/agw` or `bin/agw.cmd` on PATH is convenient but optional; the hook
+  teaches the agent the full path via session context regardless.
 - Hooks and SessionStart do not modify the process, user, or machine PATH. Both
   host manifests dispatch through their host-provided plugin root, and the
-  Windows launcher works with only Python and Windows System32 available.
+  Windows launcher works when Python and Windows System32 are already
+  accessible; it never edits PATH or permissions to make that true.
 - **Persistent store location.** The archive/session store defaults to `~/.agw`.
   Set `AGW_HOME` to a persistent, **non-cloud-synced** path. This matters most on
   ephemeral or remote runners: if hooks run in a per-session VM whose home (`~`)

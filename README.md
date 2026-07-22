@@ -18,9 +18,9 @@ don't fire there. Tracking:
 > Use the RC there only for development testing and report platform-specific
 > issues before relying on it for production work.
 
-**The core promise: nothing is ever destroyed.**
+**The core promise: preserve user work through CRUA instead of permanent deletion.**
 
-- `rm` and every destructive equivalent is blocked and redirected to
+- Permanent deletion of user files is blocked and redirected to
   `agw archive`: a reversible, versioned move into an archive store.
 - Every file the agent Writes or Edits is snapshotted *first*, automatically.
   So is every file a raw shell `>`, `mv`, `cp`, or `tee` would clobber, so the
@@ -58,7 +58,9 @@ guard and a smoke test to confirm interception on your build — is in
 
 ### Requirements
 
-Python 3.9+ as `python3`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
+Python 3.9+. Windows hooks require it as `python`; the bundled `agw.cmd`
+launcher tries `python` and then `py.exe -3`. POSIX hooks try `python3` and
+then `python`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
 (xlsx→csv) for high-fidelity document checkout; without them files are checked
 out in plain-copy mode. Fleet rollout: see
 [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md).
@@ -70,7 +72,11 @@ that string, so an update only lands once it changes:
 
 - **Claude Code:** `/plugin marketplace update synaptic-guardrails`, then
   `/plugin install agentic-guardrails@synaptic-guardrails`.
-- **Codex:** `codex plugin marketplace upgrade`.
+- **Codex desktop:** open Plugins and use **Refresh** on the imported marketplace
+  or workspace plugin when that control is available, then restart Codex. A
+  personal/local marketplace may refresh automatically at startup and may not
+  show a separate Update button. Confirm the loaded version in the plugin
+  details or Guardrails session-start message.
 
 ## What's inside
 
@@ -80,7 +86,7 @@ that string, so an update only lands once it changes:
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
 | `scripts/codex/` | Thin Codex adapter: same `ToolEvent` contract, plus `apply_patch` envelope parsing (Add→write, Update→edit+snapshot, Delete→blocked under CRUA) |
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, recovery metadata, and policy health |
-| `scripts/agw/` + `bin/agw` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
+| `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/` | Teach the agent the workflows: agent-workspace, synced-folders, gdocs-bridge, restore |
 | `commands/` | `/agw-status`, `/agw-publish`, `/agw-restore`, `/guardrails-report` (Codex reads the equivalents from `codex-prompts/`) |
@@ -96,7 +102,7 @@ so the agent self-corrects instead of fighting the rails:
 | `rm file` | `agw archive file` (reversible) |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
-| `mv` (untracked) | `agw move` (logged, undoable) |
+| `mv` (untracked) | `agw move` (transactional, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 
 Exception: `rm` of purely regenerable build/dependency dirs (`node_modules`,
@@ -120,6 +126,24 @@ Content scans are span-aware: a destructive string that only appears as a search
 pattern or echoed data (`grep "DROP TABLE" schema.sql`) is not treated as an
 executed command, so it isn't blocked.
 
+### Human-readable approvals and connected services
+
+Approval dialogs describe the action, affected category, reason, consequence,
+and safety measure without requiring the user to interpret raw shell syntax.
+They offer **Allow once** and **Cancel (recommended)**; known reversible
+Guardrails restore/mutation operations instead recommend Allow. If an action is
+cancelled or blocked, the agent is instructed to explain why in plain language
+and recommend a safe way to continue toward the user's goal.
+
+Current host hook events expose connector names and inputs but not trusted MCP
+capability annotations. Guardrails therefore classifies connected-service tools
+by action name: recognized reads, recovery, and archive operations defer to the
+host; create/update/send/share/merge-style changes ask; and permanent
+delete/destroy/trash operations are blocked under CRUA. Unrecognized connector
+verbs currently defer to the host rather than creating an extra Guardrails
+dialog. This vocabulary is deliberately tested and maintained as connectors
+evolve.
+
 ## Customizing
 
 - **Block arbitrary code/content patterns:** drop a YAML file in
@@ -131,8 +155,10 @@ executed command, so it isn't blocked.
   trees); override with `AGW_HOME`. On ephemeral or remote runners whose home
   directory is wiped per session, point it at a mounted persistent volume.
 - **Enforcement level:** `AGW_LEVEL` (or `settings.level`) picks a bundle:
-  `strict`, `standard` (default), `relaxed`, or `observe` (shadow mode: logs
-  what it would do, blocks nothing). Safe by default; the company sets one knob.
+  `strict`, `standard` (default), `relaxed`, or `observe`. Observe mode shadows
+  ordinary policy-pack asks/denies but keeps non-waivable safety invariants; it
+  does not create a separate command ledger. Safe by default; the company sets
+  one knob.
   See [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md) for the
   full table.
 - **Disk budget:** `AGW_ARCHIVE_MAX_BYTES` caps the store (0 = unlimited);
@@ -173,5 +199,9 @@ that must always resolve to deny/ask, golden subprocess tests of the actual hook
 Cowork support (hooks don't fire there yet —
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md)),
 plan→apply transactions for bulk reorganization, the `hydrate` verb, a Cursor
-adapter on the same core engine, and an instruction compiler. Design notes in
+adapter on the same core engine, and an instruction compiler. Also planned is
+an on-demand, report-only connector policy auditor that inventories exposed
+connector tools, flags unclassified or ambiguous action verbs, and proposes
+reviewed Codex/Claude policy and test updates without executing connector
+actions or changing policy automatically. Design notes in
 [PLAN.md](PLAN.md), research trail in [RESEARCH.md](RESEARCH.md).
