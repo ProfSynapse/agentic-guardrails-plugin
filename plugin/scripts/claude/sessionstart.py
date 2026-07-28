@@ -2,6 +2,7 @@
 """Claude SessionStart adapter: bootstrap the store, warm caches, and inject
 the agw vocabulary as context (skill auto-trigger is fallible; this is not)."""
 import json
+import ntpath
 import os
 import sys
 
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 def _launcher(platform=None):
     platform = os.name if platform is None else platform
     if platform == "nt":
-        return f'"{os.path.join(PLUGIN_ROOT, "bin", "agw.cmd")}"'
+        return f'"{ntpath.join(PLUGIN_ROOT, "bin", "agw.cmd")}"'
     return f'"{os.path.join(PLUGIN_ROOT, "bin", "agw").replace(chr(92), "/")}"'
 
 
