@@ -13,6 +13,7 @@ import difflib
 import json
 import os
 import sys
+import time
 
 # Windows consoles default to a legacy code page (cp1252) that cannot encode
 # non-ASCII output; force UTF-8 so the CLI never dies with a UnicodeEncodeError
@@ -48,6 +49,26 @@ def _out(args, human: str, data: dict):
 def _err(message: str, code: int = 1):
     print(f"agw: {message}", file=sys.stderr)
     sys.exit(code)
+
+
+def _office_err(args, exc, default_code: int = 1):
+    current = exc
+    error_code = "office_error"
+    details = {}
+    while current is not None:
+        error_code = getattr(current, "error_code", error_code)
+        details = getattr(current, "details", details)
+        current = getattr(current, "__cause__", None)
+    message = str(exc)
+    code = 3 if message.startswith("CONFLICT:") or "conflict" in error_code \
+        else default_code
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "ok": False,
+            "error": {"code": error_code, "message": message, "details": details},
+        }, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+        raise SystemExit(code)
+    _err(message, code=code)
 
 
 def _json_object_no_duplicates(pairs):
@@ -156,33 +177,108 @@ def cmd_init(args):
 
 def cmd_scan(args):
     folder = _resolve(args.path)
+    if not os.path.isdir(folder):
+        _err(f"scan requires a directory, not a file: {folder}", code=2)
     profile = prof.detect(folder)
-    stats = {"files": 0, "dirs": 0, "bytes": 0, "by_ext": {}, "placeholders": [],
-             "gdoc_stubs": [], "sync_artifacts": [], "profile": profile.name}
+    max_seconds = args.max_seconds if args.max_seconds is not None \
+        else (3.0 if args.fast else 30.0)
+    max_files = args.max_files if args.max_files is not None \
+        else (5000 if args.fast else 100000)
+    max_depth = args.max_depth if args.max_depth is not None \
+        else (4 if args.fast else 64)
+    if max_seconds <= 0 or max_files <= 0 or max_depth < 0:
+        _err("scan bounds require max-seconds > 0, max-files > 0, and max-depth >= 0")
+    no_size = bool(args.no_size or args.fast)
+    stats = {
+        "files": 0, "dirs": 0, "bytes": None if no_size else 0,
+        "by_ext": {}, "placeholders": [], "gdoc_stubs": [],
+        "sync_artifacts": [], "profile": profile.name,
+        "complete": True, "stop_reason": "", "files_inspected": 0,
+        "directories_inspected": 0, "elapsed_seconds": 0.0,
+        "bounds": {"max_seconds": max_seconds, "max_files": max_files,
+                   "max_depth": max_depth, "no_size": no_size},
+        "errors": [],
+    }
     max_entries = 50
-    for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames[:] = [d for d in dirnames if d not in ("_workspace", ".git", "node_modules")]
-        stats["dirs"] += len(dirnames)
-        for name in filenames:
-            p = os.path.join(dirpath, name)
-            stats["files"] += 1
-            ext = os.path.splitext(name)[1].lower() or "(none)"
-            stats["by_ext"][ext] = stats["by_ext"].get(ext, 0) + 1
-            try:
-                stats["bytes"] += os.path.getsize(p)
-            except OSError:
-                pass
-            rel = os.path.relpath(p, folder)
-            if prof.is_gdoc_stub(p) and len(stats["gdoc_stubs"]) < max_entries:
-                stats["gdoc_stubs"].append(rel)
-            elif prof.is_placeholder(p) and len(stats["placeholders"]) < max_entries:
-                stats["placeholders"].append(rel)
-            elif prof.is_sync_artifact(p) and len(stats["sync_artifacts"]) < max_entries:
-                stats["sync_artifacts"].append(rel)
+    start = time.monotonic()
+    stack = [(folder, 0)]
+    while stack:
+        if time.monotonic() - start >= max_seconds:
+            stats["complete"] = False
+            stats["stop_reason"] = "max_seconds"
+            break
+        dirpath, depth = stack.pop()
+        stats["directories_inspected"] += 1
+        try:
+            iterator = os.scandir(dirpath)
+        except OSError as exc:
+            stats["complete"] = False
+            stats["stop_reason"] = stats["stop_reason"] or "scan_errors"
+            if len(stats["errors"]) < max_entries:
+                stats["errors"].append({
+                    "path": os.path.relpath(dirpath, folder),
+                    "error": exc.__class__.__name__,
+                })
+            continue
+        with iterator:
+            for entry in iterator:
+                if time.monotonic() - start >= max_seconds:
+                    stats["complete"] = False
+                    stats["stop_reason"] = "max_seconds"
+                    stack.clear()
+                    break
+                name = entry.name
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    if name in ("_workspace", ".git", "node_modules"):
+                        continue
+                    stats["dirs"] += 1
+                    if depth >= max_depth:
+                        stats["complete"] = False
+                        stats["stop_reason"] = stats["stop_reason"] or "max_depth"
+                    else:
+                        stack.append((entry.path, depth + 1))
+                    continue
+                if stats["files_inspected"] >= max_files:
+                    stats["complete"] = False
+                    stats["stop_reason"] = "max_files"
+                    stack.clear()
+                    break
+                stats["files"] += 1
+                stats["files_inspected"] += 1
+                ext = os.path.splitext(name)[1].lower() or "(none)"
+                stats["by_ext"][ext] = stats["by_ext"].get(ext, 0) + 1
+                p = entry.path
+                st = None
+                if not no_size or profile.sync_provider:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        st = None
+                if not no_size and st is not None:
+                    stats["bytes"] += int(st.st_size)
+                rel = os.path.relpath(p, folder)
+                if prof.is_gdoc_stub(p) and len(stats["gdoc_stubs"]) < max_entries:
+                    stats["gdoc_stubs"].append(rel)
+                elif st is not None and prof.is_placeholder(
+                        p, st=st, profile=profile) \
+                        and len(stats["placeholders"]) < max_entries:
+                    stats["placeholders"].append(rel)
+                elif prof.is_sync_artifact(p) \
+                        and len(stats["sync_artifacts"]) < max_entries:
+                    stats["sync_artifacts"].append(rel)
+    stats["elapsed_seconds"] = round(time.monotonic() - start, 6)
+    size_label = "size skipped" if no_size else f"{stats['bytes'] / 1e6:.1f} MB"
     human = (f"{folder} [{profile.name}]: {stats['files']} files, "
-             f"{stats['bytes'] / 1e6:.1f} MB; placeholders: {len(stats['placeholders'])}, "
+             f"{size_label}; "
+             f"placeholders: {len(stats['placeholders'])}, "
              f"gdoc stubs: {len(stats['gdoc_stubs'])}, "
              f"sync artifacts: {len(stats['sync_artifacts'])}")
+    if not stats["complete"]:
+        human += f"; partial: {stats['stop_reason']}"
     if stats["placeholders"]:
         human += "\n  cloud-only (do NOT edit before hydrating): " + \
                  ", ".join(stats["placeholders"][:10])
@@ -428,11 +524,14 @@ def cmd_office(args):
             human = json.dumps(data, ensure_ascii=False, indent=2, default=str)
         elif args.op == "get-text":
             text = office.get_text(path)
-            data, human = {"path": path, "text": text}, text
+            data = {"path": path, "text": text,
+                    "preservation": office.preservation_info(path)}
+            human = text
         elif args.op == "replace-text":
             if args.dry_run:
                 matches = office.find_matches(path, args.find)
-                data = {"matches": matches, "count": len(matches)}
+                data = {"matches": matches, "count": len(matches),
+                        "preservation": office.preservation_info(path)}
                 human = "\n".join(
                     [f"{len(matches)} match(es) for {args.find!r}:"] +
                     [f"  #{m['n']} ({m['where']}) ...{m['context']}..."
@@ -485,16 +584,43 @@ def cmd_office(args):
             human = (f"{data['table']} on {data['sheet']}: "
                      f"{data['returned']} row(s)"
                      f"{' (more)' if data['more'] else ''}")
+        elif args.op == "ensure-table":
+            import office_excel
+            headers = _load_json_payload(
+                args.headers_json, args.headers_file, "ensure-table headers", list
+            ) if args.headers_json or args.headers_file else None
+            columns = _load_json_payload(
+                args.columns_json, args.columns_file, "ensure-table columns", None
+            ) if args.columns_json or args.columns_file else None
+            data = office_excel.ensure_table(
+                path, args.table, sheet=args.sheet, headers=headers,
+                cell_range=args.range, style=args.style, columns=columns,
+                create_sheet=args.create_sheet,
+                expected_sha256=args.expected_file_hash,
+                dry_run=args.dry_run,
+            )
+            human = ("dry-run: " if args.dry_run else "") + \
+                f"{data.get('changed', 0)} change(s) for {args.table} on {args.sheet}"
         elif args.op == "append-table-row":
             import office_excel
             row = _load_json_payload(
                 args.row_json, args.row_file, "append-table-row", dict
             )
+            if args.unique_columns_json or args.unique_columns_file:
+                if args.unique_column:
+                    _err("unique-column and unique-columns JSON are mutually exclusive")
+                unique_columns = _load_json_payload(
+                    args.unique_columns_json, args.unique_columns_file,
+                    "append-table-row unique columns", list,
+                )
+            else:
+                unique_columns = args.unique_column
             data = office_excel.append_table_row(
                 path, args.table, row, sheet=args.sheet,
                 expected_sha256=args.expected_file_hash,
                 dry_run=args.dry_run,
                 coerce_iso_dates=args.coerce_iso_dates,
+                unique_columns=unique_columns,
             )
             human = ("dry-run: " if args.dry_run else "") + \
                 f"{data.get('changed', data.get('appended', 0))} row(s) for {args.table}"
@@ -540,15 +666,14 @@ def cmd_office(args):
         else:  # pragma: no cover - argparse restricts choices
             _err(f"unknown office op: {args.op}")
     except office.MissingLibrary as exc:
-        _err(str(exc), code=2)
+        _office_err(args, exc, default_code=2)
     except office.OfficeError as exc:
-        _err(str(exc))
+        _office_err(args, exc)
     except Exception as exc:
         # Adapter errors are intentionally plain exceptions so optional
         # dependencies remain lazy. Keep CLI errors concise and preserve the
         # established conflict exit code.
-        message = str(exc)
-        _err(message, code=3 if message.startswith("CONFLICT:") else 1)
+        _office_err(args, exc)
     _out(args, human, data)
 
 
@@ -578,6 +703,16 @@ def main(argv=None):
 
     add("init", cmd_init, (["path"], {"nargs": "?", "default": "."}))
     add("scan", cmd_scan, (["path"], {"nargs": "?", "default": "."}),
+        (["--fast"], {"action": "store_true",
+                       "help": "use small time/file/depth bounds and skip sizes"}),
+        (["--max-seconds"], {"type": float, "default": None,
+                             "help": "stop after this many elapsed seconds"}),
+        (["--max-files"], {"type": int, "default": None,
+                           "help": "stop after inspecting this many files"}),
+        (["--max-depth"], {"type": int, "default": None,
+                           "help": "maximum directory depth below the root"}),
+        (["--no-size"], {"action": "store_true",
+                         "help": "skip file-size accounting"}),
         help="inventory a folder without hydrating cloud files")
     add("checkout", cmd_checkout, (["path"], {}),
         help="create an editable open-format working copy")
@@ -601,7 +736,7 @@ def main(argv=None):
     add("office", cmd_office,
         (["op"], {"choices": ["info", "get-text", "replace-text",
                               "set-cell", "append-rows", "read-table",
-                              "append-table-row", "update-table-row",
+                              "ensure-table", "append-table-row", "update-table-row",
                               "outline", "read-blocks", "patch"]}),
         (["path"], {}),
         (["--find"], {"default": ""}), (["--replace"], {"default": ""}),
@@ -610,13 +745,26 @@ def main(argv=None):
         (["--nth"], {"type": int, "default": 0,
                      "help": "replace only the Nth occurrence (1-based, document order)"}),
         (["--dry-run"], {"action": "store_true",
-                         "help": "list matches with location/context; change nothing"}),
+                         "help": "plan and validate without changing the file or archiving"}),
         (["--sheet"], {"default": ""}), (["--cell"], {"default": ""}),
         (["--value"], {"default": ""}),
         (["--rows"], {"default": "", "help": "JSON array or - for stdin"}),
         (["--from-csv"], {"default": ""}),
         (["--scope"], {"choices": ["tables", "names"], "default": ""}),
         (["--table"], {"default": ""}), (["--columns"], {"default": ""}),
+        (["--headers-json"], {"default": "",
+                                "help": "JSON header array or - for stdin"}),
+        (["--headers-file"], {"default": "",
+                               "help": "path to a JSON header array"}),
+        (["--columns-json"], {"default": "",
+                                "help": "JSON column metadata or - for stdin"}),
+        (["--columns-file"], {"default": "",
+                               "help": "path to JSON column metadata"}),
+        (["--range"], {"default": "",
+                        "help": "explicit rectangular range for ensure-table"}),
+        (["--style"], {"default": "", "help": "Excel table style name"}),
+        (["--create-sheet"], {"action": "store_true",
+                               "help": "allow ensure-table to create --sheet"}),
         (["--where-json"], {"default": "",
                              "help": "JSON object or - for stdin"}),
         (["--offset"], {"type": int, "default": 0}),
@@ -624,12 +772,20 @@ def main(argv=None):
         (["--values-only"], {"action": "store_true"}),
         (["--row-json"], {"default": "", "help": "JSON object or - for stdin"}),
         (["--row-file"], {"default": ""}),
+        (["--unique-column"], {"action": "append", "default": [],
+                                "help": "atomic uniqueness column; repeat for composites"}),
+        (["--unique-columns-json"], {"default": "",
+                                       "help": "JSON column array or - for stdin"}),
+        (["--unique-columns-file"], {"default": "",
+                                      "help": "path to a JSON uniqueness-column array"}),
         (["--set-json"], {"default": "", "help": "JSON object or - for stdin"}),
         (["--set-file"], {"default": ""}),
         (["--key-column"], {"default": ""}), (["--key"], {"default": ""}),
         (["--key-json"], {"default": "", "help": "JSON scalar or - for stdin"}),
-        (["--expected-file-hash"], {"default": ""}),
-        (["--coerce-iso-dates"], {"action": "store_true"}),
+        (["--expected-file-hash"], {"default": "",
+                                     "help": "refuse if the live SHA-256 differs"}),
+        (["--coerce-iso-dates"], {"action": "store_true",
+                                   "help": "coerce ISO date/datetime strings"}),
         (["--ids"], {"default": ""}),
         (["--ops-json"], {"default": "", "help": "JSON array or - for stdin"}),
         (["--ops-file"], {"default": ""}),

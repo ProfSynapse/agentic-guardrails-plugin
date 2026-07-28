@@ -109,6 +109,15 @@ def test_powershell_env_assignment_prefix_is_data():
     assert FLAG_INDIRECT not in parsed.flags
 
 
+def test_powershell_null_redirection_is_not_command_indirection():
+    parsed = extract_commands(
+        "rg -n 'version' plugin README.md 2>$null",
+        dialect=DIALECT_POWERSHELL,
+    )
+    assert [command.name for command in parsed.commands] == ["rg"]
+    assert FLAG_INDIRECT not in parsed.flags
+
+
 def test_windows_backslash_path_preserved():
     # shlex(posix) would eat the backslash and collapse `secrets\.env` to
     # `secrets.env`; the normalizer keeps it so path detection still works.

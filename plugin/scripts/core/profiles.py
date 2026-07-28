@@ -91,6 +91,7 @@ def _detect_uncached(directory: str) -> Profile:
 
     # marker files walking up
     cur = directory
+    git_found = False
     for _ in range(12):
         try:
             names = set(os.listdir(cur))
@@ -101,11 +102,13 @@ def _detect_uncached(directory: str) -> Profile:
         if ".dropbox.cache" in names or ".dropbox" in names:
             return BUILTIN["dropbox"]
         if ".git" in names:
-            return BUILTIN["git"]
+            git_found = True
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
+    if git_found:
+        return BUILTIN["git"]
     return BUILTIN["local"]
 
 
@@ -118,7 +121,7 @@ def _is_under(path: str, root: str) -> bool:
         return False
 
 
-def is_placeholder(path: str) -> bool:
+def is_placeholder(path: str, *, st=None, profile: Profile = None) -> bool:
     """Cloud-only placeholder detection.
 
     Authoritative OS signals (trusted on their own): Windows
@@ -132,10 +135,11 @@ def is_placeholder(path: str) -> bool:
     the bare st_blocks==0 signal is only trusted when the path is under a
     detected cloud-sync profile; on plain local/git folders it is ignored.
     False for missing files."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
+    if st is None:
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
     if st.st_size == 0:
         return False
     if sys.platform == "win32":
@@ -154,7 +158,7 @@ def is_placeholder(path: str) -> bool:
         return False
     # Corroborate the st_blocks==0 inference with a cloud-sync profile so odd
     # filesystems (tmpfs/FUSE/DrvFs) don't trigger false positives.
-    return detect(path).sync_provider
+    return (profile or detect(path)).sync_provider
 
 
 def is_gdoc_stub(path: str) -> bool:

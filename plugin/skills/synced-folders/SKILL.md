@@ -24,6 +24,14 @@ Reports per folder: total files, **placeholders** (cloud-only, not hydrated),
 (conflict copies, .tmp.driveupload, ~$ lock files). Plan around these before
 touching anything.
 
+Scanning is metadata-only and rejects file paths. Prefer `--fast` for an
+initial probe. On large or virtual trees, set `--max-seconds`, `--max-files`,
+and `--max-depth`; use `--no-size` to avoid size accounting. When a limit is
+reached, continue from the returned partial inventory rather than treating it
+as failure: `complete` is false and `stop_reason`, inspected counts, and elapsed
+time explain the bound. A detected sync profile takes precedence over an
+enclosing Git repository profile.
+
 ## Placeholders (cloud-only files)
 
 OneDrive Files On-Demand and Drive "online-only" files occupy zero local

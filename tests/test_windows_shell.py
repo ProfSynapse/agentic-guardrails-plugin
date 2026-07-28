@@ -104,6 +104,15 @@ def test_benign_powershell_not_blocked(evaluate):
     assert evaluate('powershell -Command "Get-Content nonexistent-benign.txt"').action == DEFER
 
 
+def test_powershell_null_redirection_does_not_create_a_fake_write(evaluate):
+    command = (
+        "rg -n '0\\.3\\.2|version' plugin README.md 2>$null"
+    )
+    decision = evaluate(command)
+    assert decision.action != DENY
+    assert engine.redirect_targets(command) == []
+
+
 def test_powershell_get_content_recognized_as_reader(evaluate, tmp_path, monkeypatch):
     # Get-Content / gc / type are PowerShell aliases for cat; reading a file
     # that carries a confidentiality marker must ask, exactly as `cat` would.

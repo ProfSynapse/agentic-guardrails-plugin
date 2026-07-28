@@ -47,8 +47,10 @@ def _validated(response) -> ApprovalResponse:
 
 class ACTCTXW(ctypes.Structure):
     _fields_ = [
-        ("cbSize", wintypes.ULONG),
-        ("dwFlags", wintypes.DWORD),
+        # Windows ULONG/DWORD are fixed 32-bit values. ctypes.wintypes maps
+        # them through host c_ulong, which is 64-bit on many Unix runners.
+        ("cbSize", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
         ("lpSource", wintypes.LPCWSTR),
         ("wProcessorArchitecture", wintypes.USHORT),
         ("wLangId", wintypes.WORD),

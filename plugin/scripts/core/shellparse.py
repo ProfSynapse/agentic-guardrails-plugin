@@ -233,6 +233,8 @@ def _double_winpath_backslashes(s: str) -> str:
 # deduped); a miss is the cost we avoid by biasing toward matching.
 _REDIR_TARGET_RE = re.compile(
     r"""(?:^|[^>\d&])(?:\d*|&)>\|?\s*("[^"]+"|'[^']+'|[^\s;|&<>()]+)""")
+_REDIR_EXPRESSION_RE = re.compile(
+    r"""(?:\d*|&)>\|?\s*(?:"[^"]+"|'[^']+'|[^\s;|&<>()]+)""")
 
 
 def redirect_targets(command: str) -> list:
@@ -243,7 +245,9 @@ def redirect_targets(command: str) -> list:
     out = []
     for m in _REDIR_TARGET_RE.finditer(s):
         tok = m.group(1).strip("\"'")
-        if tok and not tok.startswith("/dev/") and tok != "SUBST_OUT":
+        if tok and not tok.startswith("/dev/") \
+                and tok.casefold() not in {"$null", "nul"} \
+                and tok != "SUBST_OUT":
             out.append(tok)
     return out
 
@@ -281,6 +285,13 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
         work = _PWSH_SUBEXPRESSION_RE.sub(_sub, work)
         if "$(" in work:
             raise ParseUncertain("unbalanced PowerShell subexpression")
+
+    # A redirect target is data, not a new pipeline command. Remove complete
+    # redirect expressions before punctuation tokenization so PowerShell's
+    # `2>$null` does not become a spurious indirect `$null` command segment.
+    # redirect_targets() independently retains real filesystem destinations
+    # for pre-image planning.
+    work = _REDIR_EXPRESSION_RE.sub(" ", work)
 
     # Preserve Windows path separators so shlex doesn't strip them as escapes.
     work = _double_winpath_backslashes(work)

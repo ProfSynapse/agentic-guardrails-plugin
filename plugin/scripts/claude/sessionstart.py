@@ -2,6 +2,7 @@
 """Claude SessionStart adapter: bootstrap the store, warm caches, and inject
 the agw vocabulary as context (skill auto-trigger is fallible; this is not)."""
 import json
+import ntpath
 import os
 import sys
 
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 def _launcher(platform=None):
     platform = os.name if platform is None else platform
     if platform == "nt":
-        return f'"{os.path.join(PLUGIN_ROOT, "bin", "agw.cmd")}"'
+        return f'"{ntpath.join(PLUGIN_ROOT, "bin", "agw.cmd")}"'
     return f'"{os.path.join(PLUGIN_ROOT, "bin", "agw").replace(chr(92), "/")}"'
 
 
@@ -40,11 +41,13 @@ copy, then `{_AGW} publish <file>` (archives the old version and replaces the or
 - For small targeted Office edits, skip the round-trip: `{_AGW} office set-cell`, \
 `{_AGW} office replace-text`, `{_AGW} office append-rows`, `{_AGW} office info/get-text` \
 (each archives a pre-image first). Structured operations include `office read-table`, \
-`office append-table-row`, `office update-table-row`, `office outline/read-blocks`, \
-and `office patch`; they use compact reads and guarded atomic writes. Do not edit Office files via python/node \
+`office ensure-table`, uniqueness-aware `office append-table-row`, `office update-table-row`, \
+`office outline/read-blocks`, and general Word `office patch`; they use compact reads, \
+preservation checks, and guarded atomic writes. Do not edit Office files via python/node \
 one-liners.
 - Cloud-synced folders (OneDrive/SharePoint/Google Drive/Dropbox): run `{_AGW} scan \
-<folder>` before bulk work; never edit cloud-only placeholder files or .gdoc stubs.
+<folder> --fast` before bulk work; scans are metadata-only and bounded. Never edit \
+cloud-only placeholder files or .gdoc stubs.
 - Reading credential-type files (.env, keys, cloud configs) or files containing \
 secrets/confidentiality markings prompts the user for confirmation - explain why \
 you need the file when asking. Never combine credential files with network \
