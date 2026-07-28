@@ -72,6 +72,11 @@ def _blocks(document):
     ]
 
 
+def _preservation(path: str) -> dict:
+    risks = office_tx.inspect_preservation_risks(path)
+    return {"safe_to_mutate": not risks, "risks": risks}
+
+
 def outline(path: str, *, offset: int = 0, limit: int = DEFAULT_LIMIT) -> dict:
     if offset < 0 or limit < 1 or limit > MAX_LIMIT:
         raise WordError(f"offset must be >= 0 and limit must be 1..{MAX_LIMIT}")
@@ -91,6 +96,7 @@ def outline(path: str, *, offset: int = 0, limit: int = DEFAULT_LIMIT) -> dict:
         "offset": offset,
         "returned": len(page),
         "more": offset + len(page) < len(blocks),
+        "preservation": _preservation(path),
         "unsupported": {
             "tables": len(document.tables),
             "headers_footers_and_nested_parts": "not enumerated",
@@ -109,6 +115,7 @@ def read_blocks(path: str, ids: list[str]) -> dict:
         raise WordError(f"stale or unknown Word block ID(s): {', '.join(missing[:5])}")
     return {
         "hash": store.file_sha256(path),
+        "preservation": _preservation(path),
         "blocks": [
             {
                 "id": value,

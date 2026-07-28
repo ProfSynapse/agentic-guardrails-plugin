@@ -65,6 +65,13 @@ def _ext(path: str) -> str:
     return os.path.splitext(path)[1].lower()
 
 
+def preservation_info(path: str) -> dict:
+    """Return read-only OOXML preservation risk information."""
+    office_tx._package_preflight(path, mutating=False)
+    risks = office_tx.inspect_preservation_risks(path)
+    return {"safe_to_mutate": not risks, "risks": risks}
+
+
 def _snapshot(path: str, op: str) -> dict:
     return store.archive_file(path, mode="copy", dedupe=True,
                               reason=f"pre-image before agw office {op}")
@@ -134,6 +141,7 @@ def find_matches(path: str, find: str) -> list:
 # --- read operations (no snapshot needed) -------------------------------------
 
 def get_text(path: str) -> str:
+    preservation_info(path)
     ext = _ext(path)
     if ext == ".docx":
         doc = _docx().Document(path)
@@ -158,11 +166,13 @@ def get_text(path: str) -> str:
 def info(path: str) -> dict:
     ext = _ext(path)
     if ext == ".docx":
+        preservation = preservation_info(path)
         doc = _docx().Document(path)
         headings = [p.text for p in doc.paragraphs
                     if p.style.name.startswith("Heading") and p.text.strip()]
         return {"type": "docx", "paragraphs": len(doc.paragraphs),
-                "tables": len(doc.tables), "headings": headings}
+                "tables": len(doc.tables), "headings": headings,
+                "preservation": preservation}
     if ext in (".xlsx", ".xlsm"):
         import office_excel
         data = office_excel.workbook_info(path)
@@ -176,12 +186,14 @@ def info(path: str) -> dict:
         }
         return data
     if ext == ".pptx":
+        preservation = preservation_info(path)
         prs = _pptx().Presentation(path)
         titles = []
         for slide in prs.slides:
             title = slide.shapes.title
             titles.append(title.text if title is not None else "")
-        return {"type": "pptx", "slides": len(prs.slides), "titles": titles}
+        return {"type": "pptx", "slides": len(prs.slides), "titles": titles,
+                "preservation": preservation}
     raise OfficeError(f"unsupported extension: {ext or 'none'}")
 
 

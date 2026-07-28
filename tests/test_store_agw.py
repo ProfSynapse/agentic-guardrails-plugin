@@ -4,10 +4,13 @@ import os
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from core import store
+from core import profiles
+import agw as agw_cli
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 AGW = os.path.join(REPO, "scripts", "agw", "agw.py")
@@ -160,6 +163,66 @@ def test_cli_scan_reports_stubs(tmp_path, agw_home):
     data = json.loads(result.stdout)
     assert "Budget.gsheet" in data["gdoc_stubs"]
     assert data["files"] == 2
+    assert data["complete"] is True
+
+
+def test_cli_scan_rejects_file_path(tmp_path, agw_home):
+    target = tmp_path / "not-a-directory.txt"
+    target.write_text("content")
+    result = run_agw("scan", str(target), "--json", check=False)
+    assert result.returncode == 2
+    assert "requires a directory" in result.stderr
+
+
+def test_cli_scan_bounds_return_partial_results(tmp_path, agw_home):
+    for index in range(8):
+        (tmp_path / f"item-{index}.txt").write_text(str(index))
+    result = run_agw(
+        "scan", str(tmp_path), "--max-files", "3", "--no-size", "--json"
+    )
+    data = json.loads(result.stdout)
+    assert data["complete"] is False
+    assert data["stop_reason"] == "max_files"
+    assert data["files_inspected"] == 3
+    assert data["bytes"] is None
+    assert data["elapsed_seconds"] >= 0
+
+
+def test_sync_profile_precedes_enclosing_git_marker(tmp_path):
+    sync_root = tmp_path / "shared"
+    sync_root.mkdir()
+    (sync_root / ".dropbox").mkdir()
+    repo = sync_root / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    profiles._cache.clear()
+    assert profiles.detect(str(repo)).name == "dropbox"
+
+
+def test_scan_placeholder_checks_use_metadata_without_opening_content(
+        tmp_path, monkeypatch, capsys):
+    folder = tmp_path / "OneDrive - Example"
+    folder.mkdir()
+    target = folder / "cloud.dat"
+    target.write_bytes(b"metadata-only")
+    original = profiles.is_placeholder
+    observed = []
+
+    def inspect(path, *, st=None, profile=None):
+        observed.append((path, st is not None, profile.name))
+        return original(path, st=st, profile=profile)
+
+    monkeypatch.setattr(profiles, "is_placeholder", inspect)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("scan opened file content")
+    ))
+    agw_cli.cmd_scan(SimpleNamespace(
+        path=str(folder), fast=False, max_seconds=5.0, max_files=10,
+        max_depth=2, no_size=True, json=True,
+    ))
+    data = json.loads(capsys.readouterr().out)
+    assert data["files_inspected"] == 1
+    assert observed == [(str(target), True, "onedrive-sharepoint")]
 
 
 def test_cli_snapshot_preflight(tmp_path, agw_home):

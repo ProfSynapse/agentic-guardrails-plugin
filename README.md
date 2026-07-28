@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.2` is the Windows-first stable release.
+> **Release status:** `0.3.3` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -107,9 +107,10 @@ Structured Office operations are also available:
 
 ~~~text
 agw office info workbook.xlsx --scope tables --json
-agw office read-table workbook.xlsx --table Orders --columns ID,Status --limit 50 --json
-agw office append-table-row workbook.xlsx --table Orders --row-json '{"ID":"A-2"}'
-agw office update-table-row workbook.xlsx --table Orders --key-column ID --key A-2 --set-json '{"Status":"Closed"}'
+agw office read-table workbook.xlsx --table RecordsTable --columns RecordID,Status --limit 50 --json
+agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json '["RecordID","Status"]' --create-sheet
+agw office append-table-row workbook.xlsx --table RecordsTable --row-json '{"RecordID":"R-2"}' --unique-column RecordID
+agw office update-table-row workbook.xlsx --table RecordsTable --key-column RecordID --key R-2 --set-json '{"Status":"Closed"}'
 agw office outline report.docx --json
 agw office patch report.docx --expected-file-hash HASH --ops-file patch.json
 ~~~
@@ -119,19 +120,32 @@ input. This avoids native argument-quoting problems and is the preferred compact
 form in PowerShell:
 
 ~~~powershell
-'{"ID":"A-2","Status":"Needs review"}' | agw office append-table-row workbook.xlsx --table Orders --row-json -
+'{"RecordID":"R-2","Status":"Needs review"}' | agw office append-table-row workbook.xlsx --table RecordsTable --row-json -
+'["RecordID","Status"]' | agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json - --create-sheet
 '[{"op":"replace_block","id":"p2-abc123","text":"Revised text with spaces."}]' | agw office patch report.docx --ops-json -
 ~~~
 
-This applies to `--rows`, `--where-json`, `--row-json`, `--set-json`,
-`--key-json`, and `--ops-json`. A command can consume only one stdin payload;
+This applies to `--rows`, `--headers-json`, `--columns-json`, `--where-json`,
+`--row-json`, `--unique-columns-json`, `--set-json`, `--key-json`, and
+`--ops-json`. A command can consume only one stdin payload;
 use the corresponding file option when multiple structured inputs are needed.
 
 Reads are paginated and compact. Writes validate a staged Office package,
 archive one exact pre-image, reject source drift, and atomically replace the
-live file. Excel table writes support `.xlsx`; macro-enabled and unsupported
-complex OOXML files are refused. Word patches target top-level body paragraphs,
+live file. Table operations return sheet, table, range, row count, and file
+hashes. `ensure-table` is idempotent and can create an explicitly requested
+sheet or convert an explicit rectangular range. Appends can enforce atomic
+single or composite uniqueness with `--unique-column` or
+`--unique-columns-json`. Read-only inspection reports detected preservation
+risks; mutation refuses unsupported or lossy OOXML. Excel table writes support
+`.xlsx`; macro-enabled and unsupported complex OOXML files are refused. Word
+patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
+
+Folder scans are metadata-only and bounded. Use `agw scan <folder> --fast
+--json` for a small probe, or set `--max-seconds`, `--max-files`, and
+`--max-depth`; add `--no-size` on slow virtual filesystems. A bounded result
+sets `complete: false` and reports the stopping reason and inspected counts.
 | `mv` (untracked) | `agw move` (transactional, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 

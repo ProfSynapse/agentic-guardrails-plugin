@@ -4,13 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
 import uuid
+import warnings
 import zipfile
 from dataclasses import dataclass
 from typing import Callable, Optional
+from xml.etree import ElementTree
 
 from core import profiles, store
 
@@ -26,11 +29,23 @@ class TransactionError(Exception):
 
 
 class TransactionConflict(TransactionError):
-    pass
+    error_code = "file_conflict"
 
 
 class UnsupportedOfficeFile(TransactionError):
-    pass
+    error_code = "unsupported_office_file"
+
+
+class PreservationError(UnsupportedOfficeFile):
+    error_code = "office_preservation_risk"
+
+    def __init__(self, risks: list[dict]):
+        self.details = {"risks": risks}
+        summary = "; ".join(
+            f"{risk.get('part', 'package')}: {risk.get('message', 'preservation risk')}"
+            for risk in risks[:3]
+        )
+        super().__init__(f"Office preservation check refused the mutation: {summary}")
 
 
 @dataclass(frozen=True)
@@ -82,7 +97,7 @@ def transaction_status() -> list[dict]:
         except (OSError, json.JSONDecodeError):
             pending.append({"mutation_id": name[:-5], "state": "UNREADABLE"})
             continue
-        if record.get("state") != "COMMITTED":
+        if record.get("state") not in {"COMMITTED", "ABORTED"}:
             pending.append({
                 "mutation_id": record.get("mutation_id", name[:-5]),
                 "state": record.get("state", "UNKNOWN"),
@@ -91,6 +106,165 @@ def transaction_status() -> list[dict]:
                 "snapshot_version": record.get("snapshot_version"),
             })
     return pending
+
+
+_LOSSY_WARNING = re.compile(
+    r"(?i)(?:not supported|unsupported|will be removed|cannot be preserved|lossy|extension)"
+)
+_EXTENSION_MARKERS = (
+    b"<extLst", b":extLst", b"/office/spreadsheetml/2009/9/",
+    b"/office/spreadsheetml/2010/11/", b"/office/spreadsheetml/2014/",
+    b"/office/spreadsheetml/2016/", b"/office/drawing/2010/",
+)
+_KNOWN_LOSSY_PART_PREFIXES = (
+    "xl/slicers/", "xl/slicerCaches/", "xl/timelines/",
+    "xl/timelineCaches/", "xl/persons/", "xl/threadedComments/",
+)
+
+
+def _warning_risks(captured, phase: str) -> list[dict]:
+    risks = []
+    for item in captured:
+        message = str(item.message)
+        if _LOSSY_WARNING.search(message):
+            risks.append({
+                "code": "library_preservation_warning",
+                "feature": item.category.__name__,
+                "part": "package",
+                "phase": phase,
+                "message": message,
+            })
+    return risks
+
+
+def _run_capturing_warnings(callback, phase: str):
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        value = callback()
+    risks = _warning_risks(captured, phase)
+    if risks:
+        raise PreservationError(risks)
+    return value
+
+
+def inspect_preservation_risks(path: str) -> list[dict]:
+    """Return known OOXML features that common Python libraries lose on save."""
+    risks = []
+    seen = set()
+    with zipfile.ZipFile(path) as package:
+        for item in package.infolist():
+            name = item.filename.replace("\\", "/")
+            lower = name.lower()
+            if any(lower.startswith(prefix.lower())
+                   for prefix in _KNOWN_LOSSY_PART_PREFIXES):
+                key = ("unsupported_ooxml_part", lower)
+                if key not in seen:
+                    seen.add(key)
+                    risks.append({
+                        "code": key[0], "feature": "unsupported OOXML extension",
+                        "part": name,
+                        "message": "this OOXML part is not safely round-tripped",
+                    })
+            if not lower.startswith("xl/") or not lower.endswith(".xml"):
+                continue
+            with package.open(item) as handle:
+                sample = handle.read(min(item.file_size, 8 * 1024 * 1024))
+            if any(marker in sample for marker in _EXTENSION_MARKERS):
+                key = ("unsupported_ooxml_extension", lower)
+                if key not in seen:
+                    seen.add(key)
+                    risks.append({
+                        "code": key[0], "feature": "extension list",
+                        "part": name,
+                        "message": "the part contains an OOXML extension that may be removed on save",
+                    })
+    return risks
+
+
+def _relationship_set(payload: bytes) -> set[tuple[str, str, str]]:
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise UnsupportedOfficeFile("Office package contains malformed relationships") from exc
+    return {
+        (node.attrib.get("Type", ""), node.attrib.get("Target", ""),
+         node.attrib.get("TargetMode", ""))
+        for node in root
+    }
+
+
+def _package_state(path: str) -> dict:
+    state = {"parts": {}, "relationships": {}}
+    with zipfile.ZipFile(path) as package:
+        for item in package.infolist():
+            name = item.filename.replace("\\", "/")
+            payload = package.read(item)
+            state["parts"][name] = hashlib.sha256(payload).hexdigest()
+            if name.lower().endswith(".rels"):
+                state["relationships"][name] = _relationship_set(payload)
+    return state
+
+
+def _mutable_part(name: str, extension: str, operation: str) -> bool:
+    lower = name.lower()
+    if lower in {"[content_types].xml", "docprops/core.xml", "docprops/app.xml"}:
+        return True
+    if extension == ".xlsx":
+        return lower in {
+            "xl/workbook.xml", "xl/styles.xml", "xl/sharedstrings.xml",
+            "xl/calcchain.xml", "xl/_rels/workbook.xml.rels",
+        } or lower.startswith(("xl/worksheets/", "xl/tables/"))
+    if extension == ".docx":
+        return lower == "word/document.xml"
+    if extension == ".pptx":
+        return lower == "ppt/presentation.xml" or lower.startswith("ppt/slides/")
+    return False
+
+
+def verify_package_preservation(before_path: str, after_path: str,
+                                operation: str) -> dict:
+    """Refuse staged packages that lose or unexpectedly rewrite OOXML parts."""
+    before = _package_state(before_path)
+    after = _package_state(after_path)
+    extension = os.path.splitext(before_path)[1].lower()
+    before_names = set(before["parts"])
+    after_names = set(after["parts"])
+    removed = sorted(before_names - after_names)
+    allowed_removed = {name for name in removed if name.lower() == "xl/calcchain.xml"}
+    unexpected_removed = [name for name in removed if name not in allowed_removed]
+    added = sorted(after_names - before_names)
+    unexpected_added = [
+        name for name in added
+        if not (extension == ".xlsx" and operation == "ensure-table"
+                and _mutable_part(name, extension, operation))
+    ]
+    altered = sorted(
+        name for name in before_names & after_names
+        if before["parts"][name] != after["parts"][name]
+        and not _mutable_part(name, extension, operation)
+    )
+    relationship_changes = sorted(
+        name for name in set(before["relationships"]) & set(after["relationships"])
+        if before["relationships"][name] != after["relationships"][name]
+        and not _mutable_part(name, extension, operation)
+    )
+    risks = []
+    for code, names in (
+        ("removed_ooxml_part", unexpected_removed),
+        ("added_ooxml_part", unexpected_added),
+        ("altered_ooxml_part", altered),
+        ("altered_ooxml_relationships", relationship_changes),
+    ):
+        risks.extend({
+            "code": code, "feature": "OOXML package preservation", "part": name,
+            "message": code.replace("_", " "),
+        } for name in names)
+    if risks:
+        raise PreservationError(risks)
+    return {
+        "verified": True,
+        "removed_regenerable_parts": sorted(allowed_removed),
+    }
 
 
 def _package_preflight(path: str, *, mutating: bool = True) -> None:
@@ -175,6 +349,9 @@ def _target_preflight(path: str) -> str:
             "file has an open Guardrails checkout; publish or resolve it first"
         )
     _package_preflight(path)
+    risks = inspect_preservation_risks(path)
+    if risks:
+        raise PreservationError(risks)
     return path
 
 
@@ -192,21 +369,27 @@ def execute_mutation(
     path = os.path.abspath(os.path.expanduser(path))
     lock_name = "office-" + _target_id(path)[:32]
     stage = ""
+    receipt = None
     with store.Lock(lock_name, timeout=10.0):
         path = _target_preflight(path)
         before = store.file_sha256(path)
         if expected_sha256 and before.lower() != expected_sha256.lower():
             raise TransactionConflict("CONFLICT: file hash does not match expected version")
-        mutation_plan = plan(path)
+        mutation_plan = _run_capturing_warnings(lambda: plan(path), "plan")
         if not isinstance(mutation_plan, MutationPlan):
             raise TransactionError("Office adapter returned an invalid mutation plan")
         if not mutation_plan.changed:
-            return {**mutation_plan.preview, "changed": 0, "hash": before}
+            return {
+                **mutation_plan.preview, "changed": 0, "hash": before,
+                "before_hash": before, "after_hash": before,
+            }
         if dry_run:
             return {
                 **mutation_plan.preview,
                 "dry_run": True,
                 "hash": before,
+                "before_hash": before,
+                "after_hash": before,
             }
 
         suffix = os.path.splitext(path)[1]
@@ -216,12 +399,22 @@ def execute_mutation(
         os.close(fd)
         try:
             shutil.copy2(path, stage)
-            apply(stage, mutation_plan)
-            validation = validate(stage, mutation_plan) or {}
+            _run_capturing_warnings(
+                lambda: apply(stage, mutation_plan), "apply"
+            )
+            validation = _run_capturing_warnings(
+                lambda: validate(stage, mutation_plan), "validate"
+            ) or {}
             _package_preflight(stage)
+            preservation = verify_package_preservation(path, stage, operation)
             after = store.file_sha256(stage)
             if after == before:
-                return {**mutation_plan.preview, "changed": 0, "hash": before}
+                return {
+                    **mutation_plan.preview, **validation,
+                    "preservation": preservation,
+                    "changed": 0, "hash": before,
+                    "before_hash": before, "after_hash": before,
+                }
             if store.file_sha256(path) != before:
                 raise TransactionConflict("CONFLICT: file changed while mutation was staged")
 
@@ -274,11 +467,22 @@ def execute_mutation(
             return {
                 **mutation_plan.preview,
                 **validation,
+                "preservation": preservation,
                 "changed": receipt["affected"] or 1,
                 "snapshot": snapshot.get("version"),
                 "mutation": mutation_id,
                 "hash": after,
+                "before_hash": before,
+                "after_hash": after,
             }
+        except Exception:
+            if receipt is not None and receipt.get("state") == "PREPARED":
+                receipt["state"] = "ABORTED"
+                try:
+                    _write_manifest(receipt)
+                except OSError:
+                    pass
+            raise
         finally:
             if stage and os.path.exists(stage):
                 try:
