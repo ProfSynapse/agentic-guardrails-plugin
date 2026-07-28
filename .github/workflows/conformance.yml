@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: python -m pip install pytest pyyaml
+        run: python -m pip install pytest pyyaml openpyxl==3.1.5 python-docx==1.2.0
       - name: Validate JSON manifests
         shell: python
         run: |
@@ -58,7 +58,7 @@ jobs:
       - name: Run Windows store and policy shard
         if: runner.os == 'Windows'
         timeout-minutes: 8
-        run: python -m pytest -q tests/test_store_agw.py tests/test_policy_health.py tests/test_levels.py tests/test_archive_transactions.py tests/test_office.py
+        run: python -m pytest -q tests/test_store_agw.py tests/test_policy_health.py tests/test_levels.py tests/test_archive_transactions.py tests/test_office.py tests/test_office_structured.py
       - name: Run source and packed-artifact conformance on Unix
         if: runner.os != 'Windows'
         run: python -m pytest -q

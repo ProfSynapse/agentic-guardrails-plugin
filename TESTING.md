@@ -26,6 +26,11 @@ The core engine speaks neutral schemas (`ToolEvent` → `Decision`), so it tests
 - Operator splitting (`&&`, `;`, `|`, `||`), subshells `$(…)`, quoting, **spaces/unicode/newlines in filenames**, recursion depth limits, wrapper stripping vs. non-stripping (`timeout` yes, `npx`/`docker exec` no).
 
 ### `agw` CLI (tmpdir fixtures)
+- Structured Office coverage includes actual Excel value bounds, compact
+  named-table reads, guarded append/update, Word outline/block patch,
+  expected-hash conflicts, dry-run side-effect freedom, staged validation,
+  exact pre-image binding, restore, and atomic publication. The Office CI
+  shard pins `openpyxl==3.1.5` and `python-docx==1.2.0`.
 - Round-trips: checkout → edit → publish; archive → restore (content-identical, hash-verified); move → undo.
 - Conflict detection: mutate live file after checkout → publish refuses.
 - Version allocation: vNNN monotonic, manifest schema (with `schema_version`), timestamps injected (no wall-clock in assertions).

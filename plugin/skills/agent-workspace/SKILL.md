@@ -66,7 +66,24 @@ agw office replace-text <file> --find "Q3" --replace "Q4" --all     # every one
 agw office replace-text <file> --find "Q3" --replace "Q4" --nth 2   # just one
 agw office set-cell <file.xlsx> --sheet Q3 --cell B2 --value 55
 agw office append-rows <file.xlsx> --sheet Q3 --from-csv new-rows.csv
+agw office info <file.xlsx> --scope tables --json
+agw office read-table <file.xlsx> --table Orders --columns ID,Status --limit 50 --json
+agw office append-table-row <file.xlsx> --table Orders --row-json '{"ID":"A-2"}'
+agw office update-table-row <file.xlsx> --table Orders --key-column ID --key A-2 --set-json '{"Status":"Closed"}'
+agw office outline <file.docx> --limit 50 --json
+agw office patch <file.docx> --expected-file-hash HASH --ops-file patch.json
 ```
+
+On PowerShell, pipe structured JSON through stdin instead of fighting native
+argument quoting. JSON-bearing options accept `-` as the stdin sentinel:
+
+```powershell
+'{"ID":"A-2","Status":"Needs review"}' | agw office append-table-row <file.xlsx> --table Orders --row-json -
+'[{"op":"replace_block","id":"p2-abc123","text":"Revised text with spaces."}]' | agw office patch <file.docx> --ops-json -
+```
+
+This works for `--rows`, `--where-json`, `--row-json`, `--set-json`,
+`--key-json`, and `--ops-json`. Use only one stdin payload per command.
 
 `replace-text` works like the Edit tool: if `--find` matches more than once
 it refuses rather than mass-editing. Either make `--find` longer and unique,
@@ -79,6 +96,16 @@ checkout/publish when restructuring a document or doing heavy rewriting.
 Never edit Office files with ad-hoc interpreter one-liners (python -c with
 openpyxl etc.) — those bypass the snapshot contract and will be blocked
 or escalated.
+
+Structured reads are compact and bounded: table headers are returned once with
+row arrays, and table/Word reads support pagination. Word block IDs are bound
+to the returned file hash, so `patch` requires `--expected-file-hash`.
+
+All Office writes use one guarded transaction: validate a same-directory
+staged file, archive the exact live pre-image, check for source drift, and
+publish atomically. Dry-runs create no archive or live-file change. `.xlsx` is
+the supported Excel write format; `.xlsm` writes and unsupported complex OOXML
+are refused rather than risk lossy edits.
 
 ## Rules
 
