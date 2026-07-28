@@ -632,10 +632,91 @@ def _named_arg(argv: list, flags: tuple) -> str:
 class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
-    def __init__(self, values=(), complete=True, reason=""):
+    def __init__(self, values=(), complete=True, reason="", covered=False):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
+        # True when a recognized mutator was fully analyzed but legitimately
+        # needs no pre-image (for example mkdir -p on an existing directory).
+        self.covered = covered
+
+
+def _static_shell_path(token: str) -> bool:
+    """Whether a shell path can be resolved without runtime expansion."""
+    return bool(token) and not any(char in token for char in "$`*?[]{}()")
+
+
+def _absent_creation_root(path: str) -> str:
+    """Highest absent ancestor created as part of a new literal path."""
+    root = os.path.normpath(path)
+    parent = os.path.dirname(root)
+    while parent and parent != root and not os.path.exists(parent):
+        root = parent
+        parent = os.path.dirname(root)
+    return root
+
+
+def _covered_by_absent_root(path: str, roots: set[str]) -> bool:
+    """Whether removing a planned absent ancestor also removes this path."""
+    for root in roots:
+        try:
+            if os.path.commonpath((path, root)) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _posix_mkdir_paths(argv: list[str]) -> tuple[list[str], str]:
+    """Bind the portable mkdir options needed for literal creation planning."""
+    paths = []
+    options = True
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if options and token == "--":
+            options = False
+            i += 1
+            continue
+        if options and token in {
+                "-p", "--parents", "-v", "--verbose", "-Z", "--context"}:
+            i += 1
+            continue
+        if options and token.startswith("-") and len(token) > 2 \
+                and not token.startswith("--") \
+                and set(token[1:]).issubset({"p", "v", "Z"}):
+            i += 1
+            continue
+        if options and token in {"-m", "--mode"}:
+            if i + 1 >= len(argv):
+                return [], f"mkdir option {token!r} is missing its value"
+            i += 2
+            continue
+        if options and (token.startswith("--mode=")
+                        or token.startswith("--context=")
+                        or token.startswith("-m") and len(token) > 2):
+            i += 1
+            continue
+        if options and token.startswith("-"):
+            return [], f"mkdir option {token!r} is unsupported for static planning"
+        if not _static_shell_path(token):
+            return [], "mkdir target uses runtime expansion or a wildcard"
+        paths.append(token)
+        i += 1
+    if not paths:
+        return [], "mkdir did not identify a literal target directory"
+    return paths, ""
+
+
+def _powershell_directory_creation(argv: list[str]) -> bool:
+    name = argv[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    if name in {"mkdir", "md"}:
+        return True
+    lowered = [value.lower() for value in argv]
+    for index, value in enumerate(lowered[:-1]):
+        if value.lstrip("-") in {"itemtype", "type"}:
+            return lowered[index + 1] in {"directory", "dir"}
+    return False
 
 
 def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
@@ -655,8 +736,11 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
         return os.path.normpath(p)
 
     targets = set()
+    planned_dirs = set()
+    absent_dir_roots = set()
     complete = True
     incomplete_reason = ""
+    covered = False
     try:
         for t in redirect_targets(command):
             targets.add(_abs(t))
@@ -684,26 +768,90 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                     complete = False
                     incomplete_reason = incomplete_reason or binding.reason
                     continue
+                covered = True
                 if binding.append:
                     continue
+                creates_directory = _powershell_directory_creation(cmd.argv)
                 for target in binding.targets:
                     target_abs = _abs(target)
                     if name in ("copy-item", "copy", "cp", "cpi",
                                 "move-item", "move", "mv", "mi") \
-                            and os.path.isdir(target_abs):
+                            and (os.path.isdir(target_abs)
+                                 or target_abs in planned_dirs):
                         for source in binding.sources:
-                            targets.add(os.path.join(target_abs, os.path.basename(source)))
+                            destination = os.path.join(
+                                target_abs, os.path.basename(source)
+                            )
+                            if not _covered_by_absent_root(
+                                    destination, absent_dir_roots):
+                                targets.add(destination)
+                    elif creates_directory:
+                        planned_dirs.add(target_abs)
+                        if not os.path.isdir(target_abs):
+                            creation_root = _absent_creation_root(target_abs)
+                            absent_dir_roots.add(creation_root)
+                            targets.add(creation_root)
                     else:
                         targets.add(target_abs)
+                if name in ("move-item", "move", "mv", "mi"):
+                    targets.update(_abs(source) for source in binding.sources)
+                continue
+            if name == "mkdir":
+                mkdir_paths, reason = _posix_mkdir_paths(cmd.argv[1:])
+                if reason:
+                    complete = False
+                    incomplete_reason = incomplete_reason or reason
+                    continue
+                covered = True
+                for target in mkdir_paths:
+                    target_abs = _abs(target)
+                    planned_dirs.add(target_abs)
+                    if not os.path.isdir(target_abs):
+                        creation_root = _absent_creation_root(target_abs)
+                        absent_dir_roots.add(creation_root)
+                        targets.add(creation_root)
+                continue
+            if name == "touch":
+                touch_args = list(cmd.argv[1:])
+                if any(value.startswith("-") and value != "--"
+                       for value in touch_args):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        "touch options are unsupported for static planning"
+                    continue
+                touch_paths = [value for value in touch_args if value != "--"]
+                if not touch_paths or any(
+                        not _static_shell_path(value) for value in touch_paths):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        "touch did not identify only literal target files"
+                    continue
+                covered = True
+                targets.update(_abs(value) for value in touch_paths)
                 continue
             if name in ("mv", "cp", "install") and len(ops) >= 2:
                 dest = ops[-1]
+                sources = ops[:-1]
+                if not _static_shell_path(dest) or any(
+                        not _static_shell_path(source) for source in sources):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        f"{name} source or destination uses runtime expansion or a wildcard"
+                    continue
                 dest_abs = _abs(dest)
-                if os.path.isdir(dest_abs):
-                    for src in ops[:-1]:
-                        targets.add(os.path.join(dest_abs, os.path.basename(src)))
+                if os.path.isdir(dest_abs) or dest_abs in planned_dirs \
+                        or dest.endswith(("/", "\\")):
+                    for src in sources:
+                        destination = os.path.join(
+                            dest_abs, os.path.basename(src)
+                        )
+                        if not _covered_by_absent_root(
+                                destination, absent_dir_roots):
+                            targets.add(destination)
                 else:
                     targets.add(dest_abs)
+                if name == "mv":
+                    targets.update(_abs(source) for source in sources)
             elif name == "tee" and "-a" not in cmd.argv and "--append" not in cmd.argv:
                 targets.update(_abs(o) for o in ops)
             elif name == "dd":
@@ -722,7 +870,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
         for m in _WRITEALLTEXT_RE.finditer(text):
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
-    return TargetList(values, complete, incomplete_reason)
+    return TargetList(values, complete, incomplete_reason, covered=covered)
 
 
 def _zone_rule_for(path: str, policy: Policy):

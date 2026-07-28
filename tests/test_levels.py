@@ -82,6 +82,115 @@ def test_clobber_targets_can_plan_absent_target(tmp_path):
     assert str(fresh) in targets
 
 
+def test_literal_posix_mkdir_has_absent_target(tmp_path):
+    target = tmp_path / "archive" / "nested"
+    creation_root = tmp_path / "archive"
+    targets = engine.clobber_targets(
+        "mkdir -p archive/nested", cwd=str(tmp_path), include_absent=True
+    )
+    assert targets.complete
+    assert targets.covered
+    assert targets == [os.path.normpath(str(creation_root))]
+
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="Bash", command="mkdir -p archive/nested",
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating and plan.complete
+    assert plan.targets == [
+        os.path.normcase(os.path.realpath(str(creation_root)))
+    ]
+
+
+def test_mkdir_existing_directory_needs_no_preimage(tmp_path):
+    target = tmp_path / "archive"
+    target.mkdir()
+    targets = engine.clobber_targets(
+        "mkdir -p archive", cwd=str(tmp_path), include_absent=True
+    )
+    assert targets.complete and targets.covered
+    assert targets == []
+
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="Bash", command="mkdir -p archive",
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating and plan.complete
+    assert plan.targets == []
+
+
+@pytest.mark.parametrize("command", [
+    "mkdir -pv archive",
+    "mkdir -m 700 archive",
+    "mkdir -Z archive",
+])
+def test_literal_posix_mkdir_portable_options_are_plannable(command, tmp_path):
+    targets = engine.clobber_targets(
+        command, cwd=str(tmp_path), include_absent=True
+    )
+    assert targets.complete and targets.covered
+    assert targets == [os.path.normpath(str(tmp_path / "archive"))]
+
+
+def test_compound_mkdir_then_move_resolves_planned_directory(tmp_path):
+    source = tmp_path / "report.txt"
+    source.write_text("original")
+    directory = tmp_path / "archive"
+    command = "mkdir -p archive && mv report.txt archive/"
+    targets = engine.clobber_targets(
+        command, cwd=str(tmp_path), include_absent=True
+    )
+    assert targets.complete and targets.covered
+    assert set(targets) == {
+        os.path.normpath(str(directory)), os.path.normpath(str(source)),
+    }
+
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="Bash", command=command, cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating and plan.complete
+    assert set(plan.targets) == {
+        os.path.normcase(os.path.realpath(str(directory))),
+        os.path.normcase(os.path.realpath(str(source))),
+    }
+
+
+def test_move_preimages_source_and_existing_destination(tmp_path):
+    source = tmp_path / "report.txt"
+    source.write_text("original")
+    destination = tmp_path / "renamed.txt"
+    destination.write_text("previous")
+    targets = engine.clobber_targets(
+        "mv report.txt renamed.txt", cwd=str(tmp_path), include_absent=True
+    )
+    assert targets.complete
+    assert set(targets) == {
+        os.path.normpath(str(source)), os.path.normpath(str(destination)),
+    }
+
+
+def test_dynamic_move_source_remains_incomplete(tmp_path):
+    targets = engine.clobber_targets(
+        'mv "$source" archive/', cwd=str(tmp_path), include_absent=True
+    )
+    assert not targets.complete
+    assert "runtime expansion" in targets.reason
+
+
+def test_dynamic_mkdir_target_remains_incomplete(tmp_path):
+    targets = engine.clobber_targets(
+        'mkdir -p "$archive_dir"', cwd=str(tmp_path), include_absent=True
+    )
+    assert not targets.complete
+    assert "runtime expansion" in targets.reason
+
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="Bash", command='mkdir -p "$archive_dir"',
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating and not plan.complete
+
+
 def test_mutation_plan_rejects_ambiguous_wildcard(tmp_path):
     event = ToolEvent(kind=EDIT, tool="Edit", paths=["*.txt"], cwd=str(tmp_path))
     plan = mutations.plan([event], engine.clobber_targets)

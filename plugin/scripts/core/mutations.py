@@ -102,6 +102,7 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
     """Return exact canonical targets, or an explicit incomplete plan."""
     result = MutationPlan()
     seen = set()
+    covered_without_target = False
 
     def add_paths(paths, cwd):
         for path in paths:
@@ -143,6 +144,8 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                     result.mutating = True
                 if targets:
                     add_paths(targets, ev.cwd)
+                elif looks_mutating and getattr(targets, "covered", False):
+                    covered_without_target = True
                 elif looks_mutating:
                     raise ValueError(
                         "the command may change local files, but every target could not be identified"
@@ -165,7 +168,8 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
         result.complete = False
         result.reason = str(exc) or "every mutation target could not be identified"
 
-    if result.mutating and result.complete and not result.targets:
+    if result.mutating and result.complete and not result.targets \
+            and not covered_without_target:
         result.complete = False
         result.reason = "the operation may change data, but no exact recovery target was available"
     return result

@@ -272,6 +272,17 @@ def test_powershell_copy_move_binding_named_positional_alias_and_abbreviation(tm
         )
         assert targets.complete, inner
         assert expected in targets, inner
+        if inner.lower().startswith(("move-item", "mi ")):
+            assert os.path.normpath(str(source)) in targets, inner
+
+
+def test_powershell_move_wildcard_source_is_incomplete(tmp_path):
+    targets = engine.clobber_targets(
+        'powershell -Command "Move-Item *.txt archive"',
+        str(tmp_path), include_absent=True,
+    )
+    assert not targets.complete
+    assert "dynamic" in targets.reason
 
 
 def test_powershell_binding_wrapper_encoded_and_alias_are_equivalent(tmp_path):
