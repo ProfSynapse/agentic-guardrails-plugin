@@ -45,6 +45,48 @@ def test_bash_benign_defers():
     assert _decision(out) == "defer"
 
 
+def test_bash_literal_mkdir_then_move_has_reversible_prestate(
+        tmp_path, monkeypatch):
+    source = tmp_path / "report.txt"
+    source.write_text("original")
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    out = run_hook({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "mkdir -p archive && mv report.txt archive/",
+        },
+        "cwd": str(tmp_path),
+        "session_id": "literal-create-move",
+        "hook_event_name": "PreToolUse",
+    }, env_extra={"AGW_HOME": str(home)})
+    assert _decision(out) in ("defer", "allow")
+    assert source.read_text() == "original"
+    transaction_files = list((home / "transactions").glob("*.json"))
+    assert len(transaction_files) == 2
+    records = [json.loads(path.read_text()) for path in transaction_files]
+    assert {(record["kind"], os.path.normcase(os.path.normpath(record["src"])))
+            for record in records} == {
+        ("archive", os.path.normcase(os.path.normpath(str(source)))),
+        ("absent_tombstone",
+         os.path.normcase(os.path.normpath(str(tmp_path / "archive")))),
+    }
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    source.replace(archive / source.name)
+    assert not source.exists()
+
+    from core import store
+    store.restore(str(source))
+    tombstone = next(
+        record for record in records if record["kind"] == "absent_tombstone"
+    )
+    store.rollback_absent_tombstone(tombstone["transaction_id"])
+    assert source.read_text() == "original"
+    assert not archive.exists()
+
+
 def test_claude_ask_copy_is_plain_language_and_excludes_raw_operation():
     canary = "PRIVATE-CANARY-client-command"
     out = run_hook({

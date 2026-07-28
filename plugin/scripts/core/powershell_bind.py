@@ -108,7 +108,7 @@ def _literal(token: str) -> bool:
         return False
     # These shapes require runtime evaluation or represent PowerShell arrays,
     # expressions, script blocks, splatting, or variable expansion.
-    return not any(char in token for char in "`$@{}[](),;|&")
+    return not any(char in token for char in "`$@{}[](),;|&*?")
 
 
 def _resolve_parameter(name: str, spec: CommandSpec):

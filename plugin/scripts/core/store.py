@@ -205,7 +205,7 @@ def oplog_read() -> list:
 
 
 def _folder_key(folder: str) -> str:
-    folder = os.path.abspath(folder)
+    folder = archive_tx.canonical_path(folder)
     digest = hashlib.sha256(folder.encode("utf-8", "replace")).hexdigest()[:10]
     base = os.path.basename(folder.rstrip("/\\")) or "root"
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)[:40]
@@ -213,8 +213,9 @@ def _folder_key(folder: str) -> str:
 
 
 def _file_dir(src: str) -> str:
-    folder = os.path.dirname(os.path.abspath(src))
-    name = os.path.basename(src)
+    canonical = archive_tx.canonical_path(src)
+    folder = os.path.dirname(canonical)
+    name = os.path.basename(canonical)
     safe = "".join(c if c.isalnum() or c in "-_. " else "_" for c in name)[:80]
     d = os.path.join(agw_home(), "archive", _folder_key(folder), safe)
     os.makedirs(d, exist_ok=True)
@@ -277,7 +278,8 @@ def list_versions(src: str) -> list:
         if not record or record.get("kind") != "archive" \
                 or record.get("state") != archive_tx.COMMITTED:
             continue
-        if os.path.abspath(record.get("src", "")) == os.path.abspath(src):
+        if archive_tx.canonical_path(record.get("src", "")) \
+                == archive_tx.canonical_path(src):
             out.append(archive_tx.entry_from_record(record))
     unique = {}
     for entry in out:
