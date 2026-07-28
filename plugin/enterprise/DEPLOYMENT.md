@@ -115,6 +115,9 @@ newest version of anything. `agw doctor` reports current size and budget.
 - For the `agw office` in-place editing verbs, install the libraries for the
   formats your users touch: `openpyxl` (xlsx), `python-docx` (docx),
   `python-pptx` (pptx). `agw doctor` reports which are available.
+  Structured operations are tested against `openpyxl 3.1.5` and
+  `python-docx 1.2.0`. Keep runtime versions within `openpyxl >=3.1.5,<3.2`
+  and `python-docx >=1.2.0,<1.3` until a newer compatibility lane passes.
 - `bin/agw` or `bin/agw.cmd` on PATH is convenient but optional; the hook
   teaches the agent the full path via session context regardless.
 - Hooks and SessionStart do not modify the process, user, or machine PATH. Both

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from core import store
+import office_tx
 
 
 class OfficeError(Exception):
@@ -163,11 +164,17 @@ def info(path: str) -> dict:
         return {"type": "docx", "paragraphs": len(doc.paragraphs),
                 "tables": len(doc.tables), "headings": headings}
     if ext in (".xlsx", ".xlsm"):
-        wb = _openpyxl().load_workbook(path, read_only=True)
-        sheets = {ws.title: {"rows": ws.max_row, "cols": ws.max_column}
-                  for ws in wb.worksheets}
-        wb.close()
-        return {"type": "xlsx", "sheets": sheets}
+        import office_excel
+        data = office_excel.workbook_info(path)
+        # Preserve the legacy sheet-name mapping while returning richer data.
+        data["sheet_list"] = data.pop("sheets")
+        data["sheets"] = {
+            item["name"]: {
+                key: value for key, value in item.items() if key != "name"
+            }
+            for item in data["sheet_list"]
+        }
+        return data
     if ext == ".pptx":
         prs = _pptx().Presentation(path)
         titles = []
@@ -194,7 +201,7 @@ def replace_text(path: str, find: str, replace: str,
         raise OfficeError("--find must not be empty")
     if all_matches and nth:
         raise OfficeError("--all and --nth are mutually exclusive")
-    doc, items = _collect_paragraphs(path)
+    _, items = _collect_paragraphs(path)
     total = sum("".join(r.text for r in p.runs).count(find) for _, p in items)
     if total == 0:
         return {"replacements": 0, "matches": 0}
@@ -211,29 +218,55 @@ def replace_text(path: str, find: str, replace: str,
             f"--find that is unique. First matches: {preview}")
     else:
         targets = None  # all
-    snap = _snapshot(path, "replace-text")
-    occurrence, replaced = 0, 0
-    for _, p in items:
-        full = "".join(run.text for run in p.runs)
-        if find not in full:
-            continue
-        parts = full.split(find)
-        out, hit = parts[0], 0
-        for part in parts[1:]:
-            occurrence += 1
-            if targets is None or occurrence in targets:
-                out += replace
-                hit += 1
-            else:
-                out += find
-            out += part
-        if hit:
-            _repack_runs(p, out)
-            replaced += hit
-    if replaced:
-        doc.save(path)
-    return {"replacements": replaced, "matches": total,
-            "snapshot_version": snap.get("version")}
+    result_holder = {}
+
+    def plan(_live):
+        return office_tx.MutationPlan(
+            "replace-text",
+            {"replacements": len(targets) if targets is not None else total,
+             "matches": total},
+            {"affected": len(targets) if targets is not None else total},
+        )
+
+    def apply(stage, _plan):
+        document, stage_items = _collect_paragraphs(stage)
+        occurrence, replaced_count = 0, 0
+        for _, paragraph in stage_items:
+            full = "".join(run.text for run in paragraph.runs)
+            if find not in full:
+                continue
+            parts = full.split(find)
+            out, hit = parts[0], 0
+            for part in parts[1:]:
+                occurrence += 1
+                if targets is None or occurrence in targets:
+                    out += replace
+                    hit += 1
+                else:
+                    out += find
+                out += part
+            if hit:
+                _repack_runs(paragraph, out)
+                replaced_count += hit
+        result_holder["replacements"] = replaced_count
+        document.save(stage)
+
+    def validate(stage, _plan):
+        remaining = len(find_matches(stage, find))
+        expected = total - result_holder["replacements"]
+        if remaining != expected:
+            raise OfficeError("staged replace-text validation failed")
+        return {"replacements": result_holder["replacements"], "matches": total}
+
+    try:
+        result = office_tx.execute_mutation(
+            path, operation="replace-text", plan=plan,
+            apply=apply, validate=validate,
+        )
+    except office_tx.TransactionError as exc:
+        raise OfficeError(str(exc)) from exc
+    result["snapshot_version"] = result.pop("snapshot", None)
+    return result
 
 
 def _coerce(value: str, force_text: bool):
@@ -254,28 +287,94 @@ def _coerce(value: str, force_text: bool):
 def set_cell(path: str, sheet: str, cell: str, value: str,
              force_text: bool = False) -> dict:
     openpyxl = _openpyxl()
-    wb = openpyxl.load_workbook(path)
-    if sheet not in wb.sheetnames:
-        raise OfficeError(f"no sheet named {sheet!r} (have: {', '.join(wb.sheetnames)})")
-    snap = _snapshot(path, "set-cell")
-    ws = wb[sheet]
-    old = ws[cell].value
-    ws[cell] = _coerce(value, force_text)
-    wb.save(path)
-    return {"sheet": sheet, "cell": cell, "old": old, "new": ws[cell].value,
-            "snapshot_version": snap.get("version")}
+    state = {}
+
+    def plan(live):
+        wb = openpyxl.load_workbook(live)
+        try:
+            if sheet not in wb.sheetnames:
+                raise OfficeError(
+                    f"no sheet named {sheet!r} (have: {', '.join(wb.sheetnames)})"
+                )
+            old = wb[sheet][cell].value
+            new = _coerce(value, force_text)
+            state.update({"old": old, "new": new})
+            return office_tx.MutationPlan(
+                "set-cell", {"sheet": sheet, "cell": cell, "old": old, "new": new},
+                {"affected": int(old != new)}, changed=old != new,
+            )
+        finally:
+            wb.close()
+
+    def apply(stage, _plan):
+        wb = openpyxl.load_workbook(stage)
+        wb[sheet][cell] = state["new"]
+        wb.save(stage)
+        wb.close()
+
+    def validate(stage, _plan):
+        wb = openpyxl.load_workbook(stage, data_only=False)
+        try:
+            if wb[sheet][cell].value != state["new"]:
+                raise OfficeError("staged set-cell validation failed")
+        finally:
+            wb.close()
+        return {}
+
+    try:
+        result = office_tx.execute_mutation(
+            path, operation="set-cell", plan=plan, apply=apply, validate=validate,
+        )
+    except office_tx.TransactionError as exc:
+        raise OfficeError(str(exc)) from exc
+    result["snapshot_version"] = result.pop("snapshot", None)
+    return result
 
 
 def append_rows(path: str, sheet: str, rows: list, force_text: bool = False) -> dict:
     openpyxl = _openpyxl()
-    wb = openpyxl.load_workbook(path)
-    if sheet not in wb.sheetnames:
-        raise OfficeError(f"no sheet named {sheet!r} (have: {', '.join(wb.sheetnames)})")
-    snap = _snapshot(path, "append-rows")
-    ws = wb[sheet]
-    for row in rows:
-        ws.append([_coerce(str(v), force_text) if v is not None else None
-                   for v in row])
-    wb.save(path)
-    return {"sheet": sheet, "appended": len(rows), "rows_now": ws.max_row,
-            "snapshot_version": snap.get("version")}
+    state = {}
+
+    def plan(live):
+        wb = openpyxl.load_workbook(live)
+        try:
+            if sheet not in wb.sheetnames:
+                raise OfficeError(
+                    f"no sheet named {sheet!r} (have: {', '.join(wb.sheetnames)})"
+                )
+            state["rows_before"] = wb[sheet].max_row
+            return office_tx.MutationPlan(
+                "append-rows", {"sheet": sheet, "appended": len(rows)},
+                {"affected": len(rows)}, changed=bool(rows),
+            )
+        finally:
+            wb.close()
+
+    def apply(stage, _plan):
+        wb = openpyxl.load_workbook(stage)
+        ws = wb[sheet]
+        for row in rows:
+            ws.append([_coerce(str(v), force_text) if v is not None else None
+                       for v in row])
+        wb.save(stage)
+        wb.close()
+
+    def validate(stage, _plan):
+        wb = openpyxl.load_workbook(stage)
+        try:
+            rows_now = wb[sheet].max_row
+            if rows_now != state["rows_before"] + len(rows):
+                raise OfficeError("staged append-rows validation failed")
+            return {"rows_now": rows_now}
+        finally:
+            wb.close()
+
+    try:
+        result = office_tx.execute_mutation(
+            path, operation="append-rows", plan=plan,
+            apply=apply, validate=validate,
+        )
+    except office_tx.TransactionError as exc:
+        raise OfficeError(str(exc)) from exc
+    result["snapshot_version"] = result.pop("snapshot", None)
+    return result

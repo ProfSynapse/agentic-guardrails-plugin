@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.0` is the Windows-first stable release.
+> **Release status:** `0.3.1` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -102,6 +102,36 @@ so the agent self-corrects instead of fighting the rails:
 | `rm file` | `agw archive file` (reversible) |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
+
+Structured Office operations are also available:
+
+~~~text
+agw office info workbook.xlsx --scope tables --json
+agw office read-table workbook.xlsx --table Orders --columns ID,Status --limit 50 --json
+agw office append-table-row workbook.xlsx --table Orders --row-json '{"ID":"A-2"}'
+agw office update-table-row workbook.xlsx --table Orders --key-column ID --key A-2 --set-json '{"Status":"Closed"}'
+agw office outline report.docx --json
+agw office patch report.docx --expected-file-hash HASH --ops-file patch.json
+~~~
+
+Every JSON-bearing option also accepts `-` to read its payload from standard
+input. This avoids native argument-quoting problems and is the preferred compact
+form in PowerShell:
+
+~~~powershell
+'{"ID":"A-2","Status":"Needs review"}' | agw office append-table-row workbook.xlsx --table Orders --row-json -
+'[{"op":"replace_block","id":"p2-abc123","text":"Revised text with spaces."}]' | agw office patch report.docx --ops-json -
+~~~
+
+This applies to `--rows`, `--where-json`, `--row-json`, `--set-json`,
+`--key-json`, and `--ops-json`. A command can consume only one stdin payload;
+use the corresponding file option when multiple structured inputs are needed.
+
+Reads are paginated and compact. Writes validate a staged Office package,
+archive one exact pre-image, reject source drift, and atomically replace the
+live file. Excel table writes support `.xlsx`; macro-enabled and unsupported
+complex OOXML files are refused. Word patches target top-level body paragraphs,
+headings, and list items.
 | `mv` (untracked) | `agw move` (transactional, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 

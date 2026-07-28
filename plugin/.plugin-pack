@@ -4,6 +4,9 @@
 hooks
 scripts/agw/agw.py
 scripts/agw/office.py
+scripts/agw/office_tx.py
+scripts/agw/office_excel.py
+scripts/agw/office_word.py
 scripts/agw/converters/__init__.py
 scripts/claude/__init__.py
 scripts/claude/_dispatch.py

@@ -32,13 +32,15 @@ from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 import converters                           # noqa: E402
 import office                               # noqa: E402
+import office_tx                            # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
 
 
 def _out(args, human: str, data: dict):
     if getattr(args, "json", False):
-        print(json.dumps(data, ensure_ascii=False, default=str))
+        print(json.dumps(data, ensure_ascii=False, default=str,
+                         separators=(",", ":")))
     else:
         print(human)
 
@@ -46,6 +48,82 @@ def _out(args, human: str, data: dict):
 def _err(message: str, code: int = 1):
     print(f"agw: {message}", file=sys.stderr)
     sys.exit(code)
+
+
+def _json_object_no_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_json_stdin(label: str) -> str:
+    limit = 1024 * 1024
+    binary = getattr(sys.stdin, "buffer", None)
+    if binary is None:  # primarily useful for embedded/test StringIO streams
+        raw = sys.stdin.read(limit + 1)
+        if len(raw.encode("utf-8")) > limit:
+            _err(f"{label}: stdin payload exceeds 1 MiB")
+        return raw.lstrip("\ufeff")
+
+    payload = binary.read(limit + 5)
+    if len(payload) > limit:
+        _err(f"{label}: stdin payload exceeds 1 MiB")
+    try:
+        if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return payload.decode("utf-16")
+        return payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        _err(f"{label}: stdin payload must be UTF-8 or BOM-marked UTF-16 JSON")
+
+
+def _load_json_payload(inline: str, file_path: str, label: str, expected):
+    if inline and file_path:
+        _err(f"{label}: inline and file payloads are mutually exclusive")
+    if file_path:
+        resolved = _resolve(file_path)
+        if os.path.getsize(resolved) > 1024 * 1024:
+            _err(f"{label}: payload file exceeds 1 MiB")
+        with open(resolved, encoding="utf-8") as handle:
+            raw = handle.read()
+    elif inline == "-":
+        raw = _read_json_stdin(label)
+    else:
+        raw = inline
+        if len(raw.encode("utf-8")) > 6 * 1024:
+            _err(f"{label}: inline payload exceeds 6 KiB; use a payload file")
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    if not raw:
+        _err(f"{label}: payload is required")
+    try:
+        value = json.loads(
+            raw, object_pairs_hook=_json_object_no_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number: {token}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        _err(f"{label}: invalid JSON ({exc})")
+    if expected is not None and not isinstance(value, expected):
+        kind = "object" if expected is dict else "array"
+        _err(f"{label}: payload must be a JSON {kind}")
+    def count_nodes(item, depth=0):
+        if depth > 16:
+            raise ValueError("JSON nesting exceeds 16 levels")
+        if isinstance(item, dict):
+            return 1 + sum(count_nodes(v, depth + 1) for v in item.values())
+        if isinstance(item, list):
+            return 1 + sum(count_nodes(v, depth + 1) for v in item)
+        return 1
+    try:
+        if count_nodes(value) > 100000:
+            _err(f"{label}: payload exceeds 100000 JSON nodes")
+    except ValueError as exc:
+        _err(f"{label}: {exc}")
+    return value
 
 
 def _resolve(path: str) -> str:
@@ -285,8 +363,16 @@ def cmd_status(args):
         if os.path.exists(src) and store.file_sha256(src) != entry["base_sha256"]:
             drift = "  [LIVE FILE CHANGED]"
         lines.append(f"  {src} -> {entry['working']}{drift}")
+    pending_office = office_tx.transaction_status()
+    lines.append(f"incomplete office transactions: {len(pending_office)}")
+    for item in pending_office[:20]:
+        lines.append(
+            f"  {item['mutation_id']} [{item['state']}] "
+            f"{item.get('operation', '')}"
+        )
     _out(args, "\n".join(lines),
-         {"archive_bytes": size, "checkouts": checkouts, "home": store.agw_home()})
+         {"archive_bytes": size, "checkouts": checkouts, "home": store.agw_home(),
+          "incomplete_office_transactions": pending_office})
 
 
 def cmd_log(args):
@@ -334,7 +420,11 @@ def cmd_office(args):
     path = _resolve(args.path)
     try:
         if args.op == "info":
-            data = office.info(path)
+            if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm") and args.scope:
+                import office_excel
+                data = office_excel.workbook_info(path, scope=args.scope)
+            else:
+                data = office.info(path)
             human = json.dumps(data, ensure_ascii=False, indent=2, default=str)
         elif args.op == "get-text":
             text = office.get_text(path)
@@ -371,7 +461,9 @@ def cmd_office(args):
                 with open(_resolve(args.from_csv), newline="", encoding="utf-8") as f:
                     rows = list(csv.reader(f))
             else:
-                rows = json.loads(args.rows or "[]")
+                rows = _load_json_payload(
+                    args.rows, "", "--rows", list
+                ) if args.rows else []
                 if not (isinstance(rows, list) and
                         all(isinstance(r, list) for r in rows)):
                     _err("--rows must be a JSON array of arrays")
@@ -380,12 +472,83 @@ def cmd_office(args):
             data = office.append_rows(path, args.sheet, rows, force_text=args.text)
             human = (f"appended {data['appended']} row(s) to {args.sheet} in {path} "
                      f"(pre-image archived as v{data['snapshot_version']})")
+        elif args.op == "read-table":
+            import office_excel
+            columns = [value for value in args.columns.split(",") if value] \
+                if args.columns else None
+            where = _load_json_payload(args.where_json, "", "--where-json", dict) \
+                if args.where_json else None
+            data = office_excel.read_table(
+                path, args.table, sheet=args.sheet, columns=columns, where=where,
+                offset=args.offset, limit=args.limit, values_only=args.values_only,
+            )
+            human = (f"{data['table']} on {data['sheet']}: "
+                     f"{data['returned']} row(s)"
+                     f"{' (more)' if data['more'] else ''}")
+        elif args.op == "append-table-row":
+            import office_excel
+            row = _load_json_payload(
+                args.row_json, args.row_file, "append-table-row", dict
+            )
+            data = office_excel.append_table_row(
+                path, args.table, row, sheet=args.sheet,
+                expected_sha256=args.expected_file_hash,
+                dry_run=args.dry_run,
+                coerce_iso_dates=args.coerce_iso_dates,
+            )
+            human = ("dry-run: " if args.dry_run else "") + \
+                f"{data.get('changed', data.get('appended', 0))} row(s) for {args.table}"
+        elif args.op == "update-table-row":
+            import office_excel
+            updates = _load_json_payload(
+                args.set_json, args.set_file, "update-table-row", dict
+            )
+            key = _load_json_payload(
+                args.key_json, "", "--key-json", None
+            ) if args.key_json else args.key
+            if isinstance(key, (dict, list)):
+                _err("--key-json must be a JSON scalar")
+            data = office_excel.update_table_row(
+                path, args.table, args.key_column, key, updates,
+                sheet=args.sheet, expected_sha256=args.expected_file_hash,
+                dry_run=args.dry_run,
+                coerce_iso_dates=args.coerce_iso_dates,
+            )
+            human = ("dry-run: " if args.dry_run else "") + \
+                f"{data.get('changed', data.get('updated', 0))} row(s) for {args.table}"
+        elif args.op == "outline":
+            import office_word
+            data = office_word.outline(path, offset=args.offset, limit=args.limit)
+            human = (f"{data['returned']} Word block(s)"
+                     f"{' (more)' if data['more'] else ''}")
+        elif args.op == "read-blocks":
+            import office_word
+            ids = [value for value in args.ids.split(",") if value]
+            data = office_word.read_blocks(path, ids)
+            human = f"{len(data['blocks'])} Word block(s)"
+        elif args.op == "patch":
+            import office_word
+            operations = _load_json_payload(
+                args.ops_json, args.ops_file, "patch", list
+            )
+            data = office_word.patch(
+                path, operations, expected_sha256=args.expected_file_hash,
+                dry_run=args.dry_run,
+            )
+            human = ("dry-run: " if args.dry_run else "") + \
+                f"{data.get('changed', data.get('patched', 0))} Word operation(s)"
         else:  # pragma: no cover - argparse restricts choices
             _err(f"unknown office op: {args.op}")
     except office.MissingLibrary as exc:
         _err(str(exc), code=2)
     except office.OfficeError as exc:
         _err(str(exc))
+    except Exception as exc:
+        # Adapter errors are intentionally plain exceptions so optional
+        # dependencies remain lazy. Keep CLI errors concise and preserve the
+        # established conflict exit code.
+        message = str(exc)
+        _err(message, code=3 if message.startswith("CONFLICT:") else 1)
     _out(args, human, data)
 
 
@@ -437,7 +600,9 @@ def main(argv=None):
     add("doctor", cmd_doctor)
     add("office", cmd_office,
         (["op"], {"choices": ["info", "get-text", "replace-text",
-                              "set-cell", "append-rows"]}),
+                              "set-cell", "append-rows", "read-table",
+                              "append-table-row", "update-table-row",
+                              "outline", "read-blocks", "patch"]}),
         (["path"], {}),
         (["--find"], {"default": ""}), (["--replace"], {"default": ""}),
         (["--all"], {"action": "store_true",
@@ -448,7 +613,26 @@ def main(argv=None):
                          "help": "list matches with location/context; change nothing"}),
         (["--sheet"], {"default": ""}), (["--cell"], {"default": ""}),
         (["--value"], {"default": ""}),
-        (["--rows"], {"default": ""}), (["--from-csv"], {"default": ""}),
+        (["--rows"], {"default": "", "help": "JSON array or - for stdin"}),
+        (["--from-csv"], {"default": ""}),
+        (["--scope"], {"choices": ["tables", "names"], "default": ""}),
+        (["--table"], {"default": ""}), (["--columns"], {"default": ""}),
+        (["--where-json"], {"default": "",
+                             "help": "JSON object or - for stdin"}),
+        (["--offset"], {"type": int, "default": 0}),
+        (["--limit"], {"type": int, "default": 50}),
+        (["--values-only"], {"action": "store_true"}),
+        (["--row-json"], {"default": "", "help": "JSON object or - for stdin"}),
+        (["--row-file"], {"default": ""}),
+        (["--set-json"], {"default": "", "help": "JSON object or - for stdin"}),
+        (["--set-file"], {"default": ""}),
+        (["--key-column"], {"default": ""}), (["--key"], {"default": ""}),
+        (["--key-json"], {"default": "", "help": "JSON scalar or - for stdin"}),
+        (["--expected-file-hash"], {"default": ""}),
+        (["--coerce-iso-dates"], {"action": "store_true"}),
+        (["--ids"], {"default": ""}),
+        (["--ops-json"], {"default": "", "help": "JSON array or - for stdin"}),
+        (["--ops-file"], {"default": ""}),
         (["--text"], {"action": "store_true",
                       "help": "store values as text, no number/formula coercion"}),
         help="controlled in-place edits to docx/xlsx/pptx (pre-image archived first)")

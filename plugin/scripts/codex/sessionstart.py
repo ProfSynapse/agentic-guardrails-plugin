@@ -40,7 +40,9 @@ work around the sandbox.
 copy, then `{_AGW} publish <file>` (archives the old version and replaces the original).
 - For small targeted Office edits, skip the round-trip: `{_AGW} office set-cell`, \
 `{_AGW} office replace-text`, `{_AGW} office append-rows`, `{_AGW} office info/get-text` \
-(each archives a pre-image first). Do not edit Office files via python/node \
+(each archives a pre-image first). Structured operations include `office read-table`, \
+`office append-table-row`, `office update-table-row`, `office outline/read-blocks`, \
+and `office patch`; they use compact reads and guarded atomic writes. Do not edit Office files via python/node \
 one-liners.
 - Cloud-synced folders (OneDrive/SharePoint/Google Drive/Dropbox): run `{_AGW} scan \
 <folder>` before bulk work; never edit cloud-only placeholder files or .gdoc stubs.

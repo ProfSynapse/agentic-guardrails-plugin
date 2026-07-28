@@ -17,19 +17,19 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.3.0`
+## Release gate for `0.3.1`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.3.0` before that tag exists.
+   `v0.3.1` before that tag exists.
 
-2. Confirm all three versions are `0.3.0`, then run:
+2. Confirm all three versions are `0.3.1`, then run:
 
    ```bash
    python -m pytest -q
    python -m pytest -q tests/test_packaging.py tests/test_host_conformance.py
    ```
 
-   For the Windows-first `0.3.0` release, Windows CI and the packed-artifact
+   For the Windows-first `0.3.1` release, Windows CI and the packed-artifact
    tests are release-blocking. Linux and macOS remain in the matrix as advisory
    preview signals; failures there must be documented but do not block the
    Windows release. Equivalent real-machine validation is required before
@@ -100,19 +100,19 @@ release must bump the version.
 
    ```bash
    git add plugin .claude-plugin/marketplace.json docs/HOST_PARITY.md RELEASING.md .github/workflows/conformance.yml
-   git commit -m "Release Agentic Guardrails 0.3.0"
+   git commit -m "Release Agentic Guardrails 0.3.1"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.3.0 --target <verified-main-commit-sha> \
-     --title "v0.3.0" --notes "..."
+   gh release create v0.3.1 --target <verified-main-commit-sha> \
+     --title "v0.3.1" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.3.0`, rerun JSON and artifact conformance, and merge the catalog
+   `main` to `v0.3.1`, rerun JSON and artifact conformance, and merge the catalog
    pointer update through a follow-up pull request. This tag-exists gate is
    mandatory.
 
