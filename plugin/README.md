@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.5` is the Windows-first stable release.
+> **Release status:** `0.3.6` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -86,7 +86,7 @@ that string, so an update only lands once it changes:
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
 | `scripts/codex/` | Thin Codex adapter: same `ToolEvent` contract, plus `apply_patch` envelope parsing (Add→write, Update→edit+snapshot, Delete→blocked under CRUA) |
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, recovery metadata, and policy health |
-| `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
+| `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): reversible lifecycle verbs, guarded `file` construction/patching, declared-output `run`, and targeted `office` reads and edits with automatic pre-images |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/agentic-guardrails/` | One compact workflow router with safety references loaded only when needed |
 | CLI help | Progressive command discovery through `agw --help`, verb help, and Office operation help |
@@ -102,12 +102,18 @@ so the agent self-corrects instead of fighting the rails:
 | `rm file` | `agw archive file` (reversible) |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
+| many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
+| opaque write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 
 Structured Office operations are also available:
 
 ~~~text
 agw office info workbook.xlsx --scope tables --json
 agw office read-table workbook.xlsx --table RecordsTable --columns RecordID,Status --limit 50 --json
+agw office read-table workbook.xlsx --table RecordsTable --include-formulas --json
+agw office read-range workbook.xlsx --sheet Records --range A1:D20 --formulas --json
+agw office validate-formulas workbook.xlsx --json
+agw office normalize workbook.xlsx --output normalized.xlsx --expected-output-hash absent --json
 agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json '["RecordID","Status"]' --create-sheet
 agw office append-table-row workbook.xlsx --table RecordsTable --row-json '{"RecordID":"R-2"}' --unique-column RecordID
 agw office update-table-row workbook.xlsx --table RecordsTable --key-column RecordID --key R-2 --set-json '{"Status":"Closed"}'
@@ -141,6 +147,13 @@ risks; mutation refuses unsupported or lossy OOXML. Excel table writes support
 `.xlsx`; macro-enabled and unsupported complex OOXML files are refused. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
+
+Ordinary UTF-8 files can be constructed or changed atomically with `agw file
+write`, `patch`, and `replace`. These operations accept expected hashes, support
+dry runs, publish through same-directory stages, and record verified pre-images
+or ABSENT tombstones. `agw run` executes a command only after every declared
+output has been hash-checked and snapshotted; compact, bounded stdout/stderr tails
+are included in JSON results.
 
 Folder scans are metadata-only and hard-bounded by a parent process. Use
 `agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,

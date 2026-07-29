@@ -30,6 +30,8 @@ through stdin or a file when native quoting would be fragile.
 | Intent | Route | Read only if needed |
 |---|---|---|
 | Remove, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
+| Construct or patch a text file | Exact `file <operation> --help` | None |
+| Run a write-capable script | `run --help`; declare every output | [recovery.md](references/recovery.md) |
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Checkout/publish verb help | [office.md](references/office.md) |
 | Broad discovery in a synced/virtual folder | `scan --help`, then a bounded scan | [synced-folders.md](references/synced-folders.md) |
@@ -40,6 +42,9 @@ Office operation routing: inspect with `info`/`get-text`; change text with
 `replace-text`; edit cells or raw rows with `set-cell`/`append-rows`; use
 `read-table`, `ensure-table`, `append-table-row`, or `update-table-row` for Excel
 tables; use `outline`, `read-blocks`, and `patch` for structured Word work.
+For large or quotation-sensitive text, use `file write`, `file patch`, or
+`file replace` with file/stdin input. Run scripts that may write through `run`
+with every output declared so Guardrails can capture exact pre-images.
 
 ## Invariants
 

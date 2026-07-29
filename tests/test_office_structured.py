@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -76,6 +77,23 @@ def _inject_lossy_extension(path):
                     b'spreadsheetml/2009/9/main"/></ext></extLst>'
                 )
                 payload = payload.replace(b"</worksheet>", extension + b"</worksheet>")
+            target.writestr(item, payload)
+    os.replace(rewritten, path)
+
+
+def _inject_safe_style_metadata(path):
+    rewritten = str(path) + ".safe-metadata"
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(
+            rewritten, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            payload = source.read(item)
+            if item.filename == "xl/styles.xml":
+                payload = payload.replace(
+                    b"<fonts count=",
+                    (b'<fonts xmlns:x14ac="http://schemas.microsoft.com/office/'
+                     b'spreadsheetml/2009/9/ac" x14ac:knownFonts="1" count='),
+                    1,
+                )
             target.writestr(item, payload)
     os.replace(rewritten, path)
 
@@ -317,6 +335,11 @@ def test_lossy_ooxml_extension_is_reported_and_mutation_is_refused(
     assert info["preservation"]["safe_to_mutate"] is False
     assert info["preservation"]["risks"][0]["part"] == \
         "xl/worksheets/sheet1.xml"
+    assert info["preservation"]["risks"][0]["extension_uri"] == \
+        "{synthetic-preservation-risk}"
+    assert info["preservation"]["risks"][0]["namespaces"] == [
+        "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+    ]
 
     with pytest.raises(office_excel.ExcelError, match="preservation"):
         office_excel.append_table_row(
@@ -328,6 +351,45 @@ def test_lossy_ooxml_extension_is_reported_and_mutation_is_refused(
     assert not list(Path(table_book).parent.glob(".agw-office-*"))
 
 
+def test_known_non_destructive_style_metadata_is_allowlisted(
+        table_book, agw_home):
+    _inject_safe_style_metadata(table_book)
+    risks = office_tx.inspect_preservation_risks(table_book)
+    assert risks == []
+    info = office_excel.workbook_info(table_book)
+    assert info["preservation"]["safe_to_mutate"] is True
+
+
+def test_normalize_removes_only_allowlisted_metadata_to_guarded_output(
+        table_book, tmp_path, agw_home):
+    _inject_safe_style_metadata(table_book)
+    output = tmp_path / "normalized.xlsx"
+    result = office_tx.normalize_safe_metadata(
+        table_book, str(output), expected_sha256=store.file_sha256(table_book),
+        expected_output_sha256="absent",
+    )
+    assert result["removed_count"] == 1
+    assert result["snapshot_state"] == "ABSENT"
+    assert output.exists()
+    assert office_tx.inspect_preservation_risks(str(output)) == []
+    with zipfile.ZipFile(output) as package:
+        styles = package.read("xl/styles.xml")
+    assert b"knownFonts" not in styles
+    assert not list(tmp_path.glob(".agw-office-normalize-*"))
+
+
+def test_normalize_refuses_unknown_extension_without_output(
+        table_book, tmp_path, agw_home):
+    _inject_lossy_extension(table_book)
+    output = tmp_path / "normalized.xlsx"
+    with pytest.raises(office_tx.PreservationError):
+        office_tx.normalize_safe_metadata(
+            table_book, str(output), expected_output_sha256="absent",
+        )
+    assert not output.exists()
+    assert store.discover_archive_transactions() == []
+
+
 def test_cli_read_table_compact_json(table_book, agw_home):
     result = run_agw(
         "office", "read-table", table_book, "--table", "Orders",
@@ -337,6 +399,56 @@ def test_cli_read_table_compact_json(table_book, agw_home):
     data = json.loads(result.stdout)
     assert data["headers"] == ["ID", "Status"]
     assert data["rows"] == [["A-1", "Open"]]
+
+
+def test_cli_read_table_returns_cached_value_and_formula(table_book, agw_home):
+    result = run_agw(
+        "office", "read-table", table_book, "--table", "Orders",
+        "--columns", "ID,Total", "--include-formulas", "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    data = json.loads(result.stdout)
+    assert data["formula_mode"] == "value_and_formula"
+    assert data["rows"][0][0] == {"value": "A-1", "formula": None}
+    assert data["rows"][0][1] == {"value": None, "formula": "=1+1"}
+    assert data["cached_values_may_be_stale"] is True
+
+
+def test_cli_read_range_formulas_and_structural_validation(table_book, agw_home):
+    ranged = run_agw(
+        "office", "read-range", table_book, "--sheet", "Data",
+        "--range", "C2:D2", "--formulas", "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    range_data = json.loads(ranged.stdout)
+    assert range_data["rows"][0][1] == {"value": None, "formula": "=1+1"}
+
+    checked = run_agw(
+        "office", "validate-formulas", table_book, "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    formula_data = json.loads(checked.stdout)
+    assert formula_data["validation"] == "structural_only"
+    assert formula_data["calculation_performed"] is False
+    assert formula_data["formula_count"] == 1
+    assert formula_data["missing_cached_values"] == 1
+    assert formula_data["formulas"][0]["cell"] == "D2"
+    assert formula_data["formulas"][0]["formula"] == "=1+1"
+
+
+def test_formula_validation_does_not_misclassify_structured_references(
+        table_book, agw_home):
+    wb = openpyxl.load_workbook(table_book)
+    wb["Data"]["D2"] = "=[@Hours]*[@Rate]"
+    wb.save(table_book)
+    wb.close()
+    data = office_excel.validate_formulas(table_book)
+    assert data["formula_count"] == 1
+    assert data["external_references"] == 0
+    assert data["valid"] is True
+    assert office_excel._coerce({
+        "$formula": "=[@Hours]*[@Rate]"
+    }) == "=[@Hours]*[@Rate]"
 
 
 def test_cli_append_table_row_accepts_stdin_json_with_spaces(table_book, agw_home):
@@ -396,6 +508,79 @@ def test_cli_uniqueness_conflict_is_structured(table_book, agw_home):
     assert data["ok"] is False
     assert data["error"]["code"] == "uniqueness_conflict"
     assert data["error"]["details"]["columns"] == ["ID"]
+
+
+def test_end_to_end_tracker_replacement_workflow(tmp_path, agw_home):
+    original = tmp_path / "tracker.xlsx"
+    replacement = tmp_path / "tracker.replacement.xlsx"
+    openpyxl.Workbook().save(original)
+    original_hash = store.file_sha256(str(original))
+    shutil.copy2(original, replacement)
+
+    inspected = run_agw(
+        "office", "info", str(original), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    assert json.loads(inspected.stdout)["hash"] == original_hash
+
+    projects = run_agw(
+        "office", "ensure-table", str(replacement), "--sheet", "Projects",
+        "--table", "Projects", "--headers-json", '["Project ID","Status"]',
+        "--create-sheet", "--expected-file-hash",
+        store.file_sha256(str(replacement)), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    assert json.loads(projects.stdout)["table"] == "Projects"
+
+    columns = json.dumps([
+        {"name": "Date", "number_format": "yyyy-mm-dd"},
+        {"name": "Hours", "number_format": "0.00"},
+        {"name": "Rate", "number_format": "0.00"},
+        {"name": "Total", "formula": "=B2*C2", "number_format": "0.00"},
+    ])
+    worklog = run_agw(
+        "office", "ensure-table", str(replacement), "--sheet", "WorkLog",
+        "--table", "WorkLog", "--headers-json",
+        '["Date","Hours","Rate","Total"]', "--columns-json", columns,
+        "--create-sheet", "--expected-file-hash",
+        store.file_sha256(str(replacement)), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    assert json.loads(worklog.stdout)["table"] == "WorkLog"
+
+    appended = run_agw(
+        "office", "append-table-row", str(replacement), "--table", "WorkLog",
+        "--row-json", '{"Date":"2026-07-29","Hours":2,"Rate":150}',
+        "--unique-column", "Date", "--coerce-iso-dates",
+        "--expected-file-hash", store.file_sha256(str(replacement)), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    assert json.loads(appended.stdout)["changed"] == 1
+
+    formulas = run_agw(
+        "office", "read-table", str(replacement), "--table", "WorkLog",
+        "--include-formulas", "--json", env={"AGW_HOME": agw_home},
+    )
+    formula_data = json.loads(formulas.stdout)
+    assert formula_data["rows"][0][3]["formula"] == "=B2*C2"
+    replacement_hash = store.file_sha256(str(replacement))
+
+    archived = run_agw(
+        "archive", str(original), "--json", env={"AGW_HOME": agw_home},
+    )
+    archive_data = json.loads(archived.stdout)
+    assert archive_data[0]["sha256"] == original_hash
+    assert not original.exists()
+
+    moved = run_agw(
+        "move", str(replacement), str(original), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    move_data = json.loads(moved.stdout)
+    assert move_data["dest"] == str(original)
+    assert store.file_sha256(str(original)) == replacement_hash
+    assert office_tx.transaction_status() == []
+    assert not list(tmp_path.glob(".agw-office-*"))
 
 
 def test_word_outline_and_patch_if_dependency_present(tmp_path, agw_home):

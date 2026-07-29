@@ -26,6 +26,20 @@ _LOCAL_MUTATION_NAMES = {
     "copy", "move", "ren", "rename", "cp", "mv", "install", "tee", "dd",
     "truncate",
 }
+_SCRIPT_INTERPRETERS = {
+    "python", "python3", "py", "node", "ruby", "perl", "php",
+}
+_SCRIPT_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"}
+_SCRIPT_WRITE_EVIDENCE = re.compile(
+    r"(?ix)(?:"
+    r"writeFile(?:Sync)?\s*\(|appendFile(?:Sync)?\s*\(|createWriteStream\s*\(|"
+    r"\.write_(?:text|bytes)\s*\(|\.to_excel\s*\(|"
+    r"\bopen\s*\([^\n]{0,300},\s*['\"](?:w|a|x|r\+|w\+|a\+)"
+    r"|\.save\s*\("
+    r"|\b(?:os\.replace|os\.rename|shutil\.(?:copy|copy2|move))\s*\("
+    r"|\.xlsx\.write(?:File|Buffer)?\s*\(|@oai/artifact-tool"
+    r")"
+)
 
 
 def _unquoted_surface(command: str) -> str:
@@ -69,6 +83,41 @@ def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
                                   for arg in cmd.argv[1:]):
             return True
     return False
+
+
+def _write_capable_script(command: str, cwd: str, dialect: str = None) -> str:
+    """Return a bounded local script path when static text shows file writes."""
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return ""
+    for cmd in parsed.commands:
+        if cmd.name not in _SCRIPT_INTERPRETERS:
+            continue
+        script = ""
+        for token in cmd.argv[1:]:
+            lowered = token.lower()
+            if lowered in {"-c", "-e", "--eval", "--check", "-m"}:
+                break
+            if token.startswith("-"):
+                continue
+            if os.path.splitext(lowered)[1] in _SCRIPT_SUFFIXES:
+                script = token
+                break
+        if not script or any(char in script for char in "$`*?[]{}()"):
+            continue
+        path = os.path.abspath(os.path.join(cwd or os.getcwd(), script)) \
+            if not os.path.isabs(script) else os.path.abspath(script)
+        try:
+            if os.path.getsize(path) > 1024 * 1024:
+                continue
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                source = handle.read(1024 * 1024 + 1)
+        except OSError:
+            continue
+        if _SCRIPT_WRITE_EVIDENCE.search(source):
+            return path
+    return ""
 
 
 @dataclass
@@ -133,6 +182,16 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                 targets = clobber_resolver(
                     ev.command, ev.cwd, include_absent=True, dialect=dialect
                 )
+                opaque_script = _write_capable_script(
+                    ev.command, ev.cwd, dialect=dialect
+                )
+                if opaque_script:
+                    result.mutating = True
+                    raise ValueError(
+                        "the script may write files but does not declare every output; "
+                        "run it with `agw run --output <path> --expected-hash <hash> "
+                        "-- <command>` so Guardrails can capture pre-images"
+                    )
                 surface = _unquoted_surface(ev.command)
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
                     or _looks_locally_mutating(ev.command, dialect=dialect)
