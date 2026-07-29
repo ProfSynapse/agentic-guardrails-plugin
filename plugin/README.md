@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.3` is the Windows-first stable release.
+> **Release status:** `0.3.4` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -88,8 +88,8 @@ that string, so an update only lands once it changes:
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, recovery metadata, and policy health |
 | `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
-| `skills/` | Teach the agent the workflows: agent-workspace, synced-folders, gdocs-bridge, restore |
-| `commands/` | `/agw-status`, `/agw-publish`, `/agw-restore`, `/guardrails-report` (Codex reads the equivalents from `codex-prompts/`) |
+| `skills/agentic-guardrails/` | One compact workflow router with safety references loaded only when needed |
+| CLI help | Progressive command discovery through `agw --help`, verb help, and Office operation help |
 | `enterprise/` | Managed-settings template + deployment guide |
 
 ## The agent's vocabulary
@@ -142,10 +142,17 @@ risks; mutation refuses unsupported or lossy OOXML. Excel table writes support
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
-Folder scans are metadata-only and bounded. Use `agw scan <folder> --fast
---json` for a small probe, or set `--max-seconds`, `--max-files`, and
-`--max-depth`; add `--no-size` on slow virtual filesystems. A bounded result
-sets `complete: false` and reports the stopping reason and inspected counts.
+Folder scans are metadata-only and hard-bounded by a parent process. Use
+`agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,
+`--max-files`, and `--max-depth`; add `--no-size` on slow virtual filesystems.
+The deadline includes path validation, profile detection, enumeration, metadata
+inspection, cleanup, and bounded result construction. If a filesystem call
+blocks, the parent terminates the scan worker and returns the progress received
+so far with `complete: false`, `stop_reason`, inspected counts, and cleanup
+status. Fast/no-size scans avoid per-file `stat()` calls and report
+`placeholder_detection: "limited"`. Mounted Google Drive, OneDrive/SharePoint,
+and Dropbox roots are detected automatically where local path or volume signals
+are available; `--profile` provides a validated override for known roots.
 | `mv` (untracked) | `agw move` (transactional, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 
@@ -215,11 +222,11 @@ create a second command/event ledger, key, migration journal, provenance file,
 or quarantine. Existing `audit.jsonl` and legacy-quarantine files are left
 completely untouched and unread.
 
-`/guardrails-report` uses only privacy-safe CRUA metadata already needed for
+Guardrails reports use only privacy-safe CRUA metadata already needed for
 recovery: archive-store health and recovery-copy totals, open checkout status,
-and policy health/revision. It never reconstructs raw commands or reads legacy
-audit material. If command-level decision counts or trends are requested, the
-report says plainly that Guardrails does not keep that metric.
+and policy health/revision. They never reconstruct raw commands or read legacy
+audit material. If command-level decision counts or trends are requested, say
+plainly that Guardrails does not keep that metric.
 
 This change does not affect pre-image snapshots, archive transactions, restore,
 pending approvals, or policy revisions. Activity-history availability never

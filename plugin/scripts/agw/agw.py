@@ -34,6 +34,7 @@ from core import store                      # noqa: E402
 import converters                           # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
+import scan_worker                          # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
 
@@ -176,10 +177,7 @@ def cmd_init(args):
 
 
 def cmd_scan(args):
-    folder = _resolve(args.path)
-    if not os.path.isdir(folder):
-        _err(f"scan requires a directory, not a file: {folder}", code=2)
-    profile = prof.detect(folder)
+    started_at = time.monotonic()
     max_seconds = args.max_seconds if args.max_seconds is not None \
         else (3.0 if args.fast else 30.0)
     max_files = args.max_files if args.max_files is not None \
@@ -189,90 +187,27 @@ def cmd_scan(args):
     if max_seconds <= 0 or max_files <= 0 or max_depth < 0:
         _err("scan bounds require max-seconds > 0, max-files > 0, and max-depth >= 0")
     no_size = bool(args.no_size or args.fast)
-    stats = {
-        "files": 0, "dirs": 0, "bytes": None if no_size else 0,
-        "by_ext": {}, "placeholders": [], "gdoc_stubs": [],
-        "sync_artifacts": [], "profile": profile.name,
-        "complete": True, "stop_reason": "", "files_inspected": 0,
-        "directories_inspected": 0, "elapsed_seconds": 0.0,
-        "bounds": {"max_seconds": max_seconds, "max_files": max_files,
-                   "max_depth": max_depth, "no_size": no_size},
-        "errors": [],
+    request = {
+        "path": args.path,
+        "started_at": started_at,
+        "max_seconds": float(max_seconds),
+        "max_files": int(max_files),
+        "max_depth": int(max_depth),
+        "no_size": no_size,
+        "profile_override": getattr(args, "profile", "auto"),
     }
-    max_entries = 50
-    start = time.monotonic()
-    stack = [(folder, 0)]
-    while stack:
-        if time.monotonic() - start >= max_seconds:
-            stats["complete"] = False
-            stats["stop_reason"] = "max_seconds"
-            break
-        dirpath, depth = stack.pop()
-        stats["directories_inspected"] += 1
-        try:
-            iterator = os.scandir(dirpath)
-        except OSError as exc:
-            stats["complete"] = False
-            stats["stop_reason"] = stats["stop_reason"] or "scan_errors"
-            if len(stats["errors"]) < max_entries:
-                stats["errors"].append({
-                    "path": os.path.relpath(dirpath, folder),
-                    "error": exc.__class__.__name__,
-                })
-            continue
-        with iterator:
-            for entry in iterator:
-                if time.monotonic() - start >= max_seconds:
-                    stats["complete"] = False
-                    stats["stop_reason"] = "max_seconds"
-                    stack.clear()
-                    break
-                name = entry.name
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                except OSError:
-                    is_dir = False
-                if is_dir:
-                    if name in ("_workspace", ".git", "node_modules"):
-                        continue
-                    stats["dirs"] += 1
-                    if depth >= max_depth:
-                        stats["complete"] = False
-                        stats["stop_reason"] = stats["stop_reason"] or "max_depth"
-                    else:
-                        stack.append((entry.path, depth + 1))
-                    continue
-                if stats["files_inspected"] >= max_files:
-                    stats["complete"] = False
-                    stats["stop_reason"] = "max_files"
-                    stack.clear()
-                    break
-                stats["files"] += 1
-                stats["files_inspected"] += 1
-                ext = os.path.splitext(name)[1].lower() or "(none)"
-                stats["by_ext"][ext] = stats["by_ext"].get(ext, 0) + 1
-                p = entry.path
-                st = None
-                if not no_size or profile.sync_provider:
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        st = None
-                if not no_size and st is not None:
-                    stats["bytes"] += int(st.st_size)
-                rel = os.path.relpath(p, folder)
-                if prof.is_gdoc_stub(p) and len(stats["gdoc_stubs"]) < max_entries:
-                    stats["gdoc_stubs"].append(rel)
-                elif st is not None and prof.is_placeholder(
-                        p, st=st, profile=profile) \
-                        and len(stats["placeholders"]) < max_entries:
-                    stats["placeholders"].append(rel)
-                elif prof.is_sync_artifact(p) \
-                        and len(stats["sync_artifacts"]) < max_entries:
-                    stats["sync_artifacts"].append(rel)
-    stats["elapsed_seconds"] = round(time.monotonic() - start, 6)
+    stats, fatal = scan_worker.run_bounded_scan(request)
+    stats.pop("_worker_pid", None)
+    if fatal:
+        if args.json:
+            print(json.dumps({"ok": False, "error": fatal}, ensure_ascii=False,
+                             separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(2)
+        _err(fatal["message"], code=2)
+
+    folder = stats["path"]
     size_label = "size skipped" if no_size else f"{stats['bytes'] / 1e6:.1f} MB"
-    human = (f"{folder} [{profile.name}]: {stats['files']} files, "
+    human = (f"{folder} [{stats['profile']}]: {stats['files']} files, "
              f"{size_label}; "
              f"placeholders: {len(stats['placeholders'])}, "
              f"gdoc stubs: {len(stats['gdoc_stubs'])}, "
@@ -294,7 +229,7 @@ def cmd_checkout(args):
         _err("checkout takes a single file")
     if prof.is_gdoc_stub(src):
         _err("this is a Google Docs pointer stub with no local content - export it "
-             "via the Drive connector instead (gdocs-bridge skill)")
+             "through a Google Drive/Docs connector instead")
     if prof.is_placeholder(src):
         _err("file is a cloud-only placeholder - hydrate it first ('Always keep on "
              "this device' / 'Available offline')")
@@ -689,10 +624,15 @@ def cmd_prune(args):
 
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", help="machine-readable output")
-    parser = argparse.ArgumentParser(prog="agw", parents=[common],
-                                     description="agent workspace - CRUA file safety")
-    sub = parser.add_subparsers(dest="verb", required=True)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    parser = argparse.ArgumentParser(
+        prog="agw", parents=[common],
+        description="agent workspace - CRUA file safety",
+        epilog=("Use `agw <command> --help`; for Office use "
+                "`agw office <operation> --help`."),
+    )
+    sub = parser.add_subparsers(dest="verb", required=True, metavar="command")
 
     def add(name, fn, *specs, **kw):
         p = sub.add_parser(name, parents=[common], **kw)
@@ -701,100 +641,192 @@ def main(argv=None):
         p.set_defaults(fn=fn)
         return p
 
-    add("init", cmd_init, (["path"], {"nargs": "?", "default": "."}))
+    add("init", cmd_init, (["path"], {"nargs": "?", "default": "."}),
+        help="initialize workspace metadata")
     add("scan", cmd_scan, (["path"], {"nargs": "?", "default": "."}),
         (["--fast"], {"action": "store_true",
-                       "help": "use small time/file/depth bounds and skip sizes"}),
+                       "help": "safe synced-folder probe: 3s/5000 files/depth 4, no per-file stat"}),
         (["--max-seconds"], {"type": float, "default": None,
-                             "help": "stop after this many elapsed seconds"}),
+                             "help": "hard wall-clock deadline (default: 3 fast, otherwise 30)"}),
         (["--max-files"], {"type": int, "default": None,
                            "help": "stop after inspecting this many files"}),
         (["--max-depth"], {"type": int, "default": None,
                            "help": "maximum directory depth below the root"}),
         (["--no-size"], {"action": "store_true",
-                         "help": "skip file-size accounting"}),
-        help="inventory a folder without hydrating cloud files")
+                         "help": "skip per-file stat; placeholder detection is limited"}),
+        (["--profile"], {
+            "choices": ["auto", "local", "git", "gdrive-sync",
+                        "onedrive-sharepoint", "dropbox"],
+            "default": "auto",
+            "help": "validated folder profile override (default: auto)",
+        }),
+        help="hard-bounded metadata inventory for safe folder discovery")
     add("checkout", cmd_checkout, (["path"], {}),
         help="create an editable open-format working copy")
-    add("convert", cmd_convert, (["path"], {}), (["--dest"], {"default": ""}))
-    add("diff", cmd_diff, (["path"], {}))
+    add("convert", cmd_convert, (["path"], {}), (["--dest"], {"default": ""}),
+        help="convert to an editable working format")
+    add("diff", cmd_diff, (["path"], {}), help="compare a checkout with its source")
     add("publish", cmd_publish, (["path"], {}), (["--force"], {"action": "store_true"}),
         help="archive current version and replace with the working copy")
     add("archive", cmd_archive, (["paths"], {"nargs": "+"}),
         (["--reason"], {"default": ""}),
         help="reversible delete: move into the archive store")
-    add("move", cmd_move, (["src"], {}), (["dest"], {}))
+    add("move", cmd_move, (["src"], {}), (["dest"], {}),
+        help="logged, undoable move or rename")
     sub._name_parser_map["rename"] = sub._name_parser_map["move"]
     add("snapshot", cmd_snapshot, (["path"], {"nargs": "?", "default": "."}),
-        (["--reason"], {"default": ""}), (["--force"], {"action": "store_true"}))
+        (["--reason"], {"default": ""}), (["--force"], {"action": "store_true"}),
+        help="capture a recoverable folder pre-image")
     add("restore", cmd_restore, (["path"], {}),
-        (["--version"], {"type": int, "default": 0}))
-    add("undo", cmd_undo)
-    add("status", cmd_status)
-    add("log", cmd_log, (["-n"], {"type": int, "default": 20}))
-    add("doctor", cmd_doctor)
-    add("office", cmd_office,
-        (["op"], {"choices": ["info", "get-text", "replace-text",
-                              "set-cell", "append-rows", "read-table",
-                              "ensure-table", "append-table-row", "update-table-row",
-                              "outline", "read-blocks", "patch"]}),
-        (["path"], {}),
-        (["--find"], {"default": ""}), (["--replace"], {"default": ""}),
-        (["--all"], {"action": "store_true",
-                     "help": "replace every occurrence (default refuses if not unique)"}),
-        (["--nth"], {"type": int, "default": 0,
-                     "help": "replace only the Nth occurrence (1-based, document order)"}),
-        (["--dry-run"], {"action": "store_true",
-                         "help": "plan and validate without changing the file or archiving"}),
-        (["--sheet"], {"default": ""}), (["--cell"], {"default": ""}),
-        (["--value"], {"default": ""}),
-        (["--rows"], {"default": "", "help": "JSON array or - for stdin"}),
-        (["--from-csv"], {"default": ""}),
-        (["--scope"], {"choices": ["tables", "names"], "default": ""}),
-        (["--table"], {"default": ""}), (["--columns"], {"default": ""}),
-        (["--headers-json"], {"default": "",
-                                "help": "JSON header array or - for stdin"}),
-        (["--headers-file"], {"default": "",
-                               "help": "path to a JSON header array"}),
-        (["--columns-json"], {"default": "",
-                                "help": "JSON column metadata or - for stdin"}),
-        (["--columns-file"], {"default": "",
-                               "help": "path to JSON column metadata"}),
-        (["--range"], {"default": "",
-                        "help": "explicit rectangular range for ensure-table"}),
-        (["--style"], {"default": "", "help": "Excel table style name"}),
-        (["--create-sheet"], {"action": "store_true",
-                               "help": "allow ensure-table to create --sheet"}),
-        (["--where-json"], {"default": "",
-                             "help": "JSON object or - for stdin"}),
+        (["--version"], {"type": int, "default": 0}),
+        help="recover an archived version")
+    add("undo", cmd_undo, help="reverse the last archive or move")
+    add("status", cmd_status, help="show checkouts and incomplete transactions")
+    add("log", cmd_log, (["-n"], {"type": int, "default": 20}),
+        help="show recent recovery operations")
+    add("doctor", cmd_doctor, help="check environment, policy, and recovery health")
+    office_parser = sub.add_parser(
+        "office", parents=[common],
+        help="guarded Office reads and atomic edits",
+        description=("Guarded Office operations. Choose an operation, then run "
+                     "`agw office <operation> --help` for only its arguments."),
+    )
+    office_sub = office_parser.add_subparsers(
+        dest="op", required=True, metavar="operation",
+    )
+
+    def add_office(name, summary, *specs, example=""):
+        parser_for_op = office_sub.add_parser(
+            name, parents=[common], help=summary, description=summary,
+            epilog=(f"example:\n  {example}" if example else None),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        parser_for_op.add_argument("path", help="Office file path")
+        for spec in specs:
+            parser_for_op.add_argument(*spec[0], **spec[1])
+        parser_for_op.set_defaults(fn=cmd_office)
+        return parser_for_op
+
+    dry_run = (["--dry-run"], {"action": "store_true",
+                                "help": "validate and report without writing or archiving"})
+    sheet = (["--sheet"], {"default": "", "help": "worksheet name"})
+    table = (["--table"], {"default": "", "help": "Excel table name (required)"})
+    expected_hash = (["--expected-file-hash"], {
+        "default": "", "help": "refuse if the live SHA-256 differs",
+    })
+    page = (
         (["--offset"], {"type": int, "default": 0}),
         (["--limit"], {"type": int, "default": 50}),
-        (["--values-only"], {"action": "store_true"}),
-        (["--row-json"], {"default": "", "help": "JSON object or - for stdin"}),
-        (["--row-file"], {"default": ""}),
+    )
+
+    add_office(
+        "info", "Inspect Office structure and preservation risks",
+        (["--scope"], {"choices": ["tables", "names"], "default": "",
+                        "help": "limit Excel details"}),
+        example="agw office info workbook.xlsx --scope tables --json",
+    )
+    add_office(
+        "get-text", "Extract text from a Word or PowerPoint file",
+        example="agw office get-text report.docx --json",
+    )
+    add_office(
+        "replace-text", "Replace a unique Office text occurrence",
+        (["--find"], {"default": "", "help": "text to find (required)"}),
+        (["--replace"], {"default": "", "help": "replacement text"}),
+        (["--all"], {"action": "store_true",
+                     "help": "replace all occurrences"}),
+        (["--nth"], {"type": int, "default": 0,
+                     "help": "replace occurrence N (1-based)"}),
+        dry_run,
+        example='agw office replace-text report.docx --find "Old" --replace "New"',
+    )
+    add_office(
+        "set-cell", "Set one Excel cell with a guarded atomic write",
+        (["--sheet"], {"default": "", "help": "worksheet name (required)"}),
+        (["--cell"], {"default": "", "help": "cell reference, for example B2 (required)"}),
+        (["--value"], {"default": "", "help": "value; empty clears the cell"}),
+        (["--text"], {"action": "store_true", "help": "store literal text"}),
+        example='agw office set-cell workbook.xlsx --sheet Data --cell B2 --value 55',
+    )
+    add_office(
+        "append-rows", "Append rectangular rows to an Excel worksheet",
+        (["--sheet"], {"default": "", "help": "worksheet name (required)"}),
+        (["--rows"], {"default": "", "help": "JSON row array or - for stdin"}),
+        (["--from-csv"], {"default": "", "help": "CSV file containing rows"}),
+        (["--text"], {"action": "store_true", "help": "store literal text"}),
+        example="agw office append-rows workbook.xlsx --sheet Data --from-csv rows.csv",
+    )
+    add_office(
+        "read-table", "Read a compact, paginated Excel table",
+        table, sheet,
+        (["--columns"], {"default": "", "help": "comma-separated columns"}),
+        (["--where-json"], {"default": "", "help": "JSON filter or - for stdin"}),
+        *page,
+        (["--values-only"], {"action": "store_true",
+                             "help": "omit cell type metadata"}),
+        example="agw office read-table workbook.xlsx --table Orders --limit 50 --json",
+    )
+    add_office(
+        "ensure-table", "Create or validate an Excel table",
+        table,
+        (["--sheet"], {"default": "", "help": "worksheet name (required)"}),
+        (["--headers-json"], {"default": "", "help": "JSON header array or -"}),
+        (["--headers-file"], {"default": "", "help": "JSON header file"}),
+        (["--columns-json"], {"default": "", "help": "JSON column metadata or -"}),
+        (["--columns-file"], {"default": "", "help": "JSON column metadata file"}),
+        (["--range"], {"default": "", "help": "explicit rectangular range"}),
+        (["--style"], {"default": "", "help": "Excel table style"}),
+        (["--create-sheet"], {"action": "store_true", "help": "create missing sheet"}),
+        expected_hash, dry_run,
+        example="agw office ensure-table workbook.xlsx --sheet Data --table Orders --headers-file headers.json --dry-run",
+    )
+    add_office(
+        "append-table-row", "Append one typed row with optional uniqueness",
+        table, sheet,
+        (["--row-json"], {"default": "", "help": "JSON row object or - for stdin"}),
+        (["--row-file"], {"default": "", "help": "JSON row file"}),
         (["--unique-column"], {"action": "append", "default": [],
-                                "help": "atomic uniqueness column; repeat for composites"}),
-        (["--unique-columns-json"], {"default": "",
-                                       "help": "JSON column array or - for stdin"}),
-        (["--unique-columns-file"], {"default": "",
-                                      "help": "path to a JSON uniqueness-column array"}),
-        (["--set-json"], {"default": "", "help": "JSON object or - for stdin"}),
-        (["--set-file"], {"default": ""}),
-        (["--key-column"], {"default": ""}), (["--key"], {"default": ""}),
-        (["--key-json"], {"default": "", "help": "JSON scalar or - for stdin"}),
-        (["--expected-file-hash"], {"default": "",
-                                     "help": "refuse if the live SHA-256 differs"}),
-        (["--coerce-iso-dates"], {"action": "store_true",
-                                   "help": "coerce ISO date/datetime strings"}),
-        (["--ids"], {"default": ""}),
-        (["--ops-json"], {"default": "", "help": "JSON array or - for stdin"}),
-        (["--ops-file"], {"default": ""}),
-        (["--text"], {"action": "store_true",
-                      "help": "store values as text, no number/formula coercion"}),
-        help="controlled in-place edits to docx/xlsx/pptx (pre-image archived first)")
-    add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}))
+                                "help": "uniqueness column; repeat for composites"}),
+        (["--unique-columns-json"], {"default": "", "help": "JSON column array or -"}),
+        (["--unique-columns-file"], {"default": "", "help": "JSON column-array file"}),
+        expected_hash, dry_run,
+        (["--coerce-iso-dates"], {"action": "store_true", "help": "coerce ISO dates"}),
+        example="agw office append-table-row workbook.xlsx --table Orders --row-file row.json --unique-column ID",
+    )
+    add_office(
+        "update-table-row", "Update one exact-key Excel table row",
+        table, sheet,
+        (["--key-column"], {"default": "", "help": "exact key column (required)"}),
+        (["--key"], {"default": "", "help": "string key"}),
+        (["--key-json"], {"default": "", "help": "typed JSON scalar or -"}),
+        (["--set-json"], {"default": "", "help": "JSON updates object or -"}),
+        (["--set-file"], {"default": "", "help": "JSON updates file"}),
+        expected_hash, dry_run,
+        (["--coerce-iso-dates"], {"action": "store_true", "help": "coerce ISO dates"}),
+        example="agw office update-table-row workbook.xlsx --table Orders --key-column ID --key 42 --set-file updates.json",
+    )
+    add_office(
+        "outline", "List stable, paginated Word block IDs", *page,
+        example="agw office outline report.docx --limit 50 --json",
+    )
+    add_office(
+        "read-blocks", "Read selected Word blocks",
+        (["--ids"], {"default": "", "help": "comma-separated block IDs"}),
+        example="agw office read-blocks report.docx --ids p1-abc,p2-def --json",
+    )
+    add_office(
+        "patch", "Apply guarded Word block operations",
+        (["--ops-json"], {"default": "", "help": "JSON operation array or -"}),
+        (["--ops-file"], {"default": "", "help": "JSON operations file"}),
+        expected_hash, dry_run,
+        example="agw office patch report.docx --ops-file patch.json --expected-file-hash SHA256",
+    )
+    add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}),
+        help="human-only permanent archive cleanup")
 
     args = parser.parse_args(argv)
+    if not hasattr(args, "json"):
+        args.json = False
     try:
         args.fn(args)
     except PermissionError:

@@ -32,6 +32,7 @@ class Profile:
 
 
 BUILTIN = {
+    "unknown": Profile("unknown"),
     "local": Profile("local"),
     "git": Profile("git", git_passthrough=True),
     "gdrive-sync": Profile("gdrive-sync", sync_provider=True,
@@ -48,11 +49,15 @@ BUILTIN = {
 _cache: dict = {}
 
 
-def detect(path: str) -> Profile:
+def detect(path: str, *, assume_directory: bool = False, override: str = "") -> Profile:
     """Detect the profile governing `path` by walking up to a recognizable
     root. Results are cached per ancestor directory."""
+    if override:
+        if override not in BUILTIN or override == "unknown":
+            raise ValueError(f"unknown folder profile: {override}")
+        return BUILTIN[override]
     p = os.path.abspath(os.path.expanduser(path or "."))
-    probe = p if os.path.isdir(p) else os.path.dirname(p) or "/"
+    probe = p if assume_directory or os.path.isdir(p) else os.path.dirname(p) or "/"
     if probe in _cache:
         return _cache[probe]
     profile = _detect_uncached(probe)
@@ -73,35 +78,58 @@ def _detect_uncached(directory: str) -> Profile:
         if seg.startswith("dropbox"):
             return BUILTIN["dropbox"]
 
-    # env-var roots (OneDrive on Windows; honored cross-platform for tests)
-    for var in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer", "ONEDRIVE"):
-        root = os.environ.get(var)
-        if root and _is_under(directory, root):
-            return BUILTIN["onedrive-sharepoint"]
-
     # path-name heuristics (WSL /mnt/c/Users/x/OneDrive - Org, Google Drive mounts)
     parts = lower.split("/")
     for part in parts:
         if part.startswith("onedrive"):
             return BUILTIN["onedrive-sharepoint"]
-        if part in ("google drive", "googledrive", "my drive") or part.startswith("googledrive-"):
+        if part in ("google drive", "googledrive", "my drive",
+                    "shared drive", "shared drives") \
+                or part.startswith("googledrive-"):
             return BUILTIN["gdrive-sync"]
         if part == "dropbox":
             return BUILTIN["dropbox"]
 
-    # marker files walking up
+    # Known/configurable provider roots. These are lexical path checks only;
+    # detection performs no registry, directory enumeration, or network access.
+    provider_roots = {
+        "onedrive-sharepoint": (
+            "OneDrive", "OneDriveCommercial", "OneDriveConsumer", "ONEDRIVE",
+        ),
+        "gdrive-sync": (
+            "GOOGLE_DRIVE", "GOOGLE_DRIVE_ROOT", "GOOGLE_DRIVEFS_ROOT",
+        ),
+        "dropbox": ("DROPBOX", "DROPBOX_ROOT"),
+    }
+    for profile_name, variables in provider_roots.items():
+        for variable in variables:
+            root = os.environ.get(variable)
+            if root and _is_under(directory, root):
+                return BUILTIN[profile_name]
+
+    # A mounted Drive volume may have a provider label even when its drive
+    # letter/path contains no provider name. This uses local kernel metadata;
+    # scan invokes detection only inside its killable worker.
+    label = _windows_volume_label(directory).lower()
+    if "google" in label and "drive" in label:
+        return BUILTIN["gdrive-sync"]
+    if "onedrive" in label or "sharepoint" in label:
+        return BUILTIN["onedrive-sharepoint"]
+    if "dropbox" in label:
+        return BUILTIN["dropbox"]
+
+    # Marker paths walking up. Direct existence probes avoid enumerating every
+    # entry in every ancestor directory.
     cur = directory
     git_found = False
     for _ in range(12):
-        try:
-            names = set(os.listdir(cur))
-        except OSError:
-            names = set()
-        if names & {".tmp.drivedownload", ".tmp.driveupload"}:
+        if any(os.path.exists(os.path.join(cur, marker))
+               for marker in (".tmp.drivedownload", ".tmp.driveupload")):
             return BUILTIN["gdrive-sync"]
-        if ".dropbox.cache" in names or ".dropbox" in names:
+        if any(os.path.exists(os.path.join(cur, marker))
+               for marker in (".dropbox.cache", ".dropbox")):
             return BUILTIN["dropbox"]
-        if ".git" in names:
+        if os.path.exists(os.path.join(cur, ".git")):
             git_found = True
         parent = os.path.dirname(cur)
         if parent == cur:
@@ -112,10 +140,31 @@ def _detect_uncached(directory: str) -> Profile:
     return BUILTIN["local"]
 
 
+def _windows_volume_label(path: str) -> str:
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        volume_path = ctypes.create_unicode_buffer(32768)
+        if not kernel32.GetVolumePathNameW(
+                wintypes.LPCWSTR(path), volume_path, len(volume_path)):
+            return ""
+        label = ctypes.create_unicode_buffer(261)
+        if not kernel32.GetVolumeInformationW(
+                volume_path.value, label, len(label), None, None, None, None, 0):
+            return ""
+        return label.value
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+
 def _is_under(path: str, root: str) -> bool:
     try:
-        path = os.path.realpath(path)
-        root = os.path.realpath(os.path.expanduser(root))
+        path = os.path.normcase(os.path.abspath(path))
+        root = os.path.normcase(os.path.abspath(os.path.expanduser(root)))
         return os.path.commonpath([path, root]) == root
     except ValueError:
         return False

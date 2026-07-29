@@ -1,16 +1,17 @@
 """Archive store + agw CLI behavior: round-trips, undo, concurrency, conflicts."""
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import threading
-from types import SimpleNamespace
+import time
 
 import pytest
 
 from core import store
 from core import profiles
-import agw as agw_cli
+import scan_worker
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 AGW = os.path.join(REPO, "scripts", "agw", "agw.py")
@@ -186,6 +187,122 @@ def test_cli_scan_bounds_return_partial_results(tmp_path, agw_home):
     assert data["files_inspected"] == 3
     assert data["bytes"] is None
     assert data["elapsed_seconds"] >= 0
+    assert data["placeholder_detection"] == "limited"
+    assert data["deadline_enforced"] is True
+    assert data["worker_cleanup"] == "complete"
+
+
+def _scan_request(path, *, seconds=0.6, no_size=True, block=""):
+    started = time.monotonic()
+    return {
+        "path": str(path),
+        "started_at": started,
+        "worker_deadline": started + seconds,
+        "max_seconds": seconds,
+        "max_files": 100,
+        "max_depth": 4,
+        "no_size": no_size,
+        "profile_override": "auto",
+        "_test_block_stage": block,
+        "_test_block_seconds": 30.0,
+    }
+
+
+def _pid_exists(pid):
+    if not pid:
+        return False
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return exit_code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("stage,no_size", [
+    ("path_validation", True),
+    ("profile_detection", True),
+    ("scandir", True),
+    ("scandir_next", True),
+    ("is_dir", True),
+    ("stat", False),
+])
+def test_scan_blocking_filesystem_stages_obey_parent_deadline(
+        tmp_path, monkeypatch, stage, no_size):
+    (tmp_path / "item.txt").write_text("metadata")
+    monkeypatch.setenv("AGW_TEST_MODE", "1")
+    request = _scan_request(tmp_path, seconds=0.6, no_size=no_size, block=stage)
+    wall_start = time.monotonic()
+    result, fatal = scan_worker.run_bounded_scan(request)
+    wall_elapsed = time.monotonic() - wall_start
+
+    assert fatal is None
+    assert result["complete"] is False
+    assert result["stop_reason"] == "max_seconds"
+    assert result["elapsed_seconds"] <= 0.6
+    assert wall_elapsed < 1.0
+    assert result["worker_terminated"] is True
+    assert result["worker_cleanup"] == "complete"
+    assert not _pid_exists(result["_worker_pid"])
+    assert json.loads(json.dumps(result))["stop_reason"] == "max_seconds"
+    if stage == "profile_detection":
+        assert result["profile_detection"] == "timed_out"
+    if stage in {"scandir", "scandir_next", "is_dir", "stat"}:
+        assert result["directories_inspected"] == 1
+    if stage in {"is_dir", "stat"}:
+        assert result["entries_seen"] >= 1
+    if stage == "stat":
+        assert result["files_inspected"] == 1
+
+
+def test_scan_max_depth_stops_before_descending(tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    (child / "nested.txt").write_text("nested")
+    result = run_agw(
+        "scan", str(tmp_path), "--max-depth", "0", "--no-size", "--json"
+    )
+    data = json.loads(result.stdout)
+    assert data["complete"] is False
+    assert data["stop_reason"] == "max_depth"
+    assert data["directories_inspected"] == 1
+    assert data["files_inspected"] == 0
+
+
+def test_scan_local_folder_completes_quickly(tmp_path):
+    (tmp_path / "one.txt").write_text("one")
+    (tmp_path / "two.json").write_text("{}")
+    started = time.monotonic()
+    result = run_agw(
+        "scan", str(tmp_path), "--max-seconds", "5", "--no-size", "--json"
+    )
+    wall_elapsed = time.monotonic() - started
+    data = json.loads(result.stdout)
+    assert data["complete"] is True
+    assert data["files_inspected"] == 2
+    assert wall_elapsed < 2.0
+
+
+def test_scan_filesystem_error_is_structured_json(tmp_path):
+    missing = tmp_path / "missing"
+    # Repeat because short-lived Windows subprocesses previously raced the
+    # stdout reader and lost their final fatal frame under suite load.
+    for _ in range(5):
+        result = run_agw("scan", str(missing), "--json", check=False)
+        assert result.returncode == 2
+        data = json.loads(result.stderr)
+        assert data["ok"] is False
+        assert data["error"]["code"] == "path_not_found"
 
 
 def test_sync_profile_precedes_enclosing_git_marker(tmp_path):
@@ -199,30 +316,77 @@ def test_sync_profile_precedes_enclosing_git_marker(tmp_path):
     assert profiles.detect(str(repo)).name == "dropbox"
 
 
-def test_scan_placeholder_checks_use_metadata_without_opening_content(
-        tmp_path, monkeypatch, capsys):
+def test_google_drive_shared_drives_mount_is_classified(tmp_path):
+    mounted = tmp_path / "Shared drives" / "Synaptic Labs"
+    mounted.mkdir(parents=True)
+    profiles._cache.clear()
+    assert profiles.detect(str(mounted), assume_directory=True).name == "gdrive-sync"
+
+
+def test_provider_volume_label_is_classified_without_registry_calls(
+        tmp_path, monkeypatch):
+    mounted = tmp_path / "mounted" / "team"
+    mounted.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_windows_volume_label",
+                        lambda _path: "Google Drive")
+    profiles._cache.clear()
+    assert profiles.detect(str(mounted), assume_directory=True).name == "gdrive-sync"
+
+
+def test_profile_detection_does_not_enumerate_ancestors(tmp_path, monkeypatch):
+    root = tmp_path / "sync"
+    nested = root / "project"
+    nested.mkdir(parents=True)
+    (root / ".dropbox").mkdir()
+    monkeypatch.setattr(profiles.os, "listdir", lambda _path: (_ for _ in ()).throw(
+        AssertionError("profile detection enumerated an ancestor")
+    ))
+    profiles._cache.clear()
+    assert profiles.detect(str(nested), assume_directory=True).name == "dropbox"
+
+
+def test_fast_no_size_scan_avoids_content_reads_and_stat(
+        tmp_path, monkeypatch):
     folder = tmp_path / "OneDrive - Example"
     folder.mkdir()
     target = folder / "cloud.dat"
     target.write_bytes(b"metadata-only")
-    original = profiles.is_placeholder
-    observed = []
+    calls = {"stat": 0}
 
-    def inspect(path, *, st=None, profile=None):
-        observed.append((path, st is not None, profile.name))
-        return original(path, st=st, profile=profile)
+    class Entry:
+        name = target.name
+        path = str(target)
 
-    monkeypatch.setattr(profiles, "is_placeholder", inspect)
+        def is_dir(self, *, follow_symlinks=False):
+            assert follow_symlinks is False
+            return False
+
+        def stat(self, *, follow_symlinks=False):
+            calls["stat"] += 1
+            raise AssertionError("fast/no-size scan called entry.stat")
+
+    class Iterator:
+        def __init__(self):
+            self.items = iter([Entry()])
+
+        def __next__(self):
+            return next(self.items)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(scan_worker.os, "scandir", lambda _path: Iterator())
     monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("scan opened file content")
     ))
-    agw_cli.cmd_scan(SimpleNamespace(
-        path=str(folder), fast=False, max_seconds=5.0, max_files=10,
-        max_depth=2, no_size=True, json=True,
-    ))
-    data = json.loads(capsys.readouterr().out)
+    request = _scan_request(folder, seconds=5.0, no_size=True)
+    request["profile_override"] = "gdrive-sync"
+    data, fatal = scan_worker.scan_in_process(request)
+    assert fatal is None
     assert data["files_inspected"] == 1
-    assert observed == [(str(target), True, "onedrive-sharepoint")]
+    assert data["placeholder_detection"] == "limited"
+    assert data["placeholders"] == []
+    assert calls["stat"] == 0
 
 
 def test_cli_snapshot_preflight(tmp_path, agw_home):
