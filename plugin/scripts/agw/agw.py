@@ -3,8 +3,8 @@
 destructive primitives. Every verb is reversible by construction, dual-output
 (human line + JSON via --json), and self-logging.
 
-Verbs: init scan checkout convert diff publish archive move rename snapshot
-       restore undo status log doctor prune office
+Verbs: init scan checkout convert diff publish publish-file archive unlink-link
+       move rename snapshot restore undo status log doctor prune office
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.di
 
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
+from core import archive_transactions as archive_tx  # noqa: E402
 import converters                           # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
@@ -269,16 +270,18 @@ def cmd_checkout(args):
              "this device' / 'Available offline')")
     folder = os.path.dirname(src)
     ws = os.path.join(folder, "_workspace")
-    result = converters.to_open_format(src, ws)
+    result = converters.to_open_format(src, ws, mode=args.mode)
     state = store.state_load()
     state["checkouts"][src] = {
         "working": result["dest"], "workings": result.get("dests", [result["dest"]]),
         "base_sha256": store.file_sha256(src), "mode": result["mode"],
+        "checkout_mode": result.get("checkout_mode", "data"),
     }
     store.state_save(state)
     store.oplog_append({"op": "checkout", "src": src, "working": result["dest"]})
-    note = "" if result["mode"] == "converted" else \
-        " (no converter available - working copy is a plain copy)"
+    note = " (style-preserving working copy)" \
+        if result.get("checkout_mode") == "preserve" else \
+        (" (lossy data checkout)" if result.get("lossy") else "")
     _out(args, f"checked out -> {result['dest']}{note}",
          {"src": src, **result})
 
@@ -299,6 +302,21 @@ def cmd_diff(args):
     working = entry["working"]
     live_hash = store.file_sha256(src)
     drifted = live_hash != entry["base_sha256"]
+    if entry.get("checkout_mode") == "preserve":
+        working_hash = store.file_sha256(working)
+        changed = working_hash != entry["base_sha256"]
+        diff = "(working workbook changed)" if changed else ""
+        data = {
+            "src": src, "working": working, "drifted": drifted,
+            "changed": changed, "base_hash": entry["base_sha256"],
+            "working_hash": working_hash, "diff": diff,
+            "checkout_mode": "preserve",
+        }
+        human = diff or "(no changes in style-preserving working copy)"
+        if drifted:
+            human = "WARNING: live file changed since checkout!\n" + human
+        _out(args, human, data)
+        return
     try:
         with open(working, encoding="utf-8", errors="replace") as f:
             work_lines = f.readlines()
@@ -326,33 +344,32 @@ def cmd_publish(args):
     working = entry["working"]
     if not os.path.exists(working):
         _err(f"working copy missing: {working}")
+    live_hash = None
     if os.path.exists(src):
         live_hash = store.file_sha256(src)
         if live_hash != entry["base_sha256"] and not args.force:
             _err("CONFLICT: the live file changed since checkout (someone else edited "
                  "it?). Review with `agw diff`, then publish --force to overwrite, or "
                  "re-checkout.", code=3)
-        # version-bump: current live file -> archive
-        store.archive_file(src, mode="copy", reason="pre-publish version bump",
-                           actor="agw publish")
-    profile = prof.detect(src)
-    tmp_out = src + ".agw-publishing"
+    profile = prof.detect(os.path.dirname(src))
+    import tempfile as _tempfile
+    fd, tmp_out = _tempfile.mkstemp(
+        prefix=".agw-publishing-", suffix=os.path.splitext(src)[1],
+        dir=os.path.dirname(src),
+    )
+    os.close(fd)
     result = converters.to_original_format(working, src, tmp_out)
     try:
-        os.replace(tmp_out, src)
-    except OSError:
-        import shutil as _sh
-        import time as _time
-        for attempt in range(5):  # retry-in-place for sync-locked files
-            try:
-                _sh.copy2(tmp_out, src)
-                os.unlink(tmp_out)
-                break
-            except OSError:
-                _time.sleep(0.5 * (attempt + 1))
-        else:
-            _err(f"could not replace {src} (sync client lock?) - converted output "
-                 f"left at {tmp_out}")
+        if os.path.splitext(src)[1].lower() in {".xlsx", ".xlsm"}:
+            office_tx._package_preflight(tmp_out, mutating=False)
+        published = file_ops.publish_staged_file(
+            src, tmp_out, expected_hash=live_hash or "absent",
+            operation="checkout-publish", retry_seconds=args.retry_seconds,
+        )
+        if not published.get("changed") and os.path.exists(tmp_out):
+            os.unlink(tmp_out)
+    except (OSError, file_ops.FileOperationError) as exc:
+        _file_err(args, exc)
     entry["base_sha256"] = store.file_sha256(src)
     store.state_save(state)
     store.oplog_append({"op": "publish", "src": src, "working": working,
@@ -362,7 +379,9 @@ def cmd_publish(args):
         profile.upstream_versioning else ""
     _out(args, f"published {src}{note} - previous version archived"
                f" (restore with `agw restore {os.path.basename(src)}`){versioning}",
-         {"src": src, "conversion": result["mode"]})
+         {"src": src, "conversion": result["mode"],
+          "checkout_mode": entry.get("checkout_mode", "data"),
+          "publication": published})
 
 
 def cmd_archive(args):
@@ -378,6 +397,54 @@ def cmd_archive(args):
     if getattr(args, "json", False):
         print(json.dumps(results, ensure_ascii=False, default=str,
                          separators=(",", ":")))
+
+
+def cmd_unlink_link(args):
+    path = os.path.abspath(os.path.expanduser(args.path))
+    try:
+        metadata = archive_tx.link_metadata(path)
+    except (FileNotFoundError, OSError) as exc:
+        _file_err(args, file_ops.FileOperationError(
+            f"link could not be inspected without following its target: {exc}"
+        ))
+    if metadata is None:
+        _file_err(args, file_ops.FileOperationError(
+            "unlink-link requires a symbolic link or Windows junction; ordinary "
+            "files and directories are refused"
+        ))
+    expected = str(args.expected_target or "")
+    if expected:
+        def normalize(value):
+            value = str(value)
+            if value.startswith("\\\\?\\UNC\\"):
+                value = "\\\\" + value[8:]
+            elif value.startswith("\\\\?\\"):
+                value = value[4:]
+            elif value.startswith("\\??\\"):
+                value = value[4:]
+            return os.path.normcase(os.path.normpath(value))
+        if normalize(metadata["target"]) != normalize(expected):
+            _file_err(args, file_ops.FileConflict(
+                "CONFLICT: link target does not match --expected-target",
+                {"path": path, "expected": expected,
+                 "actual": metadata["target"]},
+            ))
+    if args.dry_run:
+        data = {"path": path, "dry_run": True, "changed": 1, **metadata}
+    else:
+        _require_archive_store()
+        entry = store.archive_file(
+            path, mode="move", reason=args.reason or "agw unlink-link",
+            actor="agw unlink-link",
+        )
+        data = {"path": path, "changed": 1, **metadata, "archive": entry}
+    _out(
+        args,
+        (("would unlink" if args.dry_run else "unlinked")
+         + f" {metadata['link_type']} {path} -> {metadata['target']}"
+         + ("" if args.dry_run else "; link metadata archived")),
+        data,
+    )
 
 
 def cmd_file(args):
@@ -442,6 +509,8 @@ def cmd_run(args):
         data = file_ops.run_declared(
             command, args.output, expected_hashes=args.expected_hash,
             cwd=args.cwd, dry_run=args.dry_run,
+            output_roots=args.output_root,
+            output_patterns=args.output_pattern,
         )
     except (OSError, file_ops.FileOperationError) as exc:
         _file_err(args, exc)
@@ -459,6 +528,26 @@ def cmd_run(args):
         raise SystemExit(data["exit_code"])
     if data.get("executed") and not data.get("ok", True):
         raise SystemExit(2)
+
+
+def cmd_publish_file(args):
+    try:
+        data = file_ops.publish_staged_file(
+            args.target, args.staged,
+            expected_hash=args.expected_hash,
+            expected_stage_hash=args.expected_staged_hash,
+            dry_run=args.dry_run,
+            retry_seconds=args.retry_seconds,
+        )
+    except (OSError, file_ops.FileOperationError) as exc:
+        _file_err(args, exc)
+    _out(
+        args,
+        (("would publish" if data.get("dry_run") else "published")
+         + f" {args.staged} -> {data['path']}"
+         + ("" if data.get("dry_run") else "; prior target recoverable")),
+        data,
+    )
 
 
 def cmd_move(args):
@@ -613,9 +702,13 @@ def cmd_office(args):
             if not (args.sheet and args.cell):
                 _err("set-cell needs --sheet and --cell")
             data = office.set_cell(path, args.sheet, args.cell, args.value,
-                                   force_text=args.text)
+                                   force_text=args.text,
+                                   expected_sha256=args.expected_file_hash,
+                                   dry_run=args.dry_run)
             human = (f"{args.sheet}!{args.cell}: {data['old']!r} -> {data['new']!r} "
-                     f"(pre-image archived as v{data['snapshot_version']})")
+                     + ("(no change; file untouched)" if not data.get("changed") else
+                        "(dry-run; file untouched)" if args.dry_run else
+                        f"(pre-image archived as v{data['snapshot_version']})"))
         elif args.op == "append-rows":
             if not args.sheet:
                 _err("append-rows needs --sheet")
@@ -812,15 +905,49 @@ def main(argv=None):
         }),
         help="hard-bounded metadata inventory for safe folder discovery")
     add("checkout", cmd_checkout, (["path"], {}),
-        help="create an editable open-format working copy")
+        (["--mode"], {"choices": ["auto", "preserve", "data"],
+                       "default": "auto",
+                       "help": "preserve .xlsx behavior by default; data is lossy"}),
+        help="create a tracked working copy")
     add("convert", cmd_convert, (["path"], {}), (["--dest"], {"default": ""}),
         help="convert to an editable working format")
     add("diff", cmd_diff, (["path"], {}), help="compare a checkout with its source")
     add("publish", cmd_publish, (["path"], {}), (["--force"], {"action": "store_true"}),
+        (["--retry-seconds"], {"type": float, "default": 5.0,
+                                "help": "bounded retry window for a busy target"}),
         help="archive current version and replace with the working copy")
+    add(
+        "publish-file", cmd_publish_file,
+        (["--staged"], {"required": True, "help": "validated temporary output"}),
+        (["--target"], {"required": True, "help": "literal live target path"}),
+        (["--expected-hash"], {
+            "default": "", "help": "expected live SHA-256, or absent",
+        }),
+        (["--expected-staged-hash"], {
+            "default": "", "help": "expected staged SHA-256",
+        }),
+        (["--retry-seconds"], {
+            "type": float, "default": 5.0,
+            "help": "bounded retry window for sharing violations/EBUSY",
+        }),
+        (["--dry-run"], {"action": "store_true",
+                           "help": "validate hashes without publishing"}),
+        help="hash-guarded atomic publication of a staged file",
+    )
     add("archive", cmd_archive, (["paths"], {"nargs": "+"}),
         (["--reason"], {"default": ""}),
         help="reversible delete: move into the archive store")
+    add(
+        "unlink-link", cmd_unlink_link,
+        (["path"], {"help": "literal symbolic-link or Windows junction path"}),
+        (["--expected-target"], {
+            "default": "", "help": "refuse unless the recorded link target matches",
+        }),
+        (["--reason"], {"default": ""}),
+        (["--dry-run"], {"action": "store_true",
+                           "help": "inspect and report without unlinking"}),
+        help="archive link metadata and remove only the link object",
+    )
     file_parser = sub.add_parser(
         "file", parents=[common],
         help="atomic, recoverable text-file writes",
@@ -873,15 +1000,19 @@ def main(argv=None):
     )
     add(
         "run", cmd_run,
-        (["--output"], {"action": "append", "required": True,
-                        "help": "literal output path; repeat for every output"}),
+        (["--output"], {"action": "append", "default": [],
+                        "help": "exact output; repeat"}),
+        (["--output-root"], {"action": "append", "default": [],
+                              "help": "bounded observation root"}),
+        (["--output-pattern"], {"action": "append", "default": [],
+                                 "help": "allowed relative sidecars"}),
         (["--expected-hash"], {"action": "append", "default": [],
-                               "help": "SHA-256 or absent; repeat in output order"}),
-        (["--cwd"], {"default": "", "help": "command working directory"}),
+                               "help": "SHA-256/absent in output order"}),
+        (["--cwd"], {"default": "", "help": "working directory"}),
         (["--dry-run"], {"action": "store_true",
-                          "help": "validate outputs without executing"}),
+                          "help": "validate without executing"}),
         (["command"], {"nargs": argparse.REMAINDER,
-                        "help": "command and arguments after --"}),
+                        "help": "command after --"}),
         help="run a command with declared, recoverable outputs",
     )
     add("move", cmd_move, (["src"], {}), (["dest"], {}),
@@ -969,6 +1100,7 @@ def main(argv=None):
         (["--cell"], {"default": "", "help": "cell reference, for example B2 (required)"}),
         (["--value"], {"default": "", "help": "value; empty clears the cell"}),
         (["--text"], {"action": "store_true", "help": "store literal text"}),
+        expected_hash, dry_run,
         example='agw office set-cell workbook.xlsx --sheet Data --cell B2 --value 55',
     )
     add_office(

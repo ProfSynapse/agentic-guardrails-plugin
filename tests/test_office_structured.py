@@ -19,6 +19,7 @@ AGW = os.path.join(REPO, "scripts", "agw", "agw.py")
 sys.path.insert(0, os.path.join(REPO, "scripts", "agw"))
 
 import office_excel  # noqa: E402
+import office  # noqa: E402
 import office_tx  # noqa: E402
 import office_word  # noqa: E402
 from core import store  # noqa: E402
@@ -75,6 +76,28 @@ def _inject_lossy_extension(path):
                     b'<x14:conditionalFormattings '
                     b'xmlns:x14="http://schemas.microsoft.com/office/'
                     b'spreadsheetml/2009/9/main"/></ext></extLst>'
+                )
+                payload = payload.replace(b"</worksheet>", extension + b"</worksheet>")
+            target.writestr(item, payload)
+    os.replace(rewritten, path)
+
+
+def _inject_x14_x15_extensions(path):
+    rewritten = str(path) + ".x14-x15"
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(
+            rewritten, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            payload = source.read(item)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                extension = (
+                    b'<extLst><ext uri="{x14-x15-preservation-risk}">'
+                    b'<x14:conditionalFormattings '
+                    b'xmlns:x14="http://schemas.microsoft.com/office/'
+                    b'spreadsheetml/2009/9/main"/>'
+                    b'<x15:conditionalFormattings '
+                    b'xmlns:x15="http://schemas.microsoft.com/office/'
+                    b'spreadsheetml/2010/11/main"/>'
+                    b'</ext></extLst>'
                 )
                 payload = payload.replace(b"</worksheet>", extension + b"</worksheet>")
             target.writestr(item, payload)
@@ -349,6 +372,40 @@ def test_lossy_ooxml_extension_is_reported_and_mutation_is_refused(
     assert store.list_versions(table_book) == []
     assert office_tx.transaction_status() == []
     assert not list(Path(table_book).parent.glob(".agw-office-*"))
+
+
+def test_set_cell_surgically_preserves_unknown_excel_extensions(
+        table_book, agw_home):
+    _inject_x14_x15_extensions(table_book)
+    with zipfile.ZipFile(table_book) as package:
+        before = {item.filename: package.read(item) for item in package.infolist()}
+    expected = store.file_sha256(table_book)
+
+    result = office.set_cell(
+        table_book, "Data", "B2", "57", expected_sha256=expected,
+    )
+    assert result["adapter"] == "ooxml-surgical"
+    assert result["preservation"]["unknown_parts_preserved"] is True
+    assert result["old"] == "Open"
+    assert result["new"] == 57
+
+    with zipfile.ZipFile(table_book) as package:
+        after = {item.filename: package.read(item) for item in package.infolist()}
+    assert before.keys() == after.keys()
+    worksheet = "xl/worksheets/sheet1.xml"
+    assert before[worksheet] != after[worksheet]
+    for name in before:
+        if name != worksheet:
+            assert before[name] == after[name], name
+    before_extension = before[worksheet][before[worksheet].index(b"<extLst>"):]
+    after_extension = after[worksheet][after[worksheet].index(b"<extLst>"):]
+    assert before_extension == after_extension
+    with pytest.warns(UserWarning, match="extension"):
+        workbook = openpyxl.load_workbook(table_book, data_only=False)
+    assert workbook["Data"]["B2"].value == 57
+    workbook.close()
+    assert len(store.list_versions(table_book)) == 1
+    assert office_tx.transaction_status() == []
 
 
 def test_known_non_destructive_style_metadata_is_allowlisted(

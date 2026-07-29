@@ -38,10 +38,10 @@ splatting, dynamic path joins, or mixed shell scripts that obscure mutations.
 - Separate discovery/read, validation/dry-run, mutation, and verification. Do not \
 bundle unrelated writes merely to save calls. Prefer the smallest reversible \
 operation plus compact JSON, pagination, or file/stdin input over clever quoting.
-For write-capable scripts, declare every output through Guardrails.
-- Never delete: use `archive`; use `restore` or `undo` for recovery. Use \
-`checkout`/`publish` for Office rewrites or targeted `office` operations for small \
-changes; never use ad hoc Python/Node mutation.
+For write-capable scripts, declare every output exactly or by bounded sidecar pattern.
+- Never delete: `archive` ordinary targets; `unlink-link` link objects; \
+`restore`/`undo` recover. Use targeted `office`, style-preserving \
+`checkout`/`publish`, or `publish-file` for staged output; no ad hoc Python/Node mutation.
 - Bound broad discovery. In OneDrive, SharePoint, Google Drive, or Dropbox, run a \
 hard-bounded `scan --fast`, then search only the relevant subtree. Fast scans have \
 limited placeholder detection; never edit cloud-only placeholders or Google stubs.

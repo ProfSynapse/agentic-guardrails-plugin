@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import threading
 
 import pytest
@@ -337,3 +338,32 @@ def test_nonregular_source_is_rejected(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="ordinary local file or folder"):
         store.archive_file(str(source), mode="copy")
     assert source.read_text() == "must not follow special source"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_windows_junction_is_archived_as_metadata_without_traversal(tmp_path):
+    target = tmp_path / "target with data"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    link = tmp_path / "working junction"
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if created.returncode:
+        pytest.skip(created.stderr or created.stdout)
+
+    metadata = archive_tx.link_metadata(str(link))
+    assert metadata["link_type"] == "junction"
+    entry = store.archive_file(str(link), mode="move", reason="junction unlink test")
+    assert not os.path.lexists(link)
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert Path(entry["dest"]).is_file()
+    assert entry["artifact_kind"] == "link-metadata"
+    assert entry["link"]["target"] == metadata["target"]
+
+    store.restore(str(link))
+    assert os.path.lexists(link)
+    assert archive_tx.link_metadata(str(link))["link_type"] == "junction"
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"

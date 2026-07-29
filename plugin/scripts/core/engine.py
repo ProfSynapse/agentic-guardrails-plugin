@@ -37,7 +37,8 @@ ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archiv
 AGW_READ_ONLY_VERBS = {"scan", "diff", "status", "log", "doctor"}
 AGW_SAFE_MUTATING_VERBS = {
     "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
-    "restore", "undo", "publish", "file", "run", "office",
+    "restore", "undo", "publish", "publish-file", "unlink-link",
+    "file", "run", "office",
 }
 AGW_ASK_VERBS = {"prune": "prune permanently destroys archived versions (human decision)",
                  "apply": "bulk apply executes a stored plan — review the manifest",
