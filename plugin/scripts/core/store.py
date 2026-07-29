@@ -238,10 +238,11 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     """Archive one file or directory. mode='move' (delete-replacement) or
     'copy' (pre-image snapshot, leaves the original)."""
     src = os.path.abspath(src)
-    if not os.path.exists(src):
+    if not os.path.lexists(src):
         raise FileNotFoundError(src)
     file_dir = _file_dir(src)
-    digest = file_sha256(src) if os.path.isfile(src) else ""
+    link = archive_tx.link_metadata(src)
+    digest = file_sha256(src) if link is None and os.path.isfile(src) else ""
 
     with Lock(_folder_key(os.path.dirname(src))):
         if dedupe and digest:
@@ -379,6 +380,11 @@ def undo_last() -> dict:
             continue
         kind = op.get("op")
         if kind == "archive" and op.get("mode") == "move":
+            if op.get("artifact_kind") == "link-metadata" \
+                    and os.path.exists(op["dest"]) and not os.path.lexists(op["src"]):
+                archive_tx.publish_restore(agw_home(), op, op["src"])
+                oplog_append({"op": "undo", "undid": op})
+                return {"undone": "archive", "restored": op["src"]}
             if os.path.exists(op["dest"]) and not os.path.exists(op["src"]):
                 shutil.move(op["dest"], op["src"])
                 oplog_append({"op": "undo", "undid": op})

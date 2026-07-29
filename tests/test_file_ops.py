@@ -1,5 +1,6 @@
 """Guarded text construction and declared-output execution."""
 import json
+import errno
 import os
 from pathlib import Path
 import subprocess
@@ -134,6 +135,118 @@ def test_declared_run_reports_missing_new_output(tmp_path):
     assert records[0]["record"]["kind"] == "absent_tombstone"
 
 
+def test_declared_run_reports_undeclared_sidecar(tmp_path):
+    output = tmp_path / "report.xlsx"
+    sidecar = tmp_path / "report.xlsx.inspect.ndjson"
+    script = tmp_path / "build.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('report.xlsx').write_bytes(b'book')\n"
+        "Path('report.xlsx.inspect.ndjson').write_text('inspection')\n",
+        encoding="utf-8",
+    )
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert result["undeclared_outputs"] == [{
+        "path": str(sidecar), "change": "created", "kind": "file",
+    }]
+
+
+def test_declared_sidecar_pattern_is_allowed(tmp_path):
+    output = tmp_path / "report.xlsx"
+    script = tmp_path / "build.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('report.xlsx').write_bytes(b'book')\n"
+        "Path('report.xlsx.inspect.ndjson').write_text('inspection')\n",
+        encoding="utf-8",
+    )
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+        output_patterns=["*.inspect.ndjson"],
+    )
+    assert result["ok"] is True
+    assert result["undeclared_outputs"] == []
+
+
+def test_publish_staged_file_cross_directory_is_atomic_and_recoverable(tmp_path):
+    target = tmp_path / "live" / "book.xlsx"
+    target.parent.mkdir()
+    target.write_bytes(b"old")
+    stage = tmp_path / "build" / "book.xlsx"
+    stage.parent.mkdir()
+    stage.write_bytes(b"new")
+    before = store.file_sha256(str(target))
+    staged_hash = store.file_sha256(str(stage))
+    result = file_ops.publish_staged_file(
+        str(target), str(stage), expected_hash=before,
+        expected_stage_hash=staged_hash,
+    )
+    assert target.read_bytes() == b"new"
+    assert stage.read_bytes() == b"new"
+    assert result["publish_attempts"] == 1
+    assert Path(store.list_versions(str(target))[0]["dest"]).read_bytes() == b"old"
+
+
+def test_publish_busy_preserves_live_and_stage(tmp_path, monkeypatch):
+    target = tmp_path / "book.xlsx"
+    stage = tmp_path / ".stage.xlsx"
+    target.write_bytes(b"old")
+    stage.write_bytes(b"new")
+    before = store.file_sha256(str(target))
+
+    def busy(source, live, _retry_seconds):
+        raise file_ops.PublishBusy(
+            "busy", {"staged": source, "target": live, "errno": errno.EBUSY}
+        )
+
+    monkeypatch.setattr(file_ops, "replace_with_retry", busy)
+    with pytest.raises(file_ops.PublishBusy):
+        file_ops.publish_staged_file(
+            str(target), str(stage), expected_hash=before, retry_seconds=0,
+        )
+    assert target.read_bytes() == b"old"
+    assert stage.read_bytes() == b"new"
+
+
+def test_cli_publish_file_validates_stage_and_publishes(tmp_path, agw_home):
+    target = tmp_path / "live.xlsx"
+    stage = tmp_path / "build.xlsx"
+    target.write_bytes(b"old")
+    stage.write_bytes(b"new")
+    result = run_agw(
+        "publish-file", "--staged", str(stage), "--target", str(target),
+        "--expected-hash", store.file_sha256(str(target)),
+        "--expected-staged-hash", store.file_sha256(str(stage)), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    data = json.loads(result.stdout)
+    assert data["changed"] == 1
+    assert data["publish_attempts"] == 1
+    assert target.read_bytes() == b"new"
+
+
+def test_output_observer_worker_is_reaped(tmp_path):
+    import multiprocessing
+
+    output = tmp_path / "out.txt"
+    script = tmp_path / "build.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('done')\n",
+        encoding="utf-8",
+    )
+    file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+    )
+    assert not [child for child in multiprocessing.active_children()
+                if child.name == "agw-output-observer"]
+
+
 def test_archive_json_stdout_is_json_only(tmp_path, agw_home):
     target = tmp_path / "archive-me.txt"
     target.write_text("recoverable", encoding="utf-8")
@@ -145,6 +258,30 @@ def test_archive_json_stdout_is_json_only(tmp_path, agw_home):
     assert len(data) == 1
     assert data[0]["src"] == str(target)
     assert result.stderr == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_cli_unlink_link_records_target_and_does_not_touch_contents(tmp_path, agw_home):
+    target = tmp_path / "junction target"
+    target.mkdir()
+    sentinel = target / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    link = tmp_path / "junction link"
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if created.returncode:
+        pytest.skip(created.stderr or created.stdout)
+    result = run_agw(
+        "unlink-link", str(link), "--expected-target", str(target), "--json",
+        env={"AGW_HOME": agw_home},
+    )
+    data = json.loads(result.stdout)
+    assert data["link_type"] == "junction"
+    assert data["archive"]["artifact_kind"] == "link-metadata"
+    assert not os.path.lexists(link)
+    assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
 def test_cli_file_write_from_stdin_is_compact_json(tmp_path, agw_home):

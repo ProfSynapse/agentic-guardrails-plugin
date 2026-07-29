@@ -297,7 +297,55 @@ def _coerce(value: str, force_text: bool):
 
 
 def set_cell(path: str, sheet: str, cell: str, value: str,
-             force_text: bool = False) -> dict:
+             force_text: bool = False, expected_sha256: str = "",
+             dry_run: bool = False) -> dict:
+    office_tx._package_preflight(path, mutating=False)
+    risks = office_tx.inspect_preservation_risks(path)
+    if risks:
+        import office_surgical
+        state = {"new": _coerce(value, force_text)}
+
+        def surgical_plan(live):
+            inspected = office_surgical.inspect_cell(live, sheet, cell)
+            state.update(inspected)
+            old = inspected["value"]
+            return office_tx.MutationPlan(
+                "set-cell",
+                {"sheet": sheet, "cell": inspected["coordinate"],
+                 "old": old, "new": state["new"],
+                 "adapter": "ooxml-surgical"},
+                {"affected": int(old != state["new"])},
+                changed=old != state["new"],
+            )
+
+        def surgical_apply(stage, _plan):
+            office_surgical.set_cell(stage, sheet, state["coordinate"], state["new"])
+
+        def surgical_validate(stage, _plan):
+            return office_surgical.verify_cell(
+                stage, sheet, state["coordinate"], state["new"]
+            )
+
+        def surgical_preservation(before, after, _operation):
+            return office_surgical.verify_preservation(
+                before, after, state["part"]
+            )
+
+        try:
+            result = office_tx.execute_mutation(
+                path, operation="set-cell", plan=surgical_plan,
+                apply=surgical_apply, validate=surgical_validate,
+                expected_sha256=expected_sha256 or None, dry_run=dry_run,
+                allow_preservation_risks=True,
+                preservation_validator=surgical_preservation,
+            )
+        except (office_tx.TransactionError,
+                office_surgical.SurgicalCellError) as exc:
+            raise OfficeError(str(exc)) from exc
+        result["snapshot_version"] = result.pop("snapshot", None)
+        result["preserved_risks"] = risks
+        return result
+
     openpyxl = _openpyxl()
     state = {}
 
@@ -336,6 +384,7 @@ def set_cell(path: str, sheet: str, cell: str, value: str,
     try:
         result = office_tx.execute_mutation(
             path, operation="set-cell", plan=plan, apply=apply, validate=validate,
+            expected_sha256=expected_sha256 or None, dry_run=dry_run,
         )
     except office_tx.TransactionError as exc:
         raise OfficeError(str(exc)) from exc

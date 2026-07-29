@@ -26,13 +26,21 @@ def capabilities() -> dict:
     return caps
 
 
-def to_open_format(src: str, dest_dir: str) -> dict:
+def to_open_format(src: str, dest_dir: str, mode: str = "auto") -> dict:
     """Convert `src` to an editable open-format working copy in dest_dir.
     Returns {dest, mode} where mode is 'converted' or 'copy'."""
+    if mode not in {"auto", "preserve", "data"}:
+        raise ValueError("checkout mode must be auto, preserve, or data")
     os.makedirs(dest_dir, exist_ok=True)
     name = os.path.basename(src)
     ext = os.path.splitext(src)[1].lower()
     caps = capabilities()
+
+    if mode == "preserve" or (ext == ".xlsx" and mode == "auto"):
+        dest = os.path.join(dest_dir, name)
+        shutil.copy2(src, dest)
+        return {"dest": dest, "mode": "copy", "format": ext.lstrip(".") or "bin",
+                "checkout_mode": "preserve", "lossy": False}
 
     if ext in PANDOC_FORMATS and caps["pandoc"]:
         dest = os.path.join(dest_dir, name + ".md")
@@ -40,7 +48,8 @@ def to_open_format(src: str, dest_dir: str) -> dict:
         subprocess.run(["pandoc", src, "-t", "gfm", "-o", dest,
                         "--extract-media", media],
                        check=True, capture_output=True, timeout=120)
-        return {"dest": dest, "mode": "converted", "format": "md"}
+        return {"dest": dest, "mode": "converted", "format": "md",
+                "checkout_mode": "data", "lossy": True}
 
     if ext == ".xlsx" and caps["openpyxl"]:
         import openpyxl
@@ -56,12 +65,15 @@ def to_open_format(src: str, dest_dir: str) -> dict:
                 f.write(out.getvalue())
             dests.append(dest)
         return {"dest": dests[0] if dests else "", "dests": dests,
-                "mode": "converted", "format": "csv"}
+                "mode": "converted", "format": "csv",
+                "checkout_mode": "data", "lossy": True,
+                "warning": "CSV checkout does not preserve workbook behavior"}
 
     # plain text and unknown formats: working copy is a plain copy
     dest = os.path.join(dest_dir, name)
     shutil.copy2(src, dest)
-    return {"dest": dest, "mode": "copy", "format": ext.lstrip(".") or "bin"}
+    return {"dest": dest, "mode": "copy", "format": ext.lstrip(".") or "bin",
+            "checkout_mode": "preserve", "lossy": False}
 
 
 def to_original_format(working: str, original: str, out_path: str) -> dict:

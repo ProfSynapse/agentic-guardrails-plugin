@@ -157,6 +157,41 @@ def test_cli_publish_conflict_detection(tmp_path, agw_home):
     assert f.read_text() == "someone else edited this"  # live file untouched
 
 
+def test_xlsx_checkout_defaults_to_style_preserving_workbook(tmp_path, agw_home):
+    openpyxl = pytest.importorskip("openpyxl")
+    from openpyxl.styles import PatternFill
+
+    source = tmp_path / "dashboard.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Dashboard"
+    sheet["A1"] = "Metric"
+    sheet["A1"].fill = PatternFill("solid", fgColor="00FF00")
+    sheet["B2"] = "=1+1"
+    workbook.save(source)
+
+    checkout = run_agw("checkout", str(source), "--json")
+    checkout_data = json.loads(checkout.stdout)
+    working = tmp_path / "_workspace" / "dashboard.xlsx"
+    assert checkout_data["checkout_mode"] == "preserve"
+    assert checkout_data["lossy"] is False
+    assert working.exists()
+    assert not list((tmp_path / "_workspace").glob("*.csv"))
+
+    edited = openpyxl.load_workbook(working)
+    edited["Dashboard"]["C2"] = "new"
+    edited.save(working)
+    edited.close()
+    published = run_agw("publish", str(source), "--json")
+    assert json.loads(published.stdout)["checkout_mode"] == "preserve"
+
+    final = openpyxl.load_workbook(source, data_only=False)
+    assert final["Dashboard"]["B2"].value == "=1+1"
+    assert final["Dashboard"]["A1"].fill.fgColor.rgb.endswith("00FF00")
+    assert final["Dashboard"]["C2"].value == "new"
+    final.close()
+
+
 def test_cli_scan_reports_stubs(tmp_path, agw_home):
     (tmp_path / "Budget.gsheet").write_text(json.dumps({"url": "x"}))
     (tmp_path / "real.txt").write_text("hello")

@@ -502,7 +502,7 @@ def _package_preflight(path: str, *, mutating: bool = True) -> None:
         raise UnsupportedOfficeFile("file is not a valid Office OOXML package") from exc
 
 
-def _target_preflight(path: str) -> str:
+def _target_preflight(path: str, *, allow_preservation_risks: bool = False) -> str:
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(path):
         raise TransactionError(f"not a regular file: {path}")
@@ -532,7 +532,7 @@ def _target_preflight(path: str) -> str:
         )
     _package_preflight(path)
     risks = inspect_preservation_risks(path)
-    if risks:
+    if risks and not allow_preservation_risks:
         raise PreservationError(risks)
     return path
 
@@ -546,6 +546,8 @@ def execute_mutation(
     validate: Callable[[str, MutationPlan], dict],
     expected_sha256: Optional[str] = None,
     dry_run: bool = False,
+    allow_preservation_risks: bool = False,
+    preservation_validator: Optional[Callable[[str, str, str], dict]] = None,
 ) -> dict:
     """Apply one validated Office mutation and publish it atomically."""
     path = os.path.abspath(os.path.expanduser(path))
@@ -553,7 +555,9 @@ def execute_mutation(
     stage = ""
     receipt = None
     with store.Lock(lock_name, timeout=10.0):
-        path = _target_preflight(path)
+        path = _target_preflight(
+            path, allow_preservation_risks=allow_preservation_risks
+        )
         before = store.file_sha256(path)
         if expected_sha256 and before.lower() != expected_sha256.lower():
             raise TransactionConflict("CONFLICT: file hash does not match expected version")
@@ -588,7 +592,11 @@ def execute_mutation(
                 lambda: validate(stage, mutation_plan), "validate"
             ) or {}
             _package_preflight(stage)
-            preservation = verify_package_preservation(path, stage, operation)
+            preservation = (
+                preservation_validator(path, stage, operation)
+                if preservation_validator is not None
+                else verify_package_preservation(path, stage, operation)
+            )
             after = store.file_sha256(stage)
             if after == before:
                 return {

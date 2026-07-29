@@ -16,6 +16,9 @@ _LOCAL_MUTATION = re.compile(
     r"cp|mv|install|tee|dd|truncate)\b"
 )
 _OVERWRITE_REDIRECT = re.compile(r"(?<!>)>(?!>)")
+_NULL_REDIRECT = re.compile(
+    r"(?i)(?:\d*|&)?>\|?\s*(?:\$null|nul:?|/dev/null)(?=$|[\s;&|])"
+)
 _MUTATION_WORDS = {
     "add", "copy", "create", "delete", "edit", "move", "remove", "rename",
     "replace", "truncate", "update", "upload", "write",
@@ -192,7 +195,7 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                         "run it with `agw run --output <path> --expected-hash <hash> "
                         "-- <command>` so Guardrails can capture pre-images"
                     )
-                surface = _unquoted_surface(ev.command)
+                surface = _NULL_REDIRECT.sub("", _unquoted_surface(ev.command))
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
                     or _looks_locally_mutating(ev.command, dialect=dialect)
                 if not getattr(targets, "complete", True):

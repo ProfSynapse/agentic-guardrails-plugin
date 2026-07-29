@@ -53,6 +53,8 @@ def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
         "agw archive file.docx", "agw move old.txt new.txt", "agw rename a.txt b.txt",
         "agw snapshot .", "agw restore file.docx", "agw undo",
         "agw publish report.docx", "agw office set-cell book.xlsx",
+        "agw publish-file --staged out.xlsx --target live.xlsx",
+        "agw unlink-link workspace-link --expected-target workspace",
         "agw file write app.js --content-file app.js.new",
         "agw run --output tracker.xlsx -- node build_tracker.mjs",
     )

@@ -119,6 +119,21 @@ def test_mkdir_existing_directory_needs_no_preimage(tmp_path):
     assert plan.targets == []
 
 
+def test_read_only_chain_with_powershell_null_redirect_needs_no_preimage(tmp_path):
+    command = (
+        "git status --short; git branch --show-current; "
+        "rg --files -g 'AGENTS.md'; "
+        "rg -n 'set-cell|publish' plugin tests 2>$null"
+    )
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="shell_command", command=command,
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.complete is True
+    assert plan.mutating is False
+    assert plan.targets == []
+
+
 @pytest.mark.parametrize("command", [
     "mkdir -pv archive",
     "mkdir -m 700 archive",

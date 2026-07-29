@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.6` is the Windows-first stable release.
+> **Release status:** `0.3.7` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -26,9 +26,9 @@ don't fire there. Tracking:
   So is every file a raw shell `>`, `mv`, `cp`, or `tee` would clobber, so the
   promise holds even when the agent bypasses the Write tool.
 - Office documents are edited via **CRUA** (Create, Read, Update, **Archive**):
-  the agent works on a markdown/csv copy in `_workspace/`, and `agw publish`
-  archives the old version before replacing the original, with conflict
-  detection if a human edited it in the meantime.
+  Excel checkout defaults to a style-preserving `.xlsx` working copy, while
+  explicitly requested CSV checkout is labeled lossy. `agw publish` snapshots
+  the old version and performs a hash-guarded atomic replacement.
 - Cloud-only placeholder files and `.gdoc` pointer stubs (the classic synced-
   folder data-loss traps) are detected and protected.
 - Anything archived comes back with `agw restore` or `agw undo`.
@@ -60,9 +60,9 @@ guard and a smoke test to confirm interception on your build — is in
 
 Python 3.9+. Windows hooks require it as `python`; the bundled `agw.cmd`
 launcher tries `python` and then `py.exe -3`. POSIX hooks try `python3` and
-then `python`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
-(xlsx→csv) for high-fidelity document checkout; without them files are checked
-out in plain-copy mode. Fleet rollout: see
+then `python`. Optional converters support document-to-markdown and explicit
+Excel data export. Style-preserving `.xlsx` checkout does not convert the
+workbook. Fleet rollout: see
 [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md).
 
 ## Updating
@@ -100,10 +100,13 @@ so the agent self-corrects instead of fighting the rails:
 | Instead of | The agent uses |
 |---|---|
 | `rm file` | `agw archive file` (reversible) |
+| unlinking a Windows junction | `agw unlink-link LINK --expected-target TARGET` |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
+| rebuilding a styled workbook | `agw checkout workbook.xlsx --mode preserve` → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
-| opaque write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
+| opaque write-capable script | `agw run --output PATH --output-root DIR --output-pattern '*.sidecar' -- command` |
+| replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 
 Structured Office operations are also available:
 
@@ -143,8 +146,10 @@ hashes. `ensure-table` is idempotent and can create an explicitly requested
 sheet or convert an explicit rectangular range. Appends can enforce atomic
 single or composite uniqueness with `--unique-column` or
 `--unique-columns-json`. Read-only inspection reports detected preservation
-risks; mutation refuses unsupported or lossy OOXML. Excel table writes support
-`.xlsx`; macro-enabled and unsupported complex OOXML files are refused. Word
+risks; mutation refuses unsupported or lossy OOXML. A cell-only `set-cell` can
+use a surgical adapter that retains x14/x15 extension content and every
+unrelated OOXML part. Excel table writes support `.xlsx`; macro-enabled and
+unsupported complex OOXML files are refused. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
@@ -152,8 +157,12 @@ Ordinary UTF-8 files can be constructed or changed atomically with `agw file
 write`, `patch`, and `replace`. These operations accept expected hashes, support
 dry runs, publish through same-directory stages, and record verified pre-images
 or ABSENT tombstones. `agw run` executes a command only after every declared
-output has been hash-checked and snapshotted; compact, bounded stdout/stderr tails
-are included in JSON results.
+output has been hash-checked and snapshotted. Bounded output-root manifests
+detect undeclared sidecars; intentional companion files can be declared with
+relative patterns. Compact, bounded stdout/stderr tails are included in JSON
+results. `publish-file` validates a staged hash, captures one target pre-image,
+retries only atomic replacement for a bounded interval, and preserves the stage
+when a sync client keeps the target busy.
 
 Folder scans are metadata-only and hard-bounded by a parent process. Use
 `agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,

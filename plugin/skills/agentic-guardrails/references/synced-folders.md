@@ -18,4 +18,7 @@ then scan again. Leave conflict copies, upload temporaries, and Office lock file
 untouched unless the user explicitly identifies one as the target.
 
 Prefer staged, atomic publishing over long-running in-place writes in a synced
-tree. Keep the Guardrails archive store outside the synced root.
+tree. Use `publish-file` to validate and hash a temporary artifact before one
+recoverable atomic replacement. Busy/sharing-violation retries are bounded; a
+failed publish leaves the live target unchanged and preserves the staged output.
+Keep the Guardrails archive store outside the synced root.
