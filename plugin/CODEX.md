@@ -13,8 +13,8 @@ see [`../docs/HOST_PARITY.md`](../docs/HOST_PARITY.md).
 | Pre/Post-tool hooks | `PreToolUse` / `PostToolUse` | same event names + JSON schema |
 | Block / ask / allow | `permissionDecision` | identical |
 | Session context | `SessionStart` | identical |
-| Skills | `skills/*/SKILL.md` | same files, listed in `.codex-plugin/plugin.json` |
-| Slash commands | `commands/*.md` | `codex-prompts/*.md` → `~/.codex/prompts/` |
+| Skill | `skills/agentic-guardrails/SKILL.md` | compact router; loads safety references progressively |
+| Command discovery | CLI `--help` hierarchy | progressively scoped; no duplicated prompt catalog |
 | `agw` CLI | `bin/agw` on POSIX, `bin/agw.cmd` on Windows | same |
 
 ### The one real difference: `apply_patch`
@@ -47,16 +47,14 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    reads `.agents/plugins/marketplace.json` at the repo root (it also accepts the
    legacy `.claude-plugin/marketplace.json`), resolves the `git-subdir` source to
    the `plugin/` directory, then loads `.codex-plugin/plugin.json` and its
-   the manifest-selected `hooks/hooks-codex.json`. To pull a later version:
+   manifest-selected `hooks/hooks-codex.json`. To pull a later version:
    `codex plugin marketplace upgrade`
    (the bumped `version` in `.codex-plugin/plugin.json` busts the cache).
 2. **Trust the hooks** - Codex requires command hooks to be trusted before they
    run. Run `/hooks` inside Codex and trust `agentic-guardrails`. (Enterprise:
    ship them as managed hooks via `requirements.toml` to skip the prompt.)
-3. **Prompts (optional)** - copy `codex-prompts/*.md` into `~/.codex/prompts/`
-   to get `/prompts:agw-status`, `/prompts:agw-publish`, `/prompts:agw-restore`,
-   `/prompts:guardrails-report`. These are user-level in Codex; plugins bundle
-   skills and hooks but not slash commands.
+3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
+   Operational syntax is not duplicated into user-level prompts.
 4. **`agw` on PATH (optional)** - add `plugin/bin` to PATH. Use `bin/agw` on
    POSIX and `bin/agw.cmd` on Windows. The Windows launcher invokes Python
    explicitly and never asks Windows to open a `.py` file by file association.

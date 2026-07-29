@@ -1429,7 +1429,7 @@ def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
             decisions.append(Decision(DENY, "This is a Google Docs pointer stub — it has no "
                                             "document content and editing it corrupts the "
                                             "link. Use the Drive connector to export the "
-                                            "doc (see the gdocs-bridge skill).",
+                                            "doc through a Google connector/export workflow.",
                                       "builtin:gdoc-stub"))
             continue
         if prof.is_placeholder(p):
