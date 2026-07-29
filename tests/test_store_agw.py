@@ -22,7 +22,7 @@ def run_agw(*args, env=None, check=True):
     if env:
         e.update(env)
     result = subprocess.run([sys.executable, AGW, *args],
-                            capture_output=True, text=True, env=e)
+                            capture_output=True, text=True, encoding="utf-8", env=e)
     if check and result.returncode != 0:
         raise AssertionError(f"agw {' '.join(args)} failed: {result.stderr}")
     return result
@@ -291,6 +291,65 @@ def test_scan_local_folder_completes_quickly(tmp_path):
     assert data["complete"] is True
     assert data["files_inspected"] == 2
     assert wall_elapsed < 2.0
+
+
+def test_scan_emoji_path_overrides_legacy_worker_encoding(tmp_path):
+    folder = tmp_path / "Clients 👥"
+    folder.mkdir()
+    (folder / "record.txt").write_text("metadata", encoding="utf-8")
+    result = run_agw(
+        "scan", str(folder), "--fast", "--json",
+        env={"PYTHONIOENCODING": "cp1252"}, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["complete"] is True
+    assert data["files_inspected"] == 1
+    assert data["path"] == str(folder)
+    assert data["worker_cleanup"] == "complete"
+
+
+def test_worker_json_emission_has_ascii_escape_fallback(monkeypatch):
+    class LegacyStream:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, value):
+            if any(ord(char) > 127 for char in value):
+                raise UnicodeEncodeError("cp1252", value, 0, 1, "unsupported")
+            self.writes.append(value)
+
+        def flush(self):
+            pass
+
+    stream = LegacyStream()
+    monkeypatch.setattr(scan_worker.sys, "stdout", stream)
+    scan_worker._write_json_line({"path": "Clients 👥"})
+    assert len(stream.writes) == 1
+    assert "\\ud83d\\udc65" in stream.writes[0]
+    assert json.loads(stream.writes[0])["path"] == "Clients 👥"
+
+
+def test_unexplained_worker_exit_includes_bounded_stderr_tail(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_TEST_MODE", "1")
+    request = _scan_request(tmp_path, seconds=2.0, no_size=True)
+    request["_test_worker_exit"] = 17
+    request["_test_worker_stderr"] = \
+        "discarded-prefix-" + ("x" * 100_000) + " actionable-tail 👥"
+    result, fatal = scan_worker.run_bounded_scan(request)
+
+    assert fatal is None
+    assert result["complete"] is False
+    assert result["stop_reason"] == "worker_error"
+    assert result["worker_cleanup"] == "complete"
+    assert not _pid_exists(result["_worker_pid"])
+    error = result["errors"][0]
+    assert error["error"] == "WorkerExited"
+    assert error["returncode"] == 17
+    assert error["detail"].endswith("actionable-tail 👥")
+    assert len(error["detail"]) <= scan_worker.MAX_STDERR_TAIL_CHARS
+    assert "discarded-prefix" not in error["detail"]
 
 
 def test_scan_filesystem_error_is_structured_json(tmp_path):

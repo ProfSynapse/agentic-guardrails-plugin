@@ -18,6 +18,7 @@ from core import profiles
 
 MAX_REPORTED_ENTRIES = 50
 MAX_EXTENSION_KEYS = 200
+MAX_STDERR_TAIL_CHARS = 2048
 IGNORED_DIRECTORIES = {"_workspace", ".git", "node_modules"}
 FATAL_EXIT_CODES = {
     "path_not_found": 10,
@@ -253,20 +254,28 @@ def scan_in_process(
 def _worker_cli() -> int:
     request = None
     try:
+        for stream in (sys.stdin, sys.stdout):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="strict")
+            except (AttributeError, ValueError):
+                pass
         raw = sys.stdin.buffer.readline(1024 * 1024 + 1)
         if not raw or len(raw) > 1024 * 1024:
             return 2
         request = json.loads(raw.decode("utf-8"))
+
+        if os.environ.get("AGW_TEST_MODE") == "1" \
+                and request.get("_test_worker_exit"):
+            sys.stderr.write(str(request.get("_test_worker_stderr", "worker test exit")))
+            sys.stderr.flush()
+            return int(request.get("_test_worker_exit"))
 
         def emit(kind, payload):
             message = _message(
                 kind, payload["result"], request,
                 **{key: value for key, value in payload.items() if key != "result"},
             )
-            sys.stdout.write(json.dumps(
-                message, ensure_ascii=False, separators=(",", ":")
-            ) + "\n")
-            sys.stdout.flush()
+            _write_json_line(message)
 
         _result, fatal = scan_in_process(request, emit=emit)
         return FATAL_EXIT_CODES.get(fatal["code"], 13) if fatal else 0
@@ -277,12 +286,24 @@ def _worker_cli() -> int:
         result["complete"] = False
         result["stop_reason"] = "worker_error"
         _record_error(result, ".", exc)
-        sys.stdout.write(json.dumps(
-            _message("final", result, request), ensure_ascii=False,
-            separators=(",", ":"),
-        ) + "\n")
-        sys.stdout.flush()
+        _write_json_line(_message("final", result, request))
         return 1
+
+
+def _write_json_line(payload: dict) -> None:
+    """Emit UTF-8 IPC, escaping non-ASCII only if the stream rejects it."""
+    try:
+        line = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"),
+        ) + "\n"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        line = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"),
+        ) + "\n"
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def _drain(messages: queue.Queue, latest: dict):
@@ -333,16 +354,24 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
         if os.name == "nt" else 0
     process = None
     reader = None
+    stderr_reader = None
+    stderr_parts = []
+    stderr_lock = threading.Lock()
     try:
+        worker_env = os.environ.copy()
+        worker_env["PYTHONUTF8"] = "1"
+        worker_env["PYTHONIOENCODING"] = "utf-8"
         process = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--worker"],
+            [sys.executable, "-X", "utf8", os.path.abspath(__file__), "--worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            env=worker_env,
         )
 
         def read_messages():
@@ -362,6 +391,23 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
 
         reader = threading.Thread(target=read_messages, daemon=True)
         reader.start()
+
+        def read_stderr():
+            try:
+                while True:
+                    chunk = process.stderr.read(1024)
+                    if not chunk:
+                        break
+                    with stderr_lock:
+                        stderr_parts.append(chunk)
+                        combined = "".join(stderr_parts)
+                        if len(combined) > MAX_STDERR_TAIL_CHARS:
+                            stderr_parts[:] = [combined[-MAX_STDERR_TAIL_CHARS:]]
+            except (OSError, ValueError):
+                pass
+
+        stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+        stderr_reader.start()
         process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
         process.stdin.close()
         while time.monotonic() < worker_deadline and final is None and fatal is None:
@@ -401,8 +447,12 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
                 pass
         if reader is not None:
             reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if stderr_reader is not None:
+            stderr_reader.join(timeout=max(0.0, deadline - time.monotonic()))
         if process is not None and process.stdout is not None:
             process.stdout.close()
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
         if process is not None and process.stdin is not None:
             process.stdin.close()
 
@@ -445,8 +495,18 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
         else:
             latest["complete"] = False
             latest["stop_reason"] = "worker_error"
-            if not latest["errors"]:
-                latest["errors"].append({"path": ".", "error": "WorkerExited"})
+            with stderr_lock:
+                stderr_tail = "".join(stderr_parts)[-MAX_STDERR_TAIL_CHARS:].strip()
+            error = {
+                "path": ".", "error": "WorkerExited",
+                "returncode": process.returncode if process is not None else None,
+            }
+            if stderr_tail:
+                error["detail"] = stderr_tail
+            if len(latest["errors"]) >= MAX_REPORTED_ENTRIES:
+                latest["errors"][-1] = error
+            else:
+                latest["errors"].append(error)
             final = latest
 
     elapsed = max(0.0, time.monotonic() - request["started_at"])
