@@ -111,11 +111,15 @@ def transaction_status() -> list[dict]:
 _LOSSY_WARNING = re.compile(
     r"(?i)(?:not supported|unsupported|will be removed|cannot be preserved|lossy|extension)"
 )
-_EXTENSION_MARKERS = (
-    b"<extLst", b":extLst", b"/office/spreadsheetml/2009/9/",
-    b"/office/spreadsheetml/2010/11/", b"/office/spreadsheetml/2014/",
-    b"/office/spreadsheetml/2016/", b"/office/drawing/2010/",
+_EXTENSION_NAMESPACE_MARKERS = (
+    "/office/spreadsheetml/2009/9/", "/office/spreadsheetml/2010/11/",
+    "/office/spreadsheetml/2014/", "/office/spreadsheetml/2016/",
+    "/office/drawing/2010/",
 )
+_SAFE_METADATA_ATTRIBUTES = {
+    ("http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac", "knownFonts"),
+    ("http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac", "dyDescent"),
+}
 _KNOWN_LOSSY_PART_PREFIXES = (
     "xl/slicers/", "xl/slicerCaches/", "xl/timelines/",
     "xl/timelineCaches/", "xl/persons/", "xl/threadedComments/",
@@ -147,6 +151,79 @@ def _run_capturing_warnings(callback, phase: str):
     return value
 
 
+def _qualified_name(value: str) -> tuple[str, str]:
+    if value.startswith("{") and "}" in value:
+        namespace, local = value[1:].split("}", 1)
+        return namespace, local
+    return "", value
+
+
+def _extension_descriptors(payload: bytes) -> list[dict]:
+    """Describe extension nodes/namespaces while ignoring proven-safe metadata."""
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError:
+        return [{"extension_uri": "", "namespaces": [], "elements": [],
+                 "parse_error": True}]
+    descriptors = []
+    seen = set()
+    ext_lists = []
+    for node in root.iter():
+        namespace, local = _qualified_name(node.tag)
+        if local == "extLst":
+            ext_lists.append(node)
+        if local == "ext":
+            uri = str(node.attrib.get("uri", ""))
+            child_namespaces = sorted({
+                _qualified_name(child.tag)[0]
+                for child in node.iter() if child is not node
+                and _qualified_name(child.tag)[0]
+            })
+            elements = sorted({
+                _qualified_name(child.tag)[1]
+                for child in node.iter() if child is not node
+            })
+            key = (uri, tuple(child_namespaces), tuple(elements))
+            if key not in seen:
+                seen.add(key)
+                descriptors.append({
+                    "extension_uri": uri,
+                    "namespaces": child_namespaces,
+                    "elements": elements,
+                })
+        if namespace and any(marker in namespace
+                             for marker in _EXTENSION_NAMESPACE_MARKERS):
+            key = ("", (namespace,), (local,))
+            if key not in seen:
+                seen.add(key)
+                descriptors.append({
+                    "extension_uri": "", "namespaces": [namespace],
+                    "elements": [local],
+                })
+        for attribute in node.attrib:
+            attr_namespace, attr_local = _qualified_name(attribute)
+            if not attr_namespace or not any(
+                    marker in attr_namespace
+                    for marker in _EXTENSION_NAMESPACE_MARKERS):
+                continue
+            if (attr_namespace, attr_local) in _SAFE_METADATA_ATTRIBUTES:
+                continue
+            key = ("", (attr_namespace,), (f"@{attr_local}",))
+            if key not in seen:
+                seen.add(key)
+                descriptors.append({
+                    "extension_uri": "", "namespaces": [attr_namespace],
+                    "elements": [f"@{attr_local}"],
+                })
+    if ext_lists and not any(item.get("extension_uri") for item in descriptors):
+        key = ("", (), ("extLst",))
+        if key not in seen:
+            descriptors.append({
+                "extension_uri": "", "namespaces": [], "elements": ["extLst"],
+            })
+    return descriptors
+
+
 def inspect_preservation_risks(path: str) -> list[dict]:
     """Return known OOXML features that common Python libraries lose on save."""
     risks = []
@@ -169,16 +246,121 @@ def inspect_preservation_risks(path: str) -> list[dict]:
                 continue
             with package.open(item) as handle:
                 sample = handle.read(min(item.file_size, 8 * 1024 * 1024))
-            if any(marker in sample for marker in _EXTENSION_MARKERS):
-                key = ("unsupported_ooxml_extension", lower)
-                if key not in seen:
-                    seen.add(key)
-                    risks.append({
-                        "code": key[0], "feature": "extension list",
-                        "part": name,
-                        "message": "the part contains an OOXML extension that may be removed on save",
-                    })
+            descriptors = _extension_descriptors(sample)
+            for descriptor in descriptors:
+                key = (
+                    "unsupported_ooxml_extension", lower,
+                    descriptor.get("extension_uri", ""),
+                    tuple(descriptor.get("namespaces", [])),
+                    tuple(descriptor.get("elements", [])),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                risks.append({
+                    "code": key[0], "feature": "OOXML extension",
+                    "part": name,
+                    "extension_uri": descriptor.get("extension_uri", ""),
+                    "namespaces": descriptor.get("namespaces", []),
+                    "elements": descriptor.get("elements", []),
+                    **({"parse_error": True} if descriptor.get("parse_error") else {}),
+                    "message": (
+                        "the part contains an OOXML extension that may be removed "
+                        "on save"
+                    ),
+                })
     return risks
+
+
+def normalize_safe_metadata(
+    path: str,
+    output: str,
+    *,
+    expected_sha256: str = "",
+    expected_output_sha256: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Remove only allowlisted compatibility metadata into a guarded output."""
+    from file_ops import publish_staged_file
+
+    source = os.path.abspath(os.path.expanduser(path))
+    output = os.path.abspath(os.path.expanduser(output))
+    _package_preflight(source, mutating=False)
+    if os.path.splitext(source)[1].lower() not in {".xlsx", ".xlsm"}:
+        raise UnsupportedOfficeFile("normalize currently supports Excel OOXML files")
+    risks = inspect_preservation_risks(source)
+    if risks:
+        raise PreservationError(risks)
+    before = store.file_sha256(source)
+    if expected_sha256 and before.lower() != expected_sha256.lower():
+        raise TransactionConflict("CONFLICT: input file hash does not match expected version")
+    if not os.path.isdir(os.path.dirname(output)):
+        raise UnsupportedOfficeFile("normalize output directory does not exist")
+
+    fd, stage = tempfile.mkstemp(
+        prefix=".agw-office-normalize-",
+        suffix=os.path.splitext(output)[1] or ".xlsx",
+        dir=os.path.dirname(output),
+    )
+    os.close(fd)
+    removed = []
+    try:
+        with zipfile.ZipFile(source) as package, zipfile.ZipFile(
+                stage, "w", zipfile.ZIP_DEFLATED) as normalized:
+            normalized.comment = package.comment
+            for item in package.infolist():
+                payload = package.read(item)
+                if item.filename.lower().endswith(".xml"):
+                    prefixes = re.findall(
+                        rb'xmlns:([A-Za-z_][\w.-]*)="'
+                        rb'http://schemas\.microsoft\.com/office/'
+                        rb'spreadsheetml/2009/9/ac"',
+                        payload,
+                    )
+                    for prefix in prefixes:
+                        for attribute in (b"knownFonts", b"dyDescent"):
+                            pattern = re.compile(
+                                rb"\s+" + re.escape(prefix) + rb":" + attribute
+                                + rb'="[^"]*"'
+                            )
+                            payload, count = pattern.subn(b"", payload)
+                            if count:
+                                removed.append({
+                                    "part": item.filename,
+                                    "namespace": (
+                                        "http://schemas.microsoft.com/office/"
+                                        "spreadsheetml/2009/9/ac"
+                                    ),
+                                    "attribute": attribute.decode("ascii"),
+                                    "count": count,
+                                })
+                normalized.writestr(item, payload)
+        _package_preflight(stage, mutating=False)
+        staged_risks = inspect_preservation_risks(stage)
+        if staged_risks:
+            raise PreservationError(staged_risks)
+        if store.file_sha256(source) != before:
+            raise TransactionConflict("CONFLICT: input file changed during normalization")
+        published = publish_staged_file(
+            output, stage, expected_hash=expected_output_sha256,
+            dry_run=dry_run, operation="office-normalize",
+        )
+        if published.get("changed") and not published.get("dry_run"):
+            stage = ""
+        return {
+            "input": source, "output": output,
+            "input_hash": before,
+            "removed_safe_metadata": removed,
+            "removed_count": sum(item["count"] for item in removed),
+            "preservation": {"safe_to_mutate": True, "risks": []},
+            **published,
+        }
+    finally:
+        if stage and os.path.exists(stage):
+            try:
+                os.unlink(stage)
+            except OSError:
+                pass
 
 
 def _relationship_set(payload: bytes) -> set[tuple[str, str, str]]:

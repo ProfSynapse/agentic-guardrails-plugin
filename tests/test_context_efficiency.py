@@ -48,10 +48,27 @@ def test_one_discoverable_skill_with_progressive_references():
 
 def test_always_on_context_is_small_and_has_no_operation_catalog():
     for context in (claude_start.CONTEXT, codex_start.CONTEXT):
-        assert len(context) < LEGACY_SESSION_CONTEXT_CHARS * 0.45
-        assert len(context.split()) <= 230
+        assert len(context) < LEGACY_SESSION_CONTEXT_CHARS * 0.60
+        assert len(context.split()) <= 330
         assert "append-table-row" not in context
         assert "office <operation>" in context
+
+
+def test_always_on_context_encodes_operating_principles():
+    for context in (claude_start.CONTEXT, codex_start.CONTEXT):
+        lower = context.lower()
+        assert "resolve exact targets" in lower
+        assert "name every target literally" in lower
+        assert "variables, globs" in lower
+        assert "separate discovery/read" in lower
+        assert "do not bundle unrelated writes" in lower
+        assert "smallest reversible operation" in lower
+        assert "declare every output" in lower
+        assert "block or ask as constraint information" in lower
+        assert "retry only with a simpler, exact operation" in lower
+        assert "request it once" in lower
+        assert "stop on conflicts" in lower
+        assert "instead of forcing" in lower
 
 
 def test_help_progressively_excludes_unrelated_options():
@@ -88,10 +105,25 @@ def test_common_office_help_paths_reduce_tokens_without_extra_round_trip():
 def test_each_office_leaf_help_is_bounded_and_single_purpose():
     operations = (
         "info", "get-text", "replace-text", "set-cell", "append-rows",
-        "read-table", "ensure-table", "append-table-row", "update-table-row",
-        "outline", "read-blocks", "patch",
+        "read-table", "read-range", "validate-formulas", "normalize",
+        "ensure-table", "append-table-row", "update-table-row", "outline",
+        "read-blocks", "patch",
     )
     for operation in operations:
         output = _help("office", operation)
         assert len(output) <= 2_200, operation
         assert f"agw office {operation}" in output
+
+
+def test_file_and_run_help_are_progressive_and_compact():
+    family = _help("file")
+    write = _help("file", "write")
+    run = _help("run")
+    assert len(family) <= 700
+    assert "--content-file" not in family
+    assert "--content-file" in write
+    assert "--patch" not in write
+    assert "--output" in run
+    assert "--expected-hash" in run
+    assert len(write) <= 1_000
+    assert len(run) <= 800

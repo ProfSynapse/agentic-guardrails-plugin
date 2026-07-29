@@ -5,6 +5,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import re
 import warnings
 from typing import Optional
 
@@ -23,6 +24,9 @@ MAX_INSPECTED_CELLS = 2_000_000
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 MAX_RETURNED_CELLS = 10_000
+_EXTERNAL_FORMULA_RE = re.compile(
+    r"(?i)(?:\[[^\]]+\.(?:xlsx|xlsm|xlsb|xls)\]|\[\d+\][^!]*!)"
+)
 
 
 class ExcelError(Exception):
@@ -210,13 +214,21 @@ def read_table(
     offset: int = 0,
     limit: int = DEFAULT_LIMIT,
     values_only: bool = False,
+    include_formulas: bool = False,
 ) -> dict:
     if offset < 0 or limit < 1 or limit > MAX_LIMIT:
         raise ExcelError(f"offset must be >= 0 and limit must be 1..{MAX_LIMIT}")
     office_tx._package_preflight(path, mutating=False)
-    wb, risks = _load_for_read(path, data_only=values_only)
+    wb, risks = _load_for_read(
+        path, data_only=(values_only and not include_formulas)
+    )
+    cached_wb = None
     try:
         ws, table = _find_table(wb, table_name, sheet)
+        cached_ws = None
+        if include_formulas:
+            cached_wb, _cached_risks = _load_for_read(path, data_only=True)
+            cached_ws, _cached_table = _find_table(cached_wb, table_name, sheet)
         headers = _table_headers(ws, table)
         selected = columns or headers
         unknown = [name for name in selected if name not in headers]
@@ -234,17 +246,35 @@ def read_table(
         data_end = max_row - _totals_count(table)
         indexes = {name: min_col + headers.index(name) for name in headers}
         matched = []
+        value_ws = cached_ws or ws
         for row_no in range(min_row + 1, data_end + 1):
-            if all(_json_value(ws.cell(row_no, indexes[key]).value,
-                               ws.cell(row_no, indexes[key])) == expected
+            if all(_json_value(value_ws.cell(row_no, indexes[key]).value,
+                               value_ws.cell(row_no, indexes[key])) == expected
                    for key, expected in where.items()):
                 matched.append(row_no)
         page = matched[offset:offset + limit]
-        rows = [
-            [_json_value(ws.cell(row_no, indexes[name]).value,
-                         ws.cell(row_no, indexes[name])) for name in selected]
-            for row_no in page
-        ]
+        rows = []
+        for row_no in page:
+            row = []
+            for name in selected:
+                formula_cell = ws.cell(row_no, indexes[name])
+                if include_formulas:
+                    cached_cell = cached_ws.cell(row_no, indexes[name])
+                    formula = formula_cell.value if (
+                        formula_cell.data_type == "f"
+                        or (isinstance(formula_cell.value, str)
+                            and formula_cell.value.startswith("="))
+                    ) else None
+                    row.append({
+                        "value": _json_value(
+                            cached_cell.value if formula else formula_cell.value,
+                            cached_cell if formula else formula_cell,
+                        ),
+                        "formula": formula,
+                    })
+                else:
+                    row.append(_json_value(formula_cell.value, formula_cell))
+            rows.append(row)
         return {
             "hash": store.file_sha256(path),
             "table": table.displayName,
@@ -257,9 +287,131 @@ def read_table(
             "more": offset + len(rows) < len(matched),
             "row_count": max(0, data_end - min_row),
             "preservation": _preservation_result(risks),
-            **({"cached_values_may_be_stale": True} if values_only else {}),
+            **({"cached_values_may_be_stale": True}
+               if values_only or include_formulas else {}),
+            **({"formula_mode": "value_and_formula"} if include_formulas else {}),
         }
     finally:
+        if cached_wb is not None:
+            cached_wb.close()
+        wb.close()
+
+
+def read_range(
+    path: str,
+    sheet: str,
+    cell_range: str,
+    *,
+    include_formulas: bool = False,
+) -> dict:
+    office_tx._package_preflight(path, mutating=False)
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    except (TypeError, ValueError) as exc:
+        raise ExcelError("range must be a finite A1 rectangle") from exc
+    cells = (max_col - min_col + 1) * (max_row - min_row + 1)
+    if cells < 1 or cells > MAX_RETURNED_CELLS:
+        raise ExcelError(
+            f"range must contain 1..{MAX_RETURNED_CELLS} cells"
+        )
+    wb, risks = _load_for_read(path, data_only=False)
+    cached_wb = None
+    try:
+        ws = _sheet_by_name(wb, sheet)
+        if ws is None:
+            raise ExcelError(f"no worksheet named {sheet!r}")
+        cached_ws = None
+        if include_formulas:
+            cached_wb, _cached_risks = _load_for_read(path, data_only=True)
+            cached_ws = _sheet_by_name(cached_wb, sheet)
+        rows = []
+        for row_no in range(min_row, max_row + 1):
+            row = []
+            for col_no in range(min_col, max_col + 1):
+                cell = ws.cell(row_no, col_no)
+                if include_formulas:
+                    cached = cached_ws.cell(row_no, col_no)
+                    formula = cell.value if (
+                        cell.data_type == "f"
+                        or (isinstance(cell.value, str) and cell.value.startswith("="))
+                    ) else None
+                    row.append({
+                        "value": _json_value(
+                            cached.value if formula else cell.value,
+                            cached if formula else cell,
+                        ),
+                        "formula": formula,
+                    })
+                else:
+                    row.append(_json_value(cell.value, cell))
+            rows.append(row)
+        return {
+            "hash": store.file_sha256(path), "sheet": ws.title,
+            "range": cell_range, "rows": rows, "cell_count": cells,
+            "preservation": _preservation_result(risks),
+            **({"formula_mode": "value_and_formula",
+                "cached_values_may_be_stale": True} if include_formulas else {}),
+        }
+    finally:
+        if cached_wb is not None:
+            cached_wb.close()
+        wb.close()
+
+
+def validate_formulas(path: str, *, offset: int = 0,
+                      limit: int = DEFAULT_LIMIT) -> dict:
+    if offset < 0 or limit < 1 or limit > MAX_LIMIT:
+        raise ExcelError(f"offset must be >= 0 and limit must be 1..{MAX_LIMIT}")
+    office_tx._package_preflight(path, mutating=False)
+    wb, risks = _load_for_read(path, data_only=False)
+    cached_wb = None
+    try:
+        cached_wb, _cached_risks = _load_for_read(path, data_only=True)
+        formulas = []
+        for ws in wb.worksheets:
+            cached_ws = _sheet_by_name(cached_wb, ws.title)
+            bounds = _actual_bounds(ws)
+            if not bounds.get("used_range"):
+                continue
+            min_col, min_row, max_col, max_row = range_boundaries(
+                bounds["used_range"]
+            )
+            for row_no in range(min_row, max_row + 1):
+                for col_no in range(min_col, max_col + 1):
+                    cell = ws.cell(row_no, col_no)
+                    if cell.data_type != "f" and not (
+                            isinstance(cell.value, str) and cell.value.startswith("=")):
+                        continue
+                    cached = cached_ws.cell(row_no, col_no)
+                    formulas.append({
+                        "sheet": ws.title, "cell": cell.coordinate,
+                        "formula": cell.value,
+                        "cached_value": _json_value(cached.value, cached),
+                        "cached_value_missing": cached.value is None,
+                        "external_reference": (
+                            isinstance(cell.value, str)
+                            and bool(_EXTERNAL_FORMULA_RE.search(cell.value))
+                        ),
+                    })
+        page = formulas[offset:offset + limit]
+        missing = sum(item["cached_value_missing"] for item in formulas)
+        external = sum(item["external_reference"] for item in formulas)
+        return {
+            "hash": store.file_sha256(path),
+            "validation": "structural_only",
+            "calculation_performed": False,
+            "formula_count": len(formulas),
+            "missing_cached_values": missing,
+            "external_references": external,
+            "formulas": page,
+            "offset": offset, "returned": len(page),
+            "more": offset + len(page) < len(formulas),
+            "valid": external == 0,
+            "preservation": _preservation_result(risks),
+        }
+    finally:
+        if cached_wb is not None:
+            cached_wb.close()
         wb.close()
 
 
@@ -279,7 +431,8 @@ def _coerce(value, *, date_column: bool = False, coerce_iso_dates: bool = False)
         if not formula.startswith("="):
             raise ExcelError("explicit formula must start with '='")
         lowered = formula.lower()
-        if any(token in lowered for token in ("[", "dde(", "http:", "https:")):
+        if (_EXTERNAL_FORMULA_RE.search(formula)
+                or any(token in lowered for token in ("dde(", "http:", "https:"))):
             raise ExcelError("external-reference formulas are unsupported")
         return formula
     if isinstance(value, str) and value.startswith("="):

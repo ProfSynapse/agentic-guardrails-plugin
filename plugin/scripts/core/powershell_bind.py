@@ -77,7 +77,9 @@ _SPECS = {
         frozenset({"new-item", "mkdir", "md", "ni"}),
         ("path",), frozenset({"path"}),
         frozenset(_COMMON_SWITCHES),
-        frozenset(_COMMON_VALUES | {"path", "literalpath", "itemtype", "value"}),
+        frozenset(_COMMON_VALUES | {
+            "path", "literalpath", "itemtype", "value", "target",
+        }),
         {"literalpath": "path"},
     ),
 }
@@ -144,8 +146,6 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
         token = args[i]
         if token == "--%":
             return _incomplete("PowerShell stop-parsing prevents safe target binding")
-        if token.startswith("@") or "$" in token:
-            return _incomplete("PowerShell dynamic values or splatting prevent safe target binding")
         if token.startswith("-") and token != "-":
             raw = token[1:]
             attached = None
@@ -171,17 +171,11 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
                 i += 2
             else:
                 i += 1
-            if not _literal(attached):
-                return _incomplete(
-                    f"PowerShell parameter '-{raw}' does not have a static literal value"
-                )
             role = spec.role_aliases.get(parameter, parameter)
             if role in named and named[role] != attached:
                 return _incomplete(f"PowerShell parameter '{role}' is specified more than once")
             named[role] = attached
             continue
-        if not _literal(token):
-            return _incomplete("PowerShell positional binding contains a dynamic expression")
         positionals.append(token)
         i += 1
 
@@ -197,13 +191,27 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
         value = bound.get(role)
         if not value:
             return _incomplete(f"PowerShell command did not identify a literal {role}")
+        if not _literal(value):
+            return _incomplete(
+                f"PowerShell {role} does not have a static literal value"
+            )
         targets.append(value)
 
     result = BindingResult(recognized=True, targets=targets,
                            append="append" in switches)
     if canonical in {"copy-item", "move-item"}:
         source = bound.get("path")
-        if not source:
-            return _incomplete("PowerShell command did not identify a literal source path")
+        if not source or not _literal(source):
+            return _incomplete(
+                "PowerShell source path uses a dynamic value or wildcard"
+            )
+        result.sources.append(source)
+    if canonical == "new-item" and str(bound.get("itemtype", "")).lower() in {
+            "symboliclink", "junction"}:
+        source = bound.get("target")
+        if not source or not _literal(source):
+            return _incomplete(
+                "PowerShell link creation did not identify a literal target path"
+            )
         result.sources.append(source)
     return result

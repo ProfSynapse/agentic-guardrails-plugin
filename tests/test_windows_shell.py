@@ -262,6 +262,22 @@ def test_powershell_binding_does_not_treat_named_values_as_targets(tmp_path):
     assert os.path.normpath(str(changed)) not in targets
 
 
+@pytest.mark.parametrize("content", [
+    "pairs.map(([old,id,name]) => value)",
+    "[[formula]]",
+    "literal*content?[not-a-path]",
+])
+def test_powershell_literal_path_ignores_value_syntax(content, tmp_path):
+    victim = tmp_path / "victim.js"
+    victim.write_text("ORIGINAL")
+    targets = engine.clobber_targets(
+        f"Set-Content -LiteralPath victim.js -Value '{content}'",
+        str(tmp_path), include_absent=True, dialect="powershell",
+    )
+    assert targets.complete, targets.reason
+    assert targets == [os.path.normpath(str(victim))]
+
+
 def test_powershell_copy_move_binding_named_positional_alias_and_abbreviation(tmp_path):
     source = tmp_path / "source.txt"
     victim = tmp_path / "victim.txt"
@@ -394,6 +410,54 @@ def test_literal_new_item_directory_has_complete_target(tmp_path):
     assert plan.mutating
     assert plan.complete
     assert plan.targets == [os.path.normcase(os.path.realpath(str(target)))]
+
+
+def test_literal_new_item_junction_has_complete_target(tmp_path):
+    target = tmp_path / "source"
+    junction = tmp_path / "linked"
+    target.mkdir()
+    event = ToolEvent(
+        kind=EXEC,
+        tool="PowerShell",
+        command=(f"New-Item -ItemType Junction -Path '{junction}' "
+                 f"-Target '{target}'"),
+        cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating
+    assert plan.complete, plan.reason
+    assert plan.targets == [os.path.normcase(os.path.realpath(str(junction)))]
+
+
+@pytest.mark.parametrize("command,source", [
+    ("py -3.12 build_tracker.py",
+     "from openpyxl import Workbook\nWorkbook().save('tracker.xlsx')\n"),
+    ("node build_tracker.mjs",
+     "import {writeFileSync} from 'node:fs'; writeFileSync('tracker.xlsx', data);\n"),
+])
+def test_write_capable_script_requires_declared_outputs(
+        command, source, tmp_path):
+    script = tmp_path / command.split()[-1]
+    script.write_text(source, encoding="utf-8")
+    event = ToolEvent(kind=EXEC, tool="PowerShell", command=command,
+                      cwd=str(tmp_path))
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating
+    assert not plan.complete
+    assert "agw run --output" in plan.reason
+
+
+def test_read_only_script_does_not_require_declared_outputs(tmp_path):
+    script = tmp_path / "inspect.py"
+    script.write_text(
+        "from pathlib import Path\nprint(Path('tracker.xlsx').read_bytes())\n",
+        encoding="utf-8",
+    )
+    event = ToolEvent(kind=EXEC, tool="PowerShell",
+                      command="py -3.12 inspect.py", cwd=str(tmp_path))
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete
+    assert not plan.mutating
 
 
 def test_quoted_diagnostic_pattern_is_not_treated_as_mutation(tmp_path):

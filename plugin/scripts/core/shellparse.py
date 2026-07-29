@@ -242,6 +242,39 @@ def redirect_targets(command: str) -> list:
     s = _HEREDOC_RE.sub(" ", command)
     s = _SUBST_RE.sub(" ", s)
     s = re.sub(r">>", "  ", s)  # drop appends before scanning for truncates
+
+    # Quoted command arguments are data. Mask them before looking for redirect
+    # operators, except when the quoted token is itself the redirect target.
+    # Without this boundary, JavaScript such as ``([x]) => value`` inside a
+    # PowerShell ``-Value`` argument is misread as ``> value``.
+    chars = list(s)
+    i = 0
+    while i < len(chars):
+        if chars[i] not in {"'", '"'}:
+            i += 1
+            continue
+        quote = chars[i]
+        previous = i - 1
+        while previous >= 0 and chars[previous].isspace():
+            previous -= 1
+        is_redirect_target = previous >= 0 and chars[previous] == ">"
+        start = i
+        i += 1
+        while i < len(chars):
+            if chars[i] == quote:
+                if quote == "'" and i + 1 < len(chars) and chars[i + 1] == "'":
+                    i += 2
+                    continue
+                if quote == '"' and i > start and chars[i - 1] in {"\\", "`"}:
+                    i += 1
+                    continue
+                i += 1
+                break
+            i += 1
+        if not is_redirect_target:
+            for index in range(start, i):
+                chars[index] = " "
+    s = "".join(chars)
     out = []
     for m in _REDIR_TARGET_RE.finditer(s):
         tok = m.group(1).strip("\"'")

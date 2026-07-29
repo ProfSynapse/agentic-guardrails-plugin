@@ -15,6 +15,13 @@ retry-safe appends. An identical retry is a no-op; a differing duplicate is a
 conflict. Treat publish or hash conflicts as user decisions and never force them
 without explicit authorization.
 
+Use `read-table --include-formulas` when verification needs both cached values
+and underlying formulas. Use bounded `read-range --formulas` for non-table cells,
+and `validate-formulas` for structural formula inventory and cached-value coverage;
+it does not calculate formulas. Preservation risks report exact extension URIs,
+namespaces, elements, and parts. `normalize` removes only explicitly allowlisted
+compatibility metadata and refuses unknown extensions.
+
 On PowerShell, prefer stdin or JSON files over inline structured JSON. Use one
 stdin payload per command. Formula values must remain explicitly typed rather
 than being inferred from arbitrary text.

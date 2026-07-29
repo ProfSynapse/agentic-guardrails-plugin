@@ -32,6 +32,7 @@ PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.di
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 import converters                           # noqa: E402
+import file_ops                             # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
 import scan_worker                          # noqa: E402
@@ -60,6 +61,21 @@ def _office_err(args, exc, default_code: int = 1):
         error_code = getattr(current, "error_code", error_code)
         details = getattr(current, "details", details)
         current = getattr(current, "__cause__", None)
+    message = str(exc)
+    code = 3 if message.startswith("CONFLICT:") or "conflict" in error_code \
+        else default_code
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "ok": False,
+            "error": {"code": error_code, "message": message, "details": details},
+        }, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+        raise SystemExit(code)
+    _err(message, code=code)
+
+
+def _file_err(args, exc, default_code: int = 1):
+    error_code = getattr(exc, "error_code", "file_operation_error")
+    details = getattr(exc, "details", {})
     message = str(exc)
     code = 3 if message.startswith("CONFLICT:") or "conflict" in error_code \
         else default_code
@@ -153,6 +169,24 @@ def _resolve(path: str) -> str:
     if not os.path.exists(p):
         _err(f"path not found: {p}")
     return p
+
+
+def _read_text_payload(path: str, label: str) -> str:
+    if path != "-":
+        return file_ops.read_utf8(path, label)
+    binary = getattr(sys.stdin, "buffer", None)
+    if binary is None:
+        value = sys.stdin.read(file_ops.MAX_TEXT_BYTES + 1)
+        if len(value.encode("utf-8")) > file_ops.MAX_TEXT_BYTES:
+            _err(f"{label}: stdin exceeds the text payload limit")
+        return value.lstrip("\ufeff")
+    payload = binary.read(file_ops.MAX_TEXT_BYTES + 1)
+    if len(payload) > file_ops.MAX_TEXT_BYTES:
+        _err(f"{label}: stdin exceeds the text payload limit")
+    try:
+        return payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        _err(f"{label}: stdin must be UTF-8 text")
 
 
 def _require_archive_store():
@@ -339,9 +373,92 @@ def cmd_archive(args):
         entry = store.archive_file(p, mode="move", reason=args.reason or "agw archive",
                                    actor="agw")
         results.append(entry)
-        print(f"archived {p} -> {entry['dest']}")
+        if not getattr(args, "json", False):
+            print(f"archived {p} -> {entry['dest']}")
     if getattr(args, "json", False):
-        print(json.dumps(results, default=str))
+        print(json.dumps(results, ensure_ascii=False, default=str,
+                         separators=(",", ":")))
+
+
+def cmd_file(args):
+    try:
+        if args.file_op == "write":
+            content = _read_text_payload(args.content_file, "content")
+            data = file_ops.write_text(
+                args.path, content, expected_hash=args.expected_hash,
+                dry_run=args.dry_run, operation="write",
+            )
+        elif args.file_op == "patch":
+            patch = _read_text_payload(args.patch, "patch")
+            data = file_ops.transform_text(
+                args.path,
+                lambda original: file_ops.apply_unified_patch(original, patch),
+                expected_hash=args.expected_hash, dry_run=args.dry_run,
+                operation="patch",
+            )
+        elif args.file_op == "replace":
+            if args.old_file and args.old is not None:
+                raise file_ops.FileOperationError(
+                    "--old and --old-file are mutually exclusive"
+                )
+            if args.new_file and args.new is not None:
+                raise file_ops.FileOperationError(
+                    "--new and --new-file are mutually exclusive"
+                )
+            old = _read_text_payload(args.old_file, "old text") \
+                if args.old_file else args.old
+            new = _read_text_payload(args.new_file, "new text") \
+                if args.new_file else args.new
+            if old is None or new is None:
+                raise file_ops.FileOperationError(
+                    "replace requires old and new text (inline or file)"
+                )
+            data = file_ops.transform_text(
+                args.path,
+                lambda original: file_ops.replace_text(
+                    original, old, new, replace_all=args.all
+                ),
+                expected_hash=args.expected_hash, dry_run=args.dry_run,
+                operation="replace",
+            )
+        else:
+            raise file_ops.FileOperationError("unknown file operation")
+    except (OSError, file_ops.FileOperationError) as exc:
+        _file_err(args, exc)
+    _out(
+        args,
+        (f"{data['operation']} {data['path']}: "
+         f"{'changed' if data['changed'] else 'no change'} "
+         f"({data['after_hash']})"),
+        data,
+    )
+
+
+def cmd_run(args):
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    try:
+        data = file_ops.run_declared(
+            command, args.output, expected_hashes=args.expected_hash,
+            cwd=args.cwd, dry_run=args.dry_run,
+        )
+    except (OSError, file_ops.FileOperationError) as exc:
+        _file_err(args, exc)
+    human_parts = []
+    if data.get("stdout_tail"):
+        human_parts.append(data["stdout_tail"].rstrip())
+    if data.get("stderr_tail"):
+        human_parts.append(data["stderr_tail"].rstrip())
+    human_parts.append(
+        "validated declared outputs" if data.get("dry_run") else
+        f"command exited {data['exit_code']}; {len(data['outputs'])} declared output(s) tracked"
+    )
+    _out(args, "\n".join(part for part in human_parts if part), data)
+    if data.get("executed") and data.get("exit_code"):
+        raise SystemExit(data["exit_code"])
+    if data.get("executed") and not data.get("ok", True):
+        raise SystemExit(2)
 
 
 def cmd_move(args):
@@ -457,6 +574,18 @@ def cmd_office(args):
             else:
                 data = office.info(path)
             human = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        elif args.op == "normalize":
+            data = office_tx.normalize_safe_metadata(
+                path, args.output,
+                expected_sha256=args.expected_file_hash,
+                expected_output_sha256=args.expected_output_hash,
+                dry_run=args.dry_run,
+            )
+            human = (
+                ("dry-run: " if args.dry_run else "")
+                + f"normalized {data['input']} -> {data['output']}; "
+                + f"removed {data['removed_count']} safe metadata attribute(s)"
+            )
         elif args.op == "get-text":
             text = office.get_text(path)
             data = {"path": path, "text": text,
@@ -508,6 +637,8 @@ def cmd_office(args):
                      f"(pre-image archived as v{data['snapshot_version']})")
         elif args.op == "read-table":
             import office_excel
+            if args.values_only and args.include_formulas:
+                _err("read-table: --values-only and --include-formulas are mutually exclusive")
             columns = [value for value in args.columns.split(",") if value] \
                 if args.columns else None
             where = _load_json_payload(args.where_json, "", "--where-json", dict) \
@@ -515,10 +646,29 @@ def cmd_office(args):
             data = office_excel.read_table(
                 path, args.table, sheet=args.sheet, columns=columns, where=where,
                 offset=args.offset, limit=args.limit, values_only=args.values_only,
+                include_formulas=args.include_formulas,
             )
             human = (f"{data['table']} on {data['sheet']}: "
                      f"{data['returned']} row(s)"
                      f"{' (more)' if data['more'] else ''}")
+        elif args.op == "read-range":
+            import office_excel
+            data = office_excel.read_range(
+                path, args.sheet, args.range,
+                include_formulas=args.formulas,
+            )
+            human = (f"{data['sheet']}!{data['range']}: "
+                     f"{data['cell_count']} cell(s)")
+        elif args.op == "validate-formulas":
+            import office_excel
+            data = office_excel.validate_formulas(
+                path, offset=args.offset, limit=args.limit,
+            )
+            human = (
+                f"{data['formula_count']} formula(s); "
+                f"{data['missing_cached_values']} missing cached value(s); "
+                f"{data['external_references']} external reference(s)"
+            )
         elif args.op == "ensure-table":
             import office_excel
             headers = _load_json_payload(
@@ -671,6 +821,69 @@ def main(argv=None):
     add("archive", cmd_archive, (["paths"], {"nargs": "+"}),
         (["--reason"], {"default": ""}),
         help="reversible delete: move into the archive store")
+    file_parser = sub.add_parser(
+        "file", parents=[common],
+        help="atomic, recoverable text-file writes",
+        description=("Atomic text-file operations. Choose an operation, then run "
+                     "`agw file <operation> --help` for only its arguments."),
+    )
+    file_sub = file_parser.add_subparsers(
+        dest="file_op", required=True, metavar="operation",
+    )
+
+    def add_file(name, summary, *specs, example=""):
+        parser_for_op = file_sub.add_parser(
+            name, parents=[common], help=summary, description=summary,
+            epilog=(f"example:\n  {example}" if example else None),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        parser_for_op.add_argument("path", help="literal target file path")
+        for spec in specs:
+            parser_for_op.add_argument(*spec[0], **spec[1])
+        parser_for_op.set_defaults(fn=cmd_file)
+        return parser_for_op
+
+    file_expected = (["--expected-hash", "--expected-file-hash"], {
+        "default": "", "help": "expected SHA-256, or 'absent' for creation",
+    })
+    file_dry_run = (["--dry-run"], {
+        "action": "store_true", "help": "validate and hash without writing or archiving",
+    })
+    add_file(
+        "write", "Write UTF-8 text atomically from a file or stdin",
+        (["--content-file"], {"required": True, "help": "UTF-8 source file or -"}),
+        file_expected, file_dry_run,
+        example="agw file write app.js --content-file app.js.new --expected-hash SHA256",
+    )
+    add_file(
+        "patch", "Apply one exact-context unified diff atomically",
+        (["--patch"], {"required": True, "help": "unified diff file or -"}),
+        file_expected, file_dry_run,
+        example="agw file patch app.js --patch change.diff --expected-hash SHA256",
+    )
+    add_file(
+        "replace", "Replace exact UTF-8 text atomically",
+        (["--old"], {"default": None, "help": "old text; prefer --old-file for large text"}),
+        (["--new"], {"default": None, "help": "new text; prefer --new-file for large text"}),
+        (["--old-file"], {"default": "", "help": "UTF-8 old-text file"}),
+        (["--new-file"], {"default": "", "help": "UTF-8 new-text file"}),
+        (["--all"], {"action": "store_true", "help": "replace every exact match"}),
+        file_expected, file_dry_run,
+        example="agw file replace app.js --old-file old.txt --new-file new.txt --expected-hash SHA256",
+    )
+    add(
+        "run", cmd_run,
+        (["--output"], {"action": "append", "required": True,
+                        "help": "literal output path; repeat for every output"}),
+        (["--expected-hash"], {"action": "append", "default": [],
+                               "help": "SHA-256 or absent; repeat in output order"}),
+        (["--cwd"], {"default": "", "help": "command working directory"}),
+        (["--dry-run"], {"action": "store_true",
+                          "help": "validate outputs without executing"}),
+        (["command"], {"nargs": argparse.REMAINDER,
+                        "help": "command and arguments after --"}),
+        help="run a command with declared, recoverable outputs",
+    )
     add("move", cmd_move, (["src"], {}), (["dest"], {}),
         help="logged, undoable move or rename")
     sub._name_parser_map["rename"] = sub._name_parser_map["move"]
@@ -726,6 +939,16 @@ def main(argv=None):
         example="agw office info workbook.xlsx --scope tables --json",
     )
     add_office(
+        "normalize", "Remove only allowlisted OOXML compatibility metadata",
+        (["--output"], {"required": True, "help": "normalized .xlsx output path"}),
+        expected_hash,
+        (["--expected-output-hash"], {
+            "default": "", "help": "expected output SHA-256, or absent",
+        }),
+        dry_run,
+        example="agw office normalize input.xlsx --output normalized.xlsx --expected-output-hash absent --json",
+    )
+    add_office(
         "get-text", "Extract text from a Word or PowerPoint file",
         example="agw office get-text report.docx --json",
     )
@@ -764,7 +987,22 @@ def main(argv=None):
         *page,
         (["--values-only"], {"action": "store_true",
                              "help": "omit cell type metadata"}),
+        (["--include-formulas"], {"action": "store_true",
+                                  "help": "return both cached values and formulas"}),
         example="agw office read-table workbook.xlsx --table Orders --limit 50 --json",
+    )
+    add_office(
+        "read-range", "Read a bounded Excel range",
+        (["--sheet"], {"required": True, "help": "worksheet name"}),
+        (["--range"], {"required": True, "help": "finite A1 rectangle"}),
+        (["--formulas"], {"action": "store_true",
+                           "help": "return both cached values and formulas"}),
+        example="agw office read-range workbook.xlsx --sheet Data --range A1:D20 --formulas --json",
+    )
+    add_office(
+        "validate-formulas", "Inspect formulas and cached-result coverage",
+        *page,
+        example="agw office validate-formulas workbook.xlsx --limit 50 --json",
     )
     add_office(
         "ensure-table", "Create or validate an Excel table",
