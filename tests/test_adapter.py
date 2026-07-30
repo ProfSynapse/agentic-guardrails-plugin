@@ -45,6 +45,37 @@ def test_bash_benign_defers():
     assert _decision(out) == "defer"
 
 
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_short_agw_is_rewritten_to_active_package(tool):
+    out = run_hook({
+        "tool_name": tool,
+        "tool_input": {"command": "agw status --json", "description": "status"},
+        "cwd": REPO,
+        "session_id": f"short-agw-{tool}",
+        "hook_event_name": "PreToolUse",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    updated = specific["updatedInput"]
+    assert updated["description"] == "status"
+    expected = "agw.cmd" if os.name == "nt" else os.path.join("bin", "agw")
+    assert expected in updated["command"]
+    assert updated["command"].endswith(" status --json")
+
+
+def test_short_agw_rewrite_never_hides_a_denied_compound_command():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {"command": "agw status; Remove-Item important.txt"},
+        "cwd": REPO,
+        "session_id": "short-agw-compound-deny",
+        "hook_event_name": "PreToolUse",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+
+
 def test_bash_literal_mkdir_then_move_has_reversible_prestate(
         tmp_path, monkeypatch):
     source = tmp_path / "report.txt"

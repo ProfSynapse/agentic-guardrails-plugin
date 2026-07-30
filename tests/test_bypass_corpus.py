@@ -3,9 +3,15 @@
 This file is the spec for the shell-analysis layer. New bypass techniques
 found in red-team sessions get appended here first.
 """
+from pathlib import Path
+
 import pytest
 
+from core import launcher
 from core.events import ASK, DENY
+
+
+PLUGIN = Path(__file__).resolve().parents[1] / "plugin"
 
 CORPUS = [
     # plain destruction
@@ -135,7 +141,11 @@ BENIGN = [
 
 @pytest.mark.parametrize("command", BENIGN)
 def test_benign_not_denied(evaluate, command):
-    decision = evaluate(command)
+    # Host adapters expand the short launcher before the shared engine sees it.
+    evaluated = launcher.rewrite_shortcut(
+        command, str(PLUGIN), platform="posix", shell="posix"
+    ) or command
+    decision = evaluate(evaluated)
     assert decision.action != DENY, (
         f"{command!r} was denied ({decision.rule_id}: {decision.reason}) — "
         "guardrails must not block normal work")

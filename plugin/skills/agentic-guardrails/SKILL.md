@@ -9,8 +9,9 @@ description: >
 
 # Agentic Guardrails
 
-Keep file operations recoverable. Use the exact packaged launcher supplied in
-session context; do not guess a different installation path.
+Keep file operations recoverable. Use the short launcher supplied in session
+context; the trusted hook resolves it to the active package. Do not guess or
+emit an installation path.
 
 ## Discover commands progressively
 

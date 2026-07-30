@@ -195,6 +195,24 @@ def test_packed_agw_cmd_requires_packaged_origin(packed_plugin, tmp_path, host):
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])
+def test_packed_short_agw_rewrites_to_its_own_launcher(
+        packed_plugin, tmp_path, host):
+    out = _run_dispatch(
+        packed_plugin, host,
+        {"tool_name": "PowerShell",
+         "tool_input": {"command": "agw status --json", "description": "status"},
+         "cwd": str(tmp_path), "session_id": f"short-launcher-{host}"},
+        tmp_path,
+    )
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    updated = specific["updatedInput"]
+    expected = "agw.cmd" if os.name == "nt" else os.path.join("bin", "agw")
+    assert expected in updated["command"]
+    assert updated["description"] == "status"
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
 def test_packed_project_keyword_search_is_ordinary_diagnostic(
         packed_plugin, tmp_path, host):
     out = _run_dispatch(

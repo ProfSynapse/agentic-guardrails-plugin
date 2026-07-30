@@ -55,9 +55,12 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    ship them as managed hooks via `requirements.toml` to skip the prompt.)
 3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
    Operational syntax is not duplicated into user-level prompts.
-4. **`agw` on PATH (optional)** - add `plugin/bin` to PATH. Use `bin/agw` on
-   POSIX and `bin/agw.cmd` on Windows. The Windows launcher invokes Python
-   explicitly and never asks Windows to open a `.py` file by file association.
+4. **Short launcher** - invoke `agw` on POSIX or `agw.cmd` on Windows. The
+   SessionStart context teaches that compact form, and the trusted PreToolUse
+   hook rewrites only a literal leading launcher token to this installed
+   package before policy evaluation and execution. No PATH or shell-profile
+   change is required. The Windows launcher invokes Python explicitly and never
+   asks Windows to open a `.py` file by file association.
 
 ## How the shared hook shim picks the host
 
@@ -65,6 +68,8 @@ Codex selects `hooks/hooks-codex.json` through `.codex-plugin/plugin.json` and
 dispatches directly to `scripts/codex/*` with `PLUGIN_ROOT`. Claude Code uses
 `hooks/hooks.json` and dispatches to `scripts/claude/*`. Both maintained
 manifests cover Bash, PowerShell, and Monitor through the shared EXEC policy.
+The same adapters expand the short launcher for interactive Bash/PowerShell
+calls. Monitor commands remain literal and receive no shortcut expansion.
 
 ## Verify before relying on it
 
