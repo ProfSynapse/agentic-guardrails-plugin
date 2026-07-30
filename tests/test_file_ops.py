@@ -87,6 +87,22 @@ def test_patch_context_conflict_creates_no_snapshot(tmp_path):
     assert store.list_versions(str(target)) == []
 
 
+def test_transform_without_expected_hash_rejects_concurrent_external_edit(tmp_path):
+    target = tmp_path / "data.json"
+    target.write_text('{"value":1}\n', encoding="utf-8")
+
+    def transform(original):
+        target.write_text('{"value":2,"source":"app"}\n', encoding="utf-8")
+        return original.replace("1", "3")
+
+    with pytest.raises(file_ops.FileConflict, match="transformation was prepared"):
+        file_ops.transform_text(str(target), transform, operation="replace")
+
+    assert target.read_text(encoding="utf-8") == \
+        '{"value":2,"source":"app"}\n'
+    assert store.list_versions(str(target)) == []
+
+
 def test_declared_run_snapshots_output_and_captures_result(tmp_path):
     output = tmp_path / "tracker.xlsx"
     output.write_bytes(b"old workbook")
@@ -148,11 +164,14 @@ def test_declared_run_reports_undeclared_sidecar(tmp_path):
     result = file_ops.run_declared(
         [sys.executable, str(script)], [str(output)],
         expected_hashes=["absent"], cwd=str(tmp_path),
+        output_roots=[str(tmp_path)],
     )
     assert result["ok"] is False
     assert result["undeclared_outputs"] == [{
         "path": str(sidecar), "change": "created", "kind": "file",
     }]
+    assert result["unclaimed_observed_changes"] == result["undeclared_outputs"]
+    assert result["output_observation"]["mode"] == "root_manifest"
 
 
 def test_declared_sidecar_pattern_is_allowed(tmp_path):
@@ -167,10 +186,56 @@ def test_declared_sidecar_pattern_is_allowed(tmp_path):
     result = file_ops.run_declared(
         [sys.executable, str(script)], [str(output)],
         expected_hashes=["absent"], cwd=str(tmp_path),
-        output_patterns=["*.inspect.ndjson"],
+        output_roots=[str(tmp_path)], output_patterns=["*.inspect.ndjson"],
     )
     assert result["ok"] is True
     assert result["undeclared_outputs"] == []
+
+
+def test_declared_exact_output_does_not_observe_parent_or_ambient_changes(
+        tmp_path, monkeypatch):
+    output = tmp_path / "report.xlsx"
+    ambient = tmp_path / "data.json"
+    ambient.write_text('{"value":1}\n', encoding="utf-8")
+    script = tmp_path / "build.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('report.xlsx').write_bytes(b'book')\n"
+        "Path('data.json').write_text('{\\\"value\\\":2}\\n')\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_observation(*args, **kwargs):
+        raise AssertionError("exact output unexpectedly scanned its parent")
+
+    monkeypatch.setattr(
+        file_ops, "_observe_output_roots_bounded", unexpected_observation,
+    )
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+    )
+
+    assert result["ok"] is True
+    assert result["undeclared_outputs"] == []
+    assert result["unclaimed_observed_changes"] == []
+    assert result["output_roots"] == []
+    assert result["output_observation"] == {
+        "mode": "exact_outputs", "complete": True,
+        "files_before": 0, "files_after": 0, "changed_paths": 0,
+        "unclaimed_changes": 0,
+    }
+    assert ambient.read_text(encoding="utf-8") == '{"value":2}\n'
+
+
+def test_output_pattern_requires_explicit_observation_root(tmp_path):
+    output = tmp_path / "report.xlsx"
+    with pytest.raises(file_ops.FileOperationError, match="explicit --output-root"):
+        file_ops.run_declared(
+            [sys.executable, "-c", "pass"], [str(output)],
+            expected_hashes=["absent"], cwd=str(tmp_path),
+            output_patterns=["*.sidecar"], dry_run=True,
+        )
 
 
 def test_publish_staged_file_cross_directory_is_atomic_and_recoverable(tmp_path):
