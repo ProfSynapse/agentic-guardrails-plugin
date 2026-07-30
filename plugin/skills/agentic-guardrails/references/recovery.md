@@ -19,6 +19,12 @@ recoverable archive artifact, and removes only the link object. Ordinary files
 and directories are refused. Supply `--expected-target` when the intended link
 destination is known.
 
-For write-capable scripts, declare exact outputs plus bounded output roots and
-any intentional sidecar patterns. A successful process exit is not a successful
-Guardrails run when undeclared files were created, modified, or removed.
+For write-capable scripts, declare exact outputs. Exact mode hashes and snapshots
+only those paths; it does not enumerate their parents, so large folders and
+unrelated application updates add no scan cost or false side-effect report.
+
+Add an explicit, narrow `--output-root` only when strict sidecar enforcement is
+needed, and declare intentional relative sidecar patterns. Root manifests report
+unclaimed observed changes and fail the run when unexpected files are created,
+modified, or removed. They cannot prove which process caused a change, so avoid
+observing broad or actively changing application/sync folders.

@@ -209,12 +209,27 @@ def transform_text(
     target = resolve_target(target)
     if not os.path.isfile(target):
         raise FileOperationError(f"agw file {operation} requires an existing file")
+    # A transform is a read-modify-write operation. Bind publication to the
+    # exact version read even when the caller did not provide --expected-hash;
+    # otherwise an external editor could update the file between the read and
+    # atomic publication and have its newer content overwritten.
+    baseline = _check_expected(target, expected_hash)
     original = read_utf8(target, "target")
     updated = transform(original)
     if not isinstance(updated, str):
         raise FileOperationError("text transform returned invalid content")
+    current = _current_hash(target)
+    if current != baseline:
+        raise FileConflict(
+            "CONFLICT: file changed while the transformation was prepared",
+            {
+                "path": target,
+                "expected": baseline or "absent",
+                "actual": current or "absent",
+            },
+        )
     return write_text(
-        target, updated, expected_hash=expected_hash,
+        target, updated, expected_hash=baseline or "absent",
         dry_run=dry_run, operation=operation,
     )
 
@@ -321,8 +336,12 @@ def run_declared(
     working = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     if not os.path.isdir(working):
         raise FileOperationError("run working directory does not exist")
-    roots = _output_roots(targets, output_roots or [])
     patterns = _validate_output_patterns(output_patterns)
+    roots = _output_roots(targets, output_roots or [])
+    if patterns and not roots:
+        raise FileOperationError(
+            "--output-pattern requires an explicit --output-root"
+        )
 
     lock_material = "\0".join(sorted(folded)).encode("utf-8", "replace")
     lock_name = "run-" + hashlib.sha256(lock_material).hexdigest()[:32]
@@ -336,14 +355,18 @@ def run_declared(
             for path, digest in zip(targets, before)
         ]
         if dry_run:
-            _observe_output_roots_bounded(
-                roots, max_files=max_observed_files,
-                max_depth=max_observed_depth,
+            observation = _observe_requested_roots(
+                roots, max_files=max_observed_files, max_depth=max_observed_depth,
             )
             return {
                 "dry_run": True, "command": command, "cwd": working,
                 "outputs": preview, "output_roots": roots,
                 "output_patterns": patterns, "executed": False,
+                "output_observation": {
+                    "mode": "root_manifest" if roots else "exact_outputs",
+                    "complete": True,
+                    "files_observed": observation["count"],
+                },
             }
         receipts = _snapshots(targets, "run")
         for path, digest in zip(targets, before):
@@ -355,7 +378,7 @@ def run_declared(
         # Recovery preparation may create AGW_HOME beneath a test/work root.
         # Establish the execution baseline only after those declared pre-images
         # are durable so Guardrails' own metadata is not blamed on the command.
-        before_observation = _observe_output_roots_bounded(
+        before_observation = _observe_requested_roots(
             roots, max_files=max_observed_files, max_depth=max_observed_depth,
         )
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -376,7 +399,7 @@ def run_declared(
             stdout = captured(stdout_file)
             stderr = captured(stderr_file)
         after = [_current_hash(path) for path in targets]
-        after_observation = _observe_output_roots_bounded(
+        after_observation = _observe_requested_roots(
             roots, max_files=max_observed_files, max_depth=max_observed_depth,
         )
         observed_changes = _observation_changes(
@@ -424,14 +447,19 @@ def run_declared(
             "stdout_tail": stdout,
             "stderr_tail": stderr,
             "declared_outputs_missing": missing_outputs,
+            "unclaimed_observed_changes": undeclared,
+            # Compatibility alias retained for existing JSON consumers. A
+            # before/after manifest cannot prove which process caused a change.
             "undeclared_outputs": undeclared,
             "output_roots": roots,
             "output_patterns": patterns,
             "output_observation": {
+                "mode": "root_manifest" if roots else "exact_outputs",
                 "complete": True,
                 "files_before": before_observation["count"],
                 "files_after": after_observation["count"],
                 "changed_paths": len(observed_changes),
+                "unclaimed_changes": len(undeclared),
             },
             "capture_truncated": (
                 len(stdout.encode("utf-8")) >= MAX_CAPTURE_BYTES
@@ -441,7 +469,11 @@ def run_declared(
 
 
 def _output_roots(targets: list[str], supplied: list[str]) -> list[str]:
-    raw = supplied or sorted({os.path.dirname(path) for path in targets})
+    # Exact declarations are deliberately exact. Recursively observing their
+    # parent directories is expensive in large/synced folders and conflates
+    # unrelated application activity with command side effects. Root manifests
+    # are therefore an explicit opt-in.
+    raw = supplied
     roots = []
     for value in raw:
         if any(char in str(value) for char in "*?["):
@@ -452,16 +484,22 @@ def _output_roots(targets: list[str], supplied: list[str]) -> list[str]:
         folded = os.path.normcase(root)
         if folded not in {os.path.normcase(item) for item in roots}:
             roots.append(root)
-    if not roots:
-        raise FileOperationError(
-            "--output-pattern requires at least one --output-root"
-        )
-    for target in targets:
-        if not any(_path_is_within(target, root) for root in roots):
-            raise FileOperationError(
-                f"declared output is outside every output root: {target}"
-            )
+    if roots:
+        for target in targets:
+            if not any(_path_is_within(target, root) for root in roots):
+                raise FileOperationError(
+                    f"declared output is outside every output root: {target}"
+                )
     return roots
+
+
+def _observe_requested_roots(roots: list[str], *, max_files: int,
+                             max_depth: int) -> dict:
+    if not roots:
+        return {"entries": {}, "count": 0}
+    return _observe_output_roots_bounded(
+        roots, max_files=max_files, max_depth=max_depth,
+    )
 
 
 def _validate_output_patterns(patterns: list[str]) -> list[str]:

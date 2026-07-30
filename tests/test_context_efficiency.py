@@ -80,6 +80,7 @@ def test_always_on_context_encodes_operating_principles():
         assert "do not bundle unrelated writes" in lower
         assert "smallest reversible operation" in lower
         assert "declare every output" in lower
+        assert "exact mode scans no siblings" in lower
         assert "block or ask as constraint information" in lower
         assert "retry only with a simpler, exact operation" in lower
         assert "request it once" in lower
