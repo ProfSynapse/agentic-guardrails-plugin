@@ -9,15 +9,14 @@ description: >
 
 # Agentic Guardrails
 
-Keep file operations recoverable. Use the short launcher supplied in session
-context; the trusted hook resolves it to the active package. Do not guess or
-emit an installation path.
+Keep file operations recoverable. Use `agw` on every platform; the trusted hook
+finds the active package. Never emit an installation path. `agw.cmd` is
+compatibility-only.
 
 ## Discover commands progressively
 
-Treat CLI help as authoritative. Use `<agw> --help` only for an unknown family,
-then request `<verb> --help` or `office <operation> --help`. Use `office --help`
-only when its operation is unknown.
+Treat CLI help as authoritative. Request only the narrowest unknown scope:
+`<agw> --help`, `<verb> --help`, or `office <operation> --help`.
 
 Do not reproduce the command catalog. Prefer compact JSON, bounded reads, and
 pagination. On PowerShell, use stdin or a file for fragile structured JSON.
@@ -28,7 +27,8 @@ pagination. On PowerShell, use stdin or a file for fragile structured JSON.
 |---|---|---|
 | Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
 | Read or change a text file | Exact `file <operation> --help` | None |
-| Run a write-capable script | `run --help`; exact outputs; optional narrow sidecar root | [recovery.md](references/recovery.md) |
+| Run a one-off write-capable script | `run --help`; declare exact outputs | [recovery.md](references/recovery.md) |
+| Run a repeated, versioned write workflow | `run --workflow ID -- ...` | [trusted-workflows.md](references/trusted-workflows.md) |
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
 | Publish a validated staged artifact | `publish-file --help` | [synced-folders.md](references/synced-folders.md) |
@@ -36,15 +36,9 @@ pagination. On PowerShell, use stdin or a file for fragile structured JSON.
 | `.gdoc`, `.gsheet`, or `.gslides` | Connector/export workflow | [google-stubs.md](references/google-stubs.md) |
 | Environment, recovery, or policy report | `doctor --help` and status help | [diagnostics.md](references/diagnostics.md) |
 
-Office operation routing: inspect with `info`/`get-text`; change text with
-`replace-text`; edit cells or raw rows with `set-cell`/`append-rows`; use
-`read-table`, `ensure-table`, `append-table-row`, or `update-table-row` for Excel
-tables; use `outline`, `read-blocks`, and `patch` for structured Word work.
-Use `file read` for bounded text. For large text writes, use `file write`,
-`patch`, or `replace` with file/stdin input. Run scripts through `run` with exact
-outputs; it does not
-enumerate siblings. Add a narrow root only for strict sidecar observation;
-unclaimed changes then fail the run.
+Use leaf help for the selected route. Exact run outputs do not enumerate siblings.
+Repeated scripts need an approved, hash-bound workflow. Observed roots detect
+sidecars after execution; they are not pre-images.
 
 ## Invariants
 

@@ -87,10 +87,10 @@ def test_sessionstart_uses_platform_native_launcher():
     from codex import sessionstart as codex_start
 
     for module in (claude_start, codex_start):
-        assert module._launcher("nt") == "agw.cmd"
+        assert module._launcher("nt") == "agw"
         assert module._launcher("posix") == "agw"
-        expected = "agw.cmd" if os.name == "nt" else "`agw`"
-        assert expected in module.CONTEXT
+        assert "Use `agw`" in module.CONTEXT
+        assert "Use `agw.cmd`" not in module.CONTEXT
         assert str(PLUGIN) not in module.CONTEXT
         assert "trusted PreToolUse hook" in module.CONTEXT
 
@@ -118,7 +118,7 @@ def test_short_launcher_expansion_is_exact_and_boundary_aware():
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
 def test_windows_short_launcher_expansion_executes_real_cli(tmp_path):
     command = launcher.rewrite_shortcut(
-        "agw.cmd status --json", str(PLUGIN), platform="nt", shell="powershell"
+        "agw status --json", str(PLUGIN), platform="nt", shell="powershell"
     )
     env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"))
     result = subprocess.run(

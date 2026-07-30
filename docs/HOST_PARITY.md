@@ -24,8 +24,8 @@ Claude Code and Codex releases must both pass:
    `tool_input.command` string and evaluates it with the Bash rules. This is a
    tested envelope contract, not a claim that a live Monitor host was probed.
 3. Equivalent shared-core decisions for the same normalized operation.
-4. Platform-native short CLI guidance (`agw` on POSIX and `agw.cmd` on
-   Windows), expanded by PreToolUse to the active packaged launcher.
+4. Platform-neutral `agw` CLI guidance, expanded by PreToolUse to the active
+   packaged launcher (`agw.cmd` remains a Windows implementation detail).
 5. Clean packed-artifact execution using only files inside the copied plugin
    subtree.
 6. Plugin-root-qualified dispatch with no cache, adjacent-repository, or

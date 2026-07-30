@@ -41,7 +41,7 @@ def test_one_discoverable_skill_with_progressive_references():
     references = sorted((skill_files[0].parent / "references").glob("*.md"))
     assert {path.name for path in references} == {
         "diagnostics.md", "google-stubs.md", "office.md", "recovery.md",
-        "synced-folders.md",
+        "synced-folders.md", "trusted-workflows.md",
     }
     assert all(path.stat().st_size < 1_800 for path in references)
 
@@ -59,7 +59,7 @@ def test_always_on_context_is_small_and_has_no_operation_catalog():
 def test_short_launcher_removes_repeated_package_path_tokens():
     operation = " run --json --output artifact.xlsx -- node build.mjs"
     for platform, short, binary in (
-        ("nt", "agw.cmd", PLUGIN / "bin" / "agw.cmd"),
+        ("nt", "agw", PLUGIN / "bin" / "agw.cmd"),
         ("posix", "agw", PLUGIN / "bin" / "agw"),
     ):
         legacy = f'"{binary}"{operation}'
@@ -149,3 +149,18 @@ def test_file_and_run_help_are_progressive_and_compact():
     assert len(write) <= 1_000
     assert len(read) <= 900
     assert len(run) <= 800
+
+
+def test_workflow_help_discloses_trust_details_only_at_the_leaf():
+    family = _help("workflow")
+    trust = _help("workflow", "trust")
+    info = _help("workflow", "info")
+    assert "trust" in family and "list" in family and "info" in family
+    assert "--expected-manifest-hash" not in family
+    assert "--approve-trust" not in family
+    assert "--expected-manifest-hash" in trust
+    assert "--approve-trust" in trust
+    assert "--replace" in trust
+    assert "--expected-manifest-hash" not in info
+    assert len(family) <= 650
+    assert len(trust) <= 1_100

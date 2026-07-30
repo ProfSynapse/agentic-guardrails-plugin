@@ -38,7 +38,7 @@ AGW_READ_ONLY_VERBS = {"scan", "diff", "status", "log", "doctor"}
 AGW_SAFE_MUTATING_VERBS = {
     "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
     "restore", "undo", "publish", "publish-file", "unlink-link",
-    "file", "run", "office",
+    "file", "run", "office", "workflow",
 }
 AGW_ASK_VERBS = {"prune": "prune permanently destroys archived versions (human decision)",
                  "apply": "bulk apply executes a stored plan — review the manifest",
@@ -1302,6 +1302,38 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 ), policy)
                 if read_decision.action != DEFER:
                     return read_decision
+        if verb == "workflow":
+            try:
+                verb_index = args.index("workflow")
+            except ValueError:
+                verb_index = -1
+            workflow_op = next(
+                (value for value in args[verb_index + 1:]
+                 if value and not value.startswith("-")), ""
+            )
+            if workflow_op == "trust":
+                return Decision(
+                    ASK,
+                    "Installing or replacing a trusted workflow grants a specific, "
+                    "hash-bound script permission to write its declared outputs. "
+                    "Review the manifest, script identity, output paths, and observed roots.",
+                    "builtin:agw-workflow-trust",
+                    enforcement_class=NON_WAIVABLE_INVARIANT,
+                    presentation_context=DecisionContext.AGW_MUTATION,
+                    presentation_details={
+                        "operation": "trust workflow",
+                        "target_kind": "workflow manifest",
+                        "signal": "persistent script output authorization",
+                        "trigger": "The agent requested a new or replacement trusted workflow record.",
+                    },
+                )
+            if workflow_op not in {"list", "info"}:
+                return Decision(
+                    ASK, "This workflow operation is not recognized.",
+                    "builtin:agw-workflow-unknown",
+                    enforcement_class=NON_WAIVABLE_INVARIANT,
+                    presentation_context=DecisionContext.AGW_UNKNOWN,
+                )
         if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFE_MUTATING_VERBS:
             return Decision(ALLOW, "", "builtin:agw")
         return Decision(

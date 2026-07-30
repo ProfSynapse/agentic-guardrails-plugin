@@ -15,7 +15,7 @@ see [`../docs/HOST_PARITY.md`](../docs/HOST_PARITY.md).
 | Session context | `SessionStart` | identical |
 | Skill | `skills/agentic-guardrails/SKILL.md` | compact router; loads safety references progressively |
 | Command discovery | CLI `--help` hierarchy | progressively scoped; no duplicated prompt catalog |
-| `agw` CLI | `bin/agw` on POSIX, `bin/agw.cmd` on Windows | same |
+| `agw` CLI | platform-neutral `agw` short form | same |
 
 ### The one real difference: `apply_patch`
 
@@ -55,12 +55,14 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    ship them as managed hooks via `requirements.toml` to skip the prompt.)
 3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
    Operational syntax is not duplicated into user-level prompts.
-4. **Short launcher** - invoke `agw` on POSIX or `agw.cmd` on Windows. The
+4. **Short launcher** - invoke `agw` on every platform. The
    SessionStart context teaches that compact form, and the trusted PreToolUse
    hook rewrites only a literal leading launcher token to this installed
    package before policy evaluation and execution. No PATH or shell-profile
-   change is required. The Windows launcher invokes Python explicitly and never
-   asks Windows to open a `.py` file by file association.
+   change is required. On Windows the hook resolves `agw` to the packaged
+   `agw.cmd`; that suffix remains a backward-compatible implementation detail.
+   The launcher invokes Python explicitly and never asks Windows to open a `.py`
+   file by file association.
 
 ## How the shared hook shim picks the host
 

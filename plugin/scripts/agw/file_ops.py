@@ -54,7 +54,7 @@ class PlaceholderReadRefused(FileOperationError):
     error_code = "placeholder_read_refused"
 
 
-def resolve_target(path: str) -> str:
+def resolve_target(path: str, *, allow_missing_parent: bool = False) -> str:
     raw = str(path or "").strip()
     if not raw or "\x00" in raw:
         raise FileOperationError("target path is missing or invalid")
@@ -64,8 +64,19 @@ def resolve_target(path: str) -> str:
     if os.path.isdir(target):
         raise FileOperationError("target must be a file, not a directory")
     parent = os.path.dirname(target)
-    if not os.path.isdir(parent):
+    if not allow_missing_parent and not os.path.isdir(parent):
         raise FileOperationError("target parent directory does not exist")
+    if allow_missing_parent:
+        probe = parent
+        while probe and not os.path.lexists(probe):
+            previous = probe
+            probe = os.path.dirname(probe)
+            if probe == previous:
+                break
+        if not probe or not os.path.isdir(probe) or os.path.islink(probe):
+            raise FileOperationError(
+                "target has no verified ordinary parent directory"
+            )
     return target
 
 
@@ -443,11 +454,15 @@ def run_declared(
     output_patterns: Optional[list[str]] = None,
     max_observed_files: int = 20_000,
     max_observed_depth: int = 8,
+    allow_missing_output_parents: bool = False,
 ) -> dict:
     """Run a command after verified pre-images for every declared output."""
     if not command:
         raise FileOperationError("run requires a command after --")
-    targets = [resolve_target(path) for path in outputs]
+    targets = [
+        resolve_target(path, allow_missing_parent=allow_missing_output_parents)
+        for path in outputs
+    ]
     output_patterns = list(output_patterns or [])
     if not targets and not output_patterns:
         raise FileOperationError("run requires at least one --output or --output-pattern")

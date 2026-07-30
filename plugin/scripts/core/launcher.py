@@ -1,9 +1,10 @@
 """Trusted short-form launcher expansion for maintained host adapters.
 
-The model emits ``agw`` (or ``agw.cmd`` on Windows).  A PreToolUse adapter
+The model emits the platform-neutral ``agw``.  A PreToolUse adapter
 expands that leading token to the active package's launcher before the policy
 engine evaluates it and before the host executes it.  This keeps the package
 path out of model output without relying on PATH, aliases, or mutable shims.
+The ``agw.cmd`` spelling remains accepted for backward compatibility.
 """
 from __future__ import annotations
 
