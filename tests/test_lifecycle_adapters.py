@@ -256,4 +256,5 @@ def test_sessionstart_uses_native_platform_launcher():
         assert "agw.cmd" in context
         assert "`agw <cmd>`" not in context
     else:
-        assert "bin/agw" in context
+        assert "Use `agw`" in context
+        assert "bin/agw" not in context
