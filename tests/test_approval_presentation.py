@@ -118,6 +118,50 @@ def test_unknown_target_is_honest_and_cancel_is_recommended():
     assert request.default_choice == "cancel"
 
 
+def test_sensitive_read_prompt_names_sanitized_file_and_signal():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:content-prescan",
+        presentation_context=events.DecisionContext.SENSITIVE_READ,
+        presentation_details={
+            "operation": "read",
+            "targets": ["C:/clients/board\nnotes.txt"],
+            "target_kind": "file",
+            "signal": "a confidentiality marking",
+            "trigger": "Guardrails detected a sensitive-content marker.",
+        },
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "read-detail"},
+        [events.ToolEvent(kind=events.READ)],
+    )
+    rendered = request.action + "\n" + request.primary_text()
+    assert "board notes.txt" in rendered
+    assert "a confidentiality marking" in rendered
+    assert "File: board notes.txt" in rendered
+    assert "keep the content out" in rendered
+    assert "\nnotes.txt" not in rendered
+
+
+def test_credential_search_prompt_names_scope_and_trigger():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:credential-hunt",
+        presentation_context=events.DecisionContext.CREDENTIAL_SEARCH,
+        presentation_details={
+            "operation": "search", "targets": ["plugin/scripts", "tests"],
+            "target_kind": "search_scope", "signal": "credential-related terms",
+            "trigger": "A scope is outside the verified project.",
+        },
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "search-detail"},
+        [events.ToolEvent(kind=events.EXEC)],
+    )
+    rendered = request.action + "\n" + request.primary_text()
+    assert "search plugin/scripts and tests" in rendered
+    assert "Search scope: plugin/scripts and tests" in rendered
+    assert "outside the verified project" in rendered
+
+
 def test_known_reversible_guardrails_change_recommends_allow():
     decision = GuardrailDecision(
         events.ASK, rule_id="builtin:agw-ask",

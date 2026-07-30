@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.9` is the Windows-first stable release.
+> **Release status:** `0.3.10` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -105,6 +105,7 @@ so the agent self-corrects instead of fighting the rails:
 | rebuilding a styled workbook | `agw checkout workbook.xlsx --mode preserve` → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
+| unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
 | opaque write-capable script | `agw run --output PATH -- command` (add a narrow `--output-root` only for strict sidecar observation) |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 
@@ -153,8 +154,11 @@ unsupported complex OOXML files are refused. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
-Ordinary UTF-8 files can be constructed or changed atomically with `agw file
-write`, `patch`, and `replace`. These operations accept expected hashes, support
+Ordinary UTF-8 files can be read with bounded line/byte pagination using `agw
+file read`; JSON includes the exact SHA-256, size, line bounds, and continuation.
+It reads only the named file, refuses cloud-only placeholders, and creates no
+recovery transaction. Files can be constructed or changed atomically with `agw
+file write`, `patch`, and `replace`. These operations accept expected hashes, support
 dry runs, publish through same-directory stages, and record verified pre-images
 or ABSENT tombstones. `agw run` executes a command only after every declared
 output has been hash-checked and snapshotted. Exact outputs do not enumerate
@@ -163,9 +167,15 @@ Explicit, bounded `--output-root` manifests detect unclaimed observed changes;
 intentional companion files can be declared with relative patterns. Because a
 directory diff cannot prove process ownership, root observations should be used
 only for narrow, stable folders. Compact, bounded stdout/stderr tails are
-included in JSON results. `publish-file` validates a staged hash, captures one target pre-image,
+included in JSON results. `publish-file` validates a staged hash, captures one
+target pre-image,
 retries only atomic replacement for a bounded interval, and preserves the stage
 when a sync client keeps the target busy.
+
+Approval prompts for sensitive reads and credential searches show a sanitized
+filename or search scope, the detected risk category, and the specific reason
+the operation was not auto-approved. Raw commands and file contents stay out of
+the dialog.
 
 Folder scans are metadata-only and hard-bounded by a parent process. Use
 `agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,

@@ -14,10 +14,13 @@ import tempfile
 import time
 from typing import Callable, Optional
 
-from core import engine, preimages, store
+from core import engine, preimages, profiles, store
 
 
 MAX_TEXT_BYTES = 32 * 1024 * 1024
+DEFAULT_READ_LINES = 200
+DEFAULT_READ_BYTES = 32 * 1024
+MAX_READ_OUTPUT_BYTES = 256 * 1024
 MAX_CAPTURE_BYTES = 64 * 1024
 OUTPUT_OBSERVATION_SECONDS = 5.0
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +48,10 @@ class PublishBusy(FileOperationError):
 
 class UndeclaredOutput(FileOperationError):
     error_code = "undeclared_output"
+
+
+class PlaceholderReadRefused(FileOperationError):
+    error_code = "placeholder_read_refused"
 
 
 def resolve_target(path: str) -> str:
@@ -105,6 +112,127 @@ def read_utf8(path: str, label: str = "input") -> str:
             return handle.read()
     except (OSError, UnicodeError) as exc:
         raise FileOperationError(f"{label} must be readable UTF-8 text: {exc}") from exc
+
+
+def read_text_page(
+    path: str,
+    *,
+    start_line: int = 1,
+    limit: int = DEFAULT_READ_LINES,
+    max_bytes: int = DEFAULT_READ_BYTES,
+) -> dict:
+    """Read one bounded, stable page from an exact UTF-8 text file."""
+    if start_line < 1:
+        raise FileOperationError("start line must be at least 1")
+    if limit < 1:
+        raise FileOperationError("line limit must be at least 1")
+    if max_bytes < 1 or max_bytes > MAX_READ_OUTPUT_BYTES:
+        raise FileOperationError(
+            f"max bytes must be between 1 and {MAX_READ_OUTPUT_BYTES}"
+        )
+
+    target = resolve_target(path)
+    try:
+        before = os.stat(target, follow_symlinks=False)
+    except OSError as exc:
+        raise FileOperationError(f"target could not be read: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise FileOperationError("target must be an ordinary local file")
+    if profiles.is_placeholder(target, st=before):
+        raise PlaceholderReadRefused(
+            "file is a cloud-only placeholder; hydrate it before reading",
+            {"path": target},
+        )
+    if int(before.st_size) > MAX_TEXT_BYTES:
+        raise FileOperationError(
+            f"file exceeds the {MAX_TEXT_BYTES // (1024 * 1024)} MB text limit"
+        )
+
+    try:
+        with open(target, "rb") as handle:
+            raw = handle.read(MAX_TEXT_BYTES + 1)
+    except OSError as exc:
+        raise FileOperationError(f"target could not be read: {exc}") from exc
+    if len(raw) > MAX_TEXT_BYTES:
+        raise FileOperationError(
+            f"file exceeds the {MAX_TEXT_BYTES // (1024 * 1024)} MB text limit"
+        )
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise FileOperationError("target must be valid UTF-8 text") from exc
+
+    try:
+        after = os.stat(target, follow_symlinks=False)
+    except OSError as exc:
+        raise FileConflict(
+            "CONFLICT: file changed while it was being read",
+            {"path": target, "error": str(exc)},
+        ) from exc
+    identity_before = (
+        int(getattr(before, "st_dev", 0)), int(getattr(before, "st_ino", 0)),
+        int(before.st_size), int(before.st_mtime_ns),
+    )
+    identity_after = (
+        int(getattr(after, "st_dev", 0)), int(getattr(after, "st_ino", 0)),
+        int(after.st_size), int(after.st_mtime_ns),
+    )
+    if identity_before != identity_after:
+        raise FileConflict(
+            "CONFLICT: file changed while it was being read", {"path": target},
+        )
+
+    lines = text.splitlines(keepends=True)
+    line_count = len(lines)
+    if start_line > line_count + 1:
+        raise FileOperationError(
+            "start line is beyond the end of the file",
+            {"path": target, "start_line": start_line,
+             "line_count": line_count},
+        )
+
+    index = start_line - 1
+    selected = []
+    returned_bytes = 0
+    stop_reason = ""
+    requested_end = min(line_count, index + limit)
+    while index < requested_end:
+        line = lines[index]
+        encoded_size = len(line.encode("utf-8"))
+        if returned_bytes + encoded_size > max_bytes:
+            stop_reason = "max_bytes"
+            break
+        selected.append(line)
+        returned_bytes += encoded_size
+        index += 1
+    if not selected and index < requested_end:
+        line_bytes = len(lines[index].encode("utf-8"))
+        raise FileOperationError(
+            "requested line exceeds the output byte limit; raise --max-bytes "
+            "or use a format-specific reader",
+            {"path": target, "line": index + 1, "line_bytes": line_bytes,
+             "max_bytes": max_bytes, "maximum": MAX_READ_OUTPUT_BYTES},
+        )
+    if not stop_reason and index < line_count:
+        stop_reason = "limit"
+    complete = index >= line_count
+    content = "".join(selected)
+    end_line = start_line + len(selected) - 1 if selected else None
+    return {
+        "path": target,
+        "content": content,
+        "encoding": "utf-8",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "total_bytes": len(raw),
+        "returned_bytes": returned_bytes,
+        "line_count": line_count,
+        "start_line": start_line,
+        "end_line": end_line,
+        "complete": complete,
+        "stop_reason": stop_reason or None,
+        "next_start_line": None if complete else index + 1,
+        "placeholder_detection": "checked",
+    }
 
 
 def _snapshots(targets: list[str], operation: str, max_file_bytes: int = 0):

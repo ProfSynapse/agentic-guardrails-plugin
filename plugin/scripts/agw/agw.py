@@ -449,7 +449,12 @@ def cmd_unlink_link(args):
 
 def cmd_file(args):
     try:
-        if args.file_op == "write":
+        if args.file_op == "read":
+            data = file_ops.read_text_page(
+                args.path, start_line=args.start_line,
+                limit=args.limit, max_bytes=args.max_bytes,
+            )
+        elif args.file_op == "write":
             content = _read_text_payload(args.content_file, "content")
             data = file_ops.write_text(
                 args.path, content, expected_hash=args.expected_hash,
@@ -492,13 +497,19 @@ def cmd_file(args):
             raise file_ops.FileOperationError("unknown file operation")
     except (OSError, file_ops.FileOperationError) as exc:
         _file_err(args, exc)
-    _out(
-        args,
-        (f"{data['operation']} {data['path']}: "
-         f"{'changed' if data['changed'] else 'no change'} "
-         f"({data['after_hash']})"),
-        data,
-    )
+    if args.file_op == "read":
+        if args.json:
+            _out(args, data["content"], data)
+        else:
+            sys.stdout.write(data["content"])
+    else:
+        _out(
+            args,
+            (f"{data['operation']} {data['path']}: "
+             f"{'changed' if data['changed'] else 'no change'} "
+             f"({data['after_hash']})"),
+            data,
+        )
 
 
 def cmd_run(args):
@@ -950,8 +961,8 @@ def main(argv=None):
     )
     file_parser = sub.add_parser(
         "file", parents=[common],
-        help="atomic, recoverable text-file writes",
-        description=("Atomic text-file operations. Choose an operation, then run "
+        help="bounded reads and recoverable text-file writes",
+        description=("Exact text-file operations. Choose an operation, then run "
                      "`agw file <operation> --help` for only its arguments."),
     )
     file_sub = file_parser.add_subparsers(
@@ -976,6 +987,15 @@ def main(argv=None):
     file_dry_run = (["--dry-run"], {
         "action": "store_true", "help": "validate and hash without writing or archiving",
     })
+    add_file(
+        "read", "Read bounded UTF-8 text without scanning sibling files",
+        (["--start-line"], {"type": int, "default": 1, "help": "first line; 1-based"}),
+        (["--limit"], {"type": int, "default": file_ops.DEFAULT_READ_LINES,
+                        "help": "maximum lines"}),
+        (["--max-bytes"], {"type": int, "default": file_ops.DEFAULT_READ_BYTES,
+                            "help": "maximum UTF-8 output bytes"}),
+        example="agw file read app.log --start-line 201 --limit 100 --json",
+    )
     add_file(
         "write", "Write UTF-8 text atomically from a file or stdin",
         (["--content-file"], {"required": True, "help": "UTF-8 source file or -"}),

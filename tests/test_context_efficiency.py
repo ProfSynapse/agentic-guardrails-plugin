@@ -134,13 +134,18 @@ def test_each_office_leaf_help_is_bounded_and_single_purpose():
 
 def test_file_and_run_help_are_progressive_and_compact():
     family = _help("file")
+    read = _help("file", "read")
     write = _help("file", "write")
     run = _help("run")
     assert len(family) <= 700
     assert "--content-file" not in family
+    assert "--start-line" not in family
+    assert "--start-line" in read
+    assert "--max-bytes" in read
     assert "--content-file" in write
     assert "--patch" not in write
     assert "--output" in run
     assert "--expected-hash" in run
     assert len(write) <= 1_000
+    assert len(read) <= 900
     assert len(run) <= 800

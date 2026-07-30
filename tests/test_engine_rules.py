@@ -5,7 +5,7 @@ import os
 import shutil
 
 from core import engine
-from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, POLICY_ENFORCEMENT, \
+from core.events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, POLICY_ENFORCEMENT, \
     READ, WRITE, DecisionContext, ToolEvent
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
@@ -49,8 +49,21 @@ def test_windows_delete_regenerable_allowed(evaluate):
 def test_agw_read_only_verbs_allowed(evaluate):
     for command in ("agw scan .", "agw diff report.docx", "agw status",
                     "agw log", "agw doctor", "agw office info report.docx",
-                    "agw office get-text report.docx"):
+                    "agw office get-text report.docx", "agw file read --help"):
         assert evaluate(_agw(command)).action == ALLOW, command
+
+
+def test_agw_file_read_prescans_exact_content(policy, tmp_path):
+    target = tmp_path / "board.txt"
+    target.write_text("CONFIDENTIAL\nDo not distribute.\n", encoding="utf-8")
+    command = _agw(f'agw file read "{target}" --json')
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command=command, cwd=str(tmp_path)), policy, REPO,
+    )
+    assert decision.action == ASK
+    assert decision.rule_id == "builtin:content-prescan"
+    assert decision.presentation_details["operation"] == "read"
+    assert decision.presentation_details["targets"] == [str(target)]
 
 
 def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
@@ -310,11 +323,26 @@ def test_project_local_recursive_keyword_searches_are_routine(evaluate):
         "rg password tests",
         "grep -R credential plugin/scripts",
         r"Select-String -Path tests\*.py -Pattern api_key -Recurse",
+        r'rg -n "placeholder|credential|confidential" plugin/scripts tests | '
+        r'Select-Object -First 300',
     )
     for command in commands:
         decision = evaluate(command)
         assert decision.action == ALLOW, command
         assert decision.rule_id == "builtin:project-diagnostic-search"
+
+
+def test_credential_search_records_specific_scope_and_trigger(policy, tmp_path):
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command=f'rg credential "{tmp_path}"',
+            cwd=os.path.dirname(REPO)),
+        policy, REPO,
+    )
+    assert decision.action == ASK
+    assert decision.rule_id == "builtin:credential-hunt"
+    assert decision.presentation_details["targets"] == [str(tmp_path)]
+    assert "outside the verified project" in \
+        decision.presentation_details["trigger"]
 
 
 def test_keyword_search_exemption_rejects_unsafe_scope_or_effect(evaluate):

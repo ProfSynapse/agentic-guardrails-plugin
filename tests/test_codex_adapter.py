@@ -290,11 +290,13 @@ def test_codex_provider_receives_closed_human_prompt(monkeypatch, capsys, tmp_pa
     request = provider.request_value
     assert request is not None
     rendered = request.action + "\n" + request.primary_text()
-    assert "potentially sensitive file" in rendered
-    assert "Cancel to make no changes" in rendered
+    assert "wants to read" in rendered
+    assert "a confidentiality marking" in rendered
+    assert "keep the content out" in rendered
     assert request.allow_label == "Allow once"
     assert request.cancel_label == "Cancel (recommended)"
-    assert canary not in rendered
+    assert f"{canary}.txt" in rendered
+    assert str(tmp_path) not in rendered
 
 
 def test_unknown_target_patch_denies_without_provider(monkeypatch, capsys, tmp_path):

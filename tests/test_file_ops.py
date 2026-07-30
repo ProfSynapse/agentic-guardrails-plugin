@@ -56,6 +56,59 @@ def test_write_absent_dry_run_creates_no_file_or_recovery_record(tmp_path):
     assert store.discover_archive_transactions() == []
 
 
+def test_bounded_file_read_returns_hash_metadata_and_continuation(tmp_path):
+    target = tmp_path / "app.log"
+    target.write_bytes(b"one\ntwo\nthree\nfour\n")
+
+    first = file_ops.read_text_page(str(target), limit=2)
+    assert first["content"] == "one\ntwo\n"
+    assert first["sha256"] == store.file_sha256(str(target))
+    assert first["line_count"] == 4
+    assert first["start_line"] == 1
+    assert first["end_line"] == 2
+    assert first["complete"] is False
+    assert first["stop_reason"] == "limit"
+    assert first["next_start_line"] == 3
+
+    second = file_ops.read_text_page(str(target), start_line=3, limit=10)
+    assert second["content"] == "three\nfour\n"
+    assert second["complete"] is True
+    assert second["next_start_line"] is None
+    assert store.discover_archive_transactions() == []
+
+
+def test_file_read_byte_bound_returns_only_complete_lines(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_bytes(b"alpha\nbeta\ngamma\n")
+    result = file_ops.read_text_page(str(target), limit=10, max_bytes=11)
+    assert result["content"] == "alpha\nbeta\n"
+    assert result["returned_bytes"] == 11
+    assert result["stop_reason"] == "max_bytes"
+    assert result["next_start_line"] == 3
+
+
+def test_file_read_refuses_placeholder_before_open(tmp_path, monkeypatch):
+    target = tmp_path / "cloud.txt"
+    target.write_text("not opened", encoding="utf-8")
+    monkeypatch.setattr(file_ops.profiles, "is_placeholder", lambda *a, **k: True)
+    with pytest.raises(file_ops.FileOperationError) as caught:
+        file_ops.read_text_page(str(target))
+    assert caught.value.error_code == "placeholder_read_refused"
+
+
+def test_file_read_json_stdout_is_strict_and_paginated(tmp_path):
+    target = tmp_path / "notes.txt"
+    target.write_bytes(b"first\nsecond\n")
+    result = run_agw(
+        "file", "read", str(target), "--limit", "1", "--json",
+    )
+    payload = json.loads(result.stdout)
+    assert result.stderr == ""
+    assert payload["content"] == "first\n"
+    assert payload["next_start_line"] == 2
+    assert payload["complete"] is False
+
+
 def test_exact_unified_patch_and_replace(tmp_path):
     target = tmp_path / "app.txt"
     target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")

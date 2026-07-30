@@ -27,7 +27,7 @@ pagination. On PowerShell, use stdin or a file for fragile structured JSON.
 | Intent | Route | Read only if needed |
 |---|---|---|
 | Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
-| Construct or patch a text file | Exact `file <operation> --help` | None |
+| Read or change a text file | Exact `file <operation> --help` | None |
 | Run a write-capable script | `run --help`; exact outputs; optional narrow sidecar root | [recovery.md](references/recovery.md) |
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
@@ -40,8 +40,9 @@ Office operation routing: inspect with `info`/`get-text`; change text with
 `replace-text`; edit cells or raw rows with `set-cell`/`append-rows`; use
 `read-table`, `ensure-table`, `append-table-row`, or `update-table-row` for Excel
 tables; use `outline`, `read-blocks`, and `patch` for structured Word work.
-For large or quotation-sensitive text, use `file write`, `patch`, or `replace`
-with file/stdin input. Run scripts through `run` with exact outputs; it does not
+Use `file read` for bounded text. For large text writes, use `file write`,
+`patch`, or `replace` with file/stdin input. Run scripts through `run` with exact
+outputs; it does not
 enumerate siblings. Add a narrow root only for strict sidecar observation;
 unclaimed changes then fail the run.
 
