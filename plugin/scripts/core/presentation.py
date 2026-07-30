@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 
 from . import events
 from .decisions import GuardrailDecision, PromptRequest
@@ -211,10 +213,48 @@ def _target_count(evlist) -> int:
     return len({str(path) for ev in evlist for path in ev.paths if path})
 
 
+def _safe_display(value, *, file_name: bool = False) -> str:
+    """Render an untrusted path label without exposing raw command/content text."""
+    text = str(value or "")
+    if file_name:
+        text = os.path.basename(text.replace("\\", "/"))
+    elif os.path.isabs(text):
+        text = os.path.basename(text.rstrip("/\\")) or text
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "unnamed target"
+    return text if len(text) <= 96 else text[:93] + "..."
+
+
+def _detail_labels(decision: GuardrailDecision) -> tuple[str, ...]:
+    details = decision.presentation_details or {}
+    values = details.get("targets") or []
+    file_name = details.get("target_kind") == "file"
+    labels = tuple(_safe_display(value, file_name=file_name) for value in values[:4])
+    if len(values) > 4:
+        labels += (f"and {len(values) - 4} more",)
+    return labels
+
+
+def _natural_list(values: tuple[str, ...]) -> str:
+    if not values:
+        return "the requested target"
+    if len(values) == 1:
+        return values[0]
+    return ", ".join(values[:-1]) + " and " + values[-1]
+
+
 def _friendly_targets(decision: GuardrailDecision, evlist) -> tuple[str, ...]:
-    """Return only closed category/count labels, never path-derived text."""
+    """Return sanitized filenames/scopes when the engine supplied exact labels."""
     context = decision.presentation_context
     count = _target_count(evlist)
+    labels = _detail_labels(decision)
+    target_kind = (decision.presentation_details or {}).get("target_kind")
+    if labels and target_kind == "file":
+        return tuple(f"File: {label}" for label in labels)
+    if labels and target_kind == "search_scope":
+        return ("Search scope: " + _natural_list(labels),)
     if context == events.DecisionContext.AGW_ARCHIVE:
         return ("Stored Guardrails recovery copies",)
     if context == events.DecisionContext.AGW_MUTATION:
@@ -249,6 +289,27 @@ def _friendly_targets(decision: GuardrailDecision, evlist) -> tuple[str, ...]:
 
 
 def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
+    details = decision.presentation_details or {}
+    labels = _detail_labels(decision)
+    target_text = _natural_list(labels)
+    signal = str(details.get("signal") or "potentially sensitive information")
+    trigger = str(details.get("trigger") or "This operation needs confirmation.")
+    if details and decision.rule_id == "builtin:credential-hunt":
+        return (
+            f"The agent wants to search {target_text} for {signal}.",
+            trigger,
+            "Private matches could be included in the agent's work.",
+            "Choose Cancel to keep search results out of the agent's work.",
+        )
+    if details and decision.rule_id in {
+            "builtin:secret-file", "builtin:content-prescan",
+            "builtin:placeholder-read"}:
+        return (
+            f"The agent wants to read {target_text}, which may contain {signal}.",
+            trigger,
+            "The file's contents could be included in the agent's work.",
+            "Choose Cancel to keep the content out of the agent's work.",
+        )
     mapped = _COPY_BY_RULE.get(decision.rule_id)
     if mapped:
         return (*mapped, "Choose Cancel to make no changes.")
@@ -266,7 +327,7 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
             "The agent wants to read a potentially sensitive file.",
             "The file may contain private or confidential information.",
             "Its contents may be included in the agent's work.",
-            "Choose Cancel to make no changes.",
+            "Choose Cancel to keep the content out of the agent's work.",
         )
     if kinds & {events.WRITE, events.EDIT}:
         return (

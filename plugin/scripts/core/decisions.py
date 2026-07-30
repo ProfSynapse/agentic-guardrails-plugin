@@ -30,6 +30,7 @@ class GuardrailDecision:
     policy_health: str = ""
     enforcement_class: EnforcementClass = None
     presentation_context: DecisionContext = DecisionContext.UNKNOWN
+    presentation_details: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.enforcement_class = normalize_enforcement_class(
@@ -64,6 +65,9 @@ class GuardrailDecision:
             ),
             presentation_context=getattr(
                 decision, "presentation_context", DecisionContext.UNKNOWN
+            ),
+            presentation_details=dict(
+                getattr(decision, "presentation_details", {}) or {}
             ),
         )
 

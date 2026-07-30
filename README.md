@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.9` is the Windows-first stable release.
+> **Release status:** `0.3.10` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -31,6 +31,10 @@ don't fire there. Tracking:
   detection if a human edited it in the meantime.
 - Cloud-only placeholder files and `.gdoc` pointer stubs (the classic synced-
   folder data-loss traps) are detected and protected.
+- Exact UTF-8 text reads are bounded and paginated through `agw file read`,
+  with hashes and continuation metadata instead of unbounded shell output.
+- Sensitive-read and credential-search prompts name the sanitized filename or
+  scope, detected risk category, and the reason approval was triggered.
 - Anything archived comes back with `agw restore` or `agw undo`.
 
 ## Install
@@ -86,7 +90,7 @@ that string, so an update only lands once it changes:
 | `scripts/claude/` | Thin Claude adapter: tool call → neutral `ToolEvent`, decision → hook JSON. Fails **closed** (any internal error → "ask", never silent allow) |
 | `scripts/codex/` | Thin Codex adapter: same `ToolEvent` contract, plus `apply_patch` envelope parsing (Add→write, Update→edit+snapshot, Delete→blocked under CRUA) |
 | `scripts/core/` | Platform-neutral policy engine: shell parser (substitutions, `bash -c`, xargs, wrappers, decode-pipes), folder profiles, archive store, recovery metadata, and policy health |
-| `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): `scan`, `checkout`, `diff`, `publish`, `archive`, `restore`, `undo`, `move`, `snapshot`, `status`, `log`, `doctor`, plus `office` for targeted in-place docx/xlsx/pptx edits (replace-text, set-cell, append-rows) with automatic pre-image snapshots |
+| `scripts/agw/` + `bin/agw` / `bin/agw.cmd` | The `agw` CLI ("agent workspace"): bounded `file read`, recoverable text writes, scans, recovery, publishing, and targeted Office operations |
 | `policies/` | Editable YAML rules: command rules, content/snippet rules (regex → deny/ask), path zones. Per-machine drop-ins in `~/.agw/policies.d/` |
 | `skills/agentic-guardrails/` | One compact workflow router with safety references loaded only when needed |
 | CLI help | Progressive command discovery through `agw --help`, verb help, and Office operation help |

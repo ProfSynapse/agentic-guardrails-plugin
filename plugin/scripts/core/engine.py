@@ -1022,25 +1022,30 @@ def _within(path: str, root: str) -> bool:
         return False
 
 
-def _project_search_is_routine(cmd: SimpleCommand, event: ToolEvent,
-                               plugin_root: str) -> bool:
-    """True only for a static, read-only diagnostic inside the project."""
+def _project_search_assessment(cmd: SimpleCommand, event: ToolEvent,
+                               plugin_root: str) -> tuple[bool, str, list[str]]:
+    """Classify a credential-term search and explain any approval trigger."""
     _pattern, recursive, filename_only, scopes = _search_shape(cmd, event)
-    if not recursive or filename_only or not plugin_root:
-        return False
+    labels = [str(scope) for scope in scopes] or ["."]
+    if not recursive:
+        return False, "Guardrails could not verify this as a bounded recursive search.", labels
+    if filename_only:
+        return False, "The requested search shape could not be verified.", labels
+    if not plugin_root:
+        return False, "The active project root could not be verified.", labels
     if redirect_targets(event.command) or _has_mutation_evidence(event.command):
-        return False
+        return False, "The search command may also write or redirect output.", labels
     root = os.path.realpath(os.path.dirname(os.path.realpath(plugin_root)))
     cwd = os.path.realpath(event.cwd or os.getcwd())
     if not _within(cwd, root):
-        return False
+        return False, "The current folder is outside the verified project.", labels
     candidates = scopes or [cwd]
     for raw_scope in candidates:
         scope = str(raw_scope).strip("'\"")
         if not scope or any(marker in scope for marker in ("$", "%", "SUBST_OUT")):
-            return False
+            return False, "A search scope is dynamic or could not be resolved.", labels
         if _is_secret_path(scope):
-            return False
+            return False, "A search scope directly names a credential location.", labels
         static_prefix = re.split(r"[\*\?\[]", scope, maxsplit=1)[0] or "."
         resolved = os.path.realpath(os.path.expanduser(
             static_prefix.replace("\\", os.sep)
@@ -1048,10 +1053,10 @@ def _project_search_is_routine(cmd: SimpleCommand, event: ToolEvent,
             else os.path.join(cwd, static_prefix.replace("\\", os.sep))
         ))
         if not _within(resolved, root) or not os.path.exists(resolved):
-            return False
+            return False, "A search scope is missing or outside the verified project.", labels
         parts = {part.lower() for part in resolved.replace("\\", "/").split("/")}
         if parts & _CLOUD_SCOPE_PARTS:
-            return False
+            return False, "A search scope is inside a cloud-synced folder.", labels
         relative = os.path.relpath(resolved, root).replace("\\", "/")
         first = relative.split("/", 1)[0].lower()
         base = os.path.basename(resolved).lower()
@@ -1060,8 +1065,42 @@ def _project_search_is_routine(cmd: SimpleCommand, event: ToolEvent,
                 and suffix not in _DEV_SOURCE_SUFFIXES \
                 and suffix not in {".md", ".txt", ".log", ".jsonl"} \
                 and base not in _DEV_DOC_BASENAMES:
-            return False
-    return True
+            return False, "A scope is not a recognized project diagnostics location.", labels
+    return True, "The search is limited to verified project diagnostics.", labels
+
+
+def _project_search_is_routine(cmd: SimpleCommand, event: ToolEvent,
+                               plugin_root: str) -> bool:
+    return _project_search_assessment(cmd, event, plugin_root)[0]
+
+
+def _agw_file_read_target(args: list[str]) -> str:
+    """Return the literal path from a trusted `agw file read` invocation."""
+    try:
+        file_index = args.index("file")
+    except ValueError:
+        return ""
+    tail = args[file_index + 1:]
+    operation_index = next(
+        (index for index, value in enumerate(tail) if not value.startswith("-")),
+        None,
+    )
+    if operation_index is None or tail[operation_index] != "read":
+        return ""
+    value_options = {"--start-line", "--limit", "--max-bytes"}
+    index = operation_index + 1
+    while index < len(tail):
+        value = tail[index]
+        if value in value_options:
+            index += 2
+            continue
+        if value in {"--json", "-h", "--help"}:
+            index += 1
+            continue
+        if not value.startswith("-"):
+            return value
+        index += 1
+    return ""
 
 def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) -> Decision:
     if event.tool == "Monitor" and not event.command.strip():
@@ -1172,7 +1211,12 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                      "their contents would enter the conversation. Confirm this is "
                      "needed for the task.", "builtin:secret-file",
                 memo_key=f"secret-file:{'|'.join(sorted(set(secret_read_hits)))}",
-                presentation_context=DecisionContext.SENSITIVE_READ))
+                presentation_context=DecisionContext.SENSITIVE_READ,
+                presentation_details={
+                    "operation": "read", "targets": sorted(set(secret_read_hits)),
+                    "target_kind": "file", "signal": "account or access information",
+                    "trigger": "The selected filename identifies a credential-type file.",
+                }))
 
     for cmd in parsed.commands:
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
@@ -1244,6 +1288,20 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 enforcement_class=NON_WAIVABLE_INVARIANT,
                 presentation_context=context,
             )
+        if verb == "file":
+            read_target = _agw_file_read_target(args)
+            if read_target:
+                target = os.path.abspath(os.path.expanduser(
+                    read_target if os.path.isabs(read_target)
+                    else os.path.join(event.cwd or os.getcwd(), read_target)
+                ))
+                read_decision = _eval_read(ToolEvent(
+                    kind=READ, tool=event.tool, paths=[target], cwd=event.cwd,
+                    command=event.command, platform=event.platform,
+                    session_id=event.session_id, event_id=event.event_id,
+                ), policy)
+                if read_decision.action != DEFER:
+                    return read_decision
         if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFE_MUTATING_VERBS:
             return Decision(ALLOW, "", "builtin:agw")
         return Decision(
@@ -1304,7 +1362,10 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 "select-string"):
         pattern, recursive, filename_only, _scopes = _search_shape(cmd, event)
         if recursive and not filename_only and _HUNT_RE.search(pattern):
-            if _project_search_is_routine(cmd, event, plugin_root):
+            routine, trigger, scopes = _project_search_assessment(
+                cmd, event, plugin_root,
+            )
+            if routine:
                 return Decision(
                     ALLOW,
                     "A read-only diagnostic search stayed inside verified project files.",
@@ -1316,7 +1377,13 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                                  "would land in the conversation.",
                             "builtin:credential-hunt", memo_key=f"credential-hunt:{pattern}",
                             enforcement_class=NON_WAIVABLE_INVARIANT,
-                            presentation_context=DecisionContext.CREDENTIAL_SEARCH)
+                            presentation_context=DecisionContext.CREDENTIAL_SEARCH,
+                            presentation_details={
+                                "operation": "search", "targets": scopes,
+                                "target_kind": "search_scope",
+                                "signal": "credential-related terms",
+                                "trigger": trigger,
+                            })
 
     # content prescan for plain readers: "hey, this might contain a password"
     if name in _READER_CMDS:
@@ -1342,7 +1409,12 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                                          "pulls that into the conversation — confirm "
                                          "this is needed.", "builtin:content-prescan",
                                     memo_key=f"content-prescan:{p}",
-                                    presentation_context=DecisionContext.SENSITIVE_READ)
+                                    presentation_context=DecisionContext.SENSITIVE_READ,
+                                    presentation_details={
+                                        "operation": "read", "targets": [p],
+                                        "target_kind": "file", "signal": marker,
+                                        "trigger": "Guardrails detected a sensitive-content marker.",
+                                    })
 
     # protected-path mutation via shell
     if name in _MUTATOR_CMDS or name in ("rm",):
@@ -1503,7 +1575,13 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
                                            "trigger a download). Hydrate it first for "
                                            "reliable results.", "builtin:placeholder-read",
                                       memo_key=f"placeholder-read:{p}",
-                                      presentation_context=DecisionContext.SENSITIVE_READ))
+                                      presentation_context=DecisionContext.SENSITIVE_READ,
+                                      presentation_details={
+                                          "operation": "read", "targets": [p],
+                                          "target_kind": "file",
+                                          "signal": "cloud-only content",
+                                          "trigger": "The local file is marked for retrieval on access.",
+                                      }))
             continue
         if _is_secret_path(p):
             decisions.append(Decision(ASK, f"'{os.path.basename(p)}' is a credential-type "
@@ -1511,7 +1589,13 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
                                            "enter the conversation — confirm this is "
                                            "needed for the task.", "builtin:secret-file",
                                       memo_key=f"secret-file:{p}",
-                                      presentation_context=DecisionContext.SENSITIVE_READ))
+                                      presentation_context=DecisionContext.SENSITIVE_READ,
+                                      presentation_details={
+                                          "operation": "read", "targets": [p],
+                                          "target_kind": "file",
+                                          "signal": "account or access information",
+                                          "trigger": "The selected filename identifies a credential-type file.",
+                                      }))
             continue
         finding = _prescan_file(p)
         if finding:
@@ -1526,7 +1610,12 @@ def _eval_read(event: ToolEvent, policy: Policy) -> Decision:
                                            f"{marker}. Reading it pulls that into the "
                                            "conversation — confirm this is needed.",
                                       "builtin:content-prescan", memo_key=f"content-prescan:{p}",
-                                      presentation_context=DecisionContext.SENSITIVE_READ))
+                                      presentation_context=DecisionContext.SENSITIVE_READ,
+                                      presentation_details={
+                                          "operation": "read", "targets": [p],
+                                          "target_kind": "file", "signal": marker,
+                                          "trigger": "Guardrails detected a sensitive-content marker.",
+                                      }))
     return worst(decisions)
 
 

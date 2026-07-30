@@ -114,6 +114,9 @@ class Decision:
     policy_health: str = ""
     enforcement_class: EnforcementClass = None
     presentation_context: DecisionContext = DecisionContext.UNKNOWN
+    # Closed, engine-generated labels for an approval prompt. Never place file
+    # content or raw command text here; presentation sanitizes display strings.
+    presentation_details: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.enforcement_class = normalize_enforcement_class(
@@ -136,6 +139,7 @@ class Decision:
                 self.enforcement_class, other.enforcement_class
             ),
             winner.presentation_context,
+            dict(winner.presentation_details),
         )
         return merged
 
