@@ -11,8 +11,7 @@ PLUGIN_ROOT = (os.environ.get("PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_RO
 sys.path.insert(0, os.path.dirname(_HERE))
 
 def _launcher(platform=None):
-    platform = os.name if platform is None else platform
-    return "agw.cmd" if platform == "nt" else "agw"
+    return "agw"
 
 
 _AGW = _launcher()
@@ -25,7 +24,7 @@ _WINDOWS_PREREQUISITE = (
 )
 
 CONTEXT = f"""agentic-guardrails is active. Use `{_AGW}`; the trusted PreToolUse \
-hook resolves it to this active package before policy evaluation and execution.\
+hook resolves it to this package.\
 {_WINDOWS_PREREQUISITE} Treat CLI help as authoritative: request only \
 the narrowest relevant help (`--help`, `<verb> --help`, or `office <operation> \
 --help`); never load or repeat a full command catalog.
@@ -36,8 +35,8 @@ splatting, dynamic path joins, or mixed shell scripts that obscure mutations.
 - Separate discovery/read, validation/dry-run, mutation, and verification. Do not \
 bundle unrelated writes merely to save calls. Prefer the smallest reversible \
 operation plus compact JSON, pagination, or file/stdin input over clever quoting.
-For scripts that write, declare every output exactly; exact mode scans no siblings. \
-Use a narrow root for strict sidecars.
+For write scripts, declare every output; exact mode scans no siblings. Use reviewed \
+workflows for repeats; observed roots only detect sidecars.
 - Never delete: `archive` ordinary targets; `unlink-link` link objects; \
 `restore`/`undo` recover. Use targeted `office`, style-preserving \
 `checkout`/`publish`, or `publish-file` for staged output; no ad hoc Python/Node mutation.

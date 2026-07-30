@@ -32,6 +32,7 @@ PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.di
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 from core import archive_transactions as archive_tx  # noqa: E402
+from core import workflows                  # noqa: E402
 import converters                           # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
@@ -517,13 +518,35 @@ def cmd_run(args):
     if command and command[0] == "--":
         command = command[1:]
     try:
+        workflow = None
+        if args.workflow:
+            if args.output or args.expected_hash or args.output_root or args.output_pattern:
+                raise workflows.WorkflowError(
+                    "--workflow resolves its own output contract; do not combine it "
+                    "with --output, --expected-hash, --output-root, or --output-pattern"
+                )
+            workflow = workflows.resolve_run(args.workflow, command, args.cwd)
+            outputs = workflow["outputs"]
+            expected_hashes = workflow["expected_hashes"]
+            output_roots = workflow["output_roots"]
+            output_patterns = workflow["output_patterns"]
+        else:
+            outputs = args.output
+            expected_hashes = args.expected_hash
+            output_roots = args.output_root
+            output_patterns = args.output_pattern
         data = file_ops.run_declared(
-            command, args.output, expected_hashes=args.expected_hash,
+            command, outputs, expected_hashes=expected_hashes,
             cwd=args.cwd, dry_run=args.dry_run,
-            output_roots=args.output_root,
-            output_patterns=args.output_pattern,
+            output_roots=output_roots,
+            output_patterns=output_patterns,
+            allow_missing_output_parents=bool(workflow),
         )
-    except (OSError, file_ops.FileOperationError) as exc:
+        if workflow:
+            data["workflow"] = workflow["workflow"]
+            data["workflow_manifest_sha256"] = workflow["manifest_sha256"]
+            data["script_sha256"] = workflow["script_sha256"]
+    except (OSError, file_ops.FileOperationError, workflows.WorkflowError) as exc:
         _file_err(args, exc)
     human_parts = []
     if data.get("stdout_tail"):
@@ -539,6 +562,48 @@ def cmd_run(args):
         raise SystemExit(data["exit_code"])
     if data.get("executed") and not data.get("ok", True):
         raise SystemExit(2)
+
+
+def cmd_workflow(args):
+    try:
+        if args.workflow_op == "trust":
+            if not args.approve_trust:
+                raise workflows.WorkflowTrustError(
+                    "review the manifest and pass --approve-trust; the host will "
+                    "also request confirmation"
+                )
+            data = workflows.trust_manifest(
+                args.manifest, args.expected_manifest_hash, replace=args.replace,
+            )
+            human = (
+                ("trusted" if data["changed"] else "already trusted")
+                + f" workflow {data['workflow']}"
+            )
+        elif args.workflow_op == "list":
+            items = workflows.list_trusted()
+            data = {"workflows": items, "count": len(items)}
+            human = "\n".join(
+                item.get("id") or f"unverified record: {item.get('record', 'unknown')}"
+                for item in items
+            ) or "no trusted workflows"
+        elif args.workflow_op == "info":
+            record = workflows.load_trusted(args.workflow_id)
+            manifest = record["manifest"]
+            data = {
+                "id": manifest["id"], "description": manifest.get("description", ""),
+                "command": manifest["command"],
+                "allowed_roots": manifest["allowed_roots"],
+                "outputs": manifest["outputs"],
+                "observed_roots": manifest.get("observed_roots", []),
+                "manifest_sha256": record["manifest_sha256"],
+                "trusted_at": record["trusted_at"], "verified": True,
+            }
+            human = f"trusted workflow {manifest['id']} ({manifest['command']['runtime']})"
+        else:
+            raise workflows.WorkflowError("unknown workflow operation")
+    except (OSError, workflows.WorkflowError) as exc:
+        _file_err(args, exc)
+    _out(args, human, data)
 
 
 def cmd_publish_file(args):
@@ -1020,21 +1085,63 @@ def main(argv=None):
     )
     add(
         "run", cmd_run,
-        (["--output"], {"action": "append", "default": [],
+        (["--workflow"], {"default": "", "metavar": "ID",
+                           "help": "trusted hash-bound output contract"}),
+        (["--output"], {"action": "append", "default": [], "metavar": "FILE",
                         "help": "exact output; repeat"}),
-        (["--output-root"], {"action": "append", "default": [],
-                              "help": "opt-in observation root"}),
-        (["--output-pattern"], {"action": "append", "default": [],
-                                 "help": "allowed sidecar; needs root"}),
-        (["--expected-hash"], {"action": "append", "default": [],
-                               "help": "SHA-256/absent in output order"}),
-        (["--cwd"], {"default": "", "help": "working directory"}),
+        (["--output-root"], {"action": "append", "default": [], "metavar": "DIR",
+                              "help": "observed root (detection only)"}),
+        (["--output-pattern"], {"action": "append", "default": [], "metavar": "GLOB",
+                                 "help": "allowed observed sidecar; needs root"}),
+        (["--expected-hash"], {"action": "append", "default": [], "metavar": "HASH",
+                               "help": "SHA-256/absent per output"}),
+        (["--cwd"], {"default": "", "metavar": "DIR", "help": "working folder"}),
         (["--dry-run"], {"action": "store_true",
                           "help": "validate without executing"}),
-        (["command"], {"nargs": argparse.REMAINDER,
+        (["command"], {"nargs": argparse.REMAINDER, "metavar": "...",
                         "help": "command after --"}),
         help="run a command with declared, recoverable outputs",
     )
+    workflow_parser = sub.add_parser(
+        "workflow", parents=[common],
+        help="inspect or explicitly trust script output contracts",
+        description=("Trusted workflow records bind a data-only manifest to an "
+                     "exact script hash. Choose an operation, then request only "
+                     "that operation's help."),
+    )
+    workflow_sub = workflow_parser.add_subparsers(
+        dest="workflow_op", required=True, metavar="operation",
+    )
+    workflow_trust = workflow_sub.add_parser(
+        "trust", parents=[common],
+        help="user-approved installation of one hash-checked manifest",
+        description=("Validate and copy a workflow manifest into the protected "
+                     "Guardrails trust store. Repository manifests are inert until "
+                     "this explicit operation is approved."),
+    )
+    workflow_trust.add_argument("manifest", help="literal manifest JSON file")
+    workflow_trust.add_argument(
+        "--expected-manifest-hash", required=True,
+        help="expected SHA-256 of the manifest file",
+    )
+    workflow_trust.add_argument(
+        "--approve-trust", action="store_true",
+        help="confirm that the manifest and resolved script identity were reviewed",
+    )
+    workflow_trust.add_argument(
+        "--replace", action="store_true",
+        help="replace a different trusted record with the same id after review",
+    )
+    workflow_trust.set_defaults(fn=cmd_workflow)
+    workflow_list = workflow_sub.add_parser(
+        "list", parents=[common], help="list trusted workflow ids",
+    )
+    workflow_list.set_defaults(fn=cmd_workflow)
+    workflow_info = workflow_sub.add_parser(
+        "info", parents=[common], help="verify and inspect one trusted workflow",
+    )
+    workflow_info.add_argument("workflow_id", help="trusted workflow id")
+    workflow_info.set_defaults(fn=cmd_workflow)
     add("move", cmd_move, (["src"], {}), (["dest"], {}),
         help="logged, undoable move or rename")
     sub._name_parser_map["rename"] = sub._name_parser_map["move"]

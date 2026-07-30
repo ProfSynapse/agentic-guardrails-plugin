@@ -252,9 +252,6 @@ def test_sessionstart_survives_no_stdin():
 
 def test_sessionstart_uses_native_platform_launcher():
     context = _context(_run(START, {"hook_event_name": "SessionStart"}))
-    if os.name == "nt":
-        assert "agw.cmd" in context
-        assert "`agw <cmd>`" not in context
-    else:
-        assert "Use `agw`" in context
-        assert "bin/agw" not in context
+    assert "Use `agw`" in context
+    assert "Use `agw.cmd`" not in context
+    assert "bin/agw" not in context

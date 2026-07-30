@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import os
 import re
 
-from . import events
+from . import events, workflows
 from .shellparse import ParseUncertain, extract_commands
 
 
@@ -31,8 +31,12 @@ _LOCAL_MUTATION_NAMES = {
 }
 _SCRIPT_INTERPRETERS = {
     "python", "python3", "py", "node", "ruby", "perl", "php",
+    "powershell", "pwsh", "bash", "sh", "zsh",
 }
-_SCRIPT_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php"}
+_SCRIPT_SUFFIXES = {
+    ".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php",
+    ".ps1", ".psm1", ".sh", ".bash",
+}
 _SCRIPT_WRITE_EVIDENCE = re.compile(
     r"(?ix)(?:"
     r"writeFile(?:Sync)?\s*\(|appendFile(?:Sync)?\s*\(|createWriteStream\s*\(|"
@@ -41,6 +45,11 @@ _SCRIPT_WRITE_EVIDENCE = re.compile(
     r"|\.save\s*\("
     r"|\b(?:os\.replace|os\.rename|shutil\.(?:copy|copy2|move))\s*\("
     r"|\.xlsx\.write(?:File|Buffer)?\s*\(|@oai/artifact-tool"
+    r"|\b(?:Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|"
+    r"Remove-Item)\b"
+    r"|\[(?:System\.)?IO\.(?:File|Directory)\]::(?:Write|Create|Copy|Move|Delete)"
+    r"|(?:^|[;\n])\s*(?:cp|mv|touch|mkdir|rm|install|tee|truncate)\b"
+    r"|(?<!>)>(?!>)\s*[^\s&|;]+"
     r")"
 )
 
@@ -123,6 +132,24 @@ def _write_capable_script(command: str, cwd: str, dialect: str = None) -> str:
     return ""
 
 
+def _matching_trusted_workflow(command: str, cwd: str, dialect: str = None) -> str:
+    """Find a valid integration only to produce a compact remediation hint."""
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return ""
+    for cmd in parsed.commands:
+        if cmd.name not in _SCRIPT_INTERPRETERS:
+            continue
+        try:
+            workflow_id = workflows.matching_workflow(cmd.argv, cwd or os.getcwd())
+        except (OSError, workflows.WorkflowError):
+            continue
+        if workflow_id:
+            return workflow_id
+    return ""
+
+
 @dataclass
 class MutationPlan:
     targets: list[str] = field(default_factory=list)
@@ -190,10 +217,20 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                 )
                 if opaque_script:
                     result.mutating = True
+                    workflow_id = _matching_trusted_workflow(
+                        ev.command, ev.cwd, dialect=dialect
+                    )
+                    if workflow_id:
+                        raise ValueError(
+                            "the script has a trusted output contract but direct "
+                            "interpreter execution cannot apply it; use "
+                            f"`agw run --workflow {workflow_id} -- <command>`"
+                        )
                     raise ValueError(
-                        "the script may write files but does not declare every output; "
-                        "run it with `agw run --output <path> --expected-hash <hash> "
-                        "-- <command>` so Guardrails can capture pre-images"
+                        "the script may write files but has no pre-execution output "
+                        "contract; use `agw run --output <path> --expected-hash <hash> "
+                        "-- <command>`, or install a reviewed reusable contract with "
+                        "`agw workflow trust --help`"
                     )
                 surface = _NULL_REDIRECT.sub("", _unquoted_surface(ev.command))
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \

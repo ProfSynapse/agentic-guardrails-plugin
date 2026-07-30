@@ -118,10 +118,11 @@ newest version of anything. `agw doctor` reports current size and budget.
   Structured operations are tested against `openpyxl 3.1.5` and
   `python-docx 1.2.0`. Keep runtime versions within `openpyxl >=3.1.5,<3.2`
   and `python-docx >=1.2.0,<1.3` until a newer compatibility lane passes.
-- Agents use `agw` on POSIX or `agw.cmd` on Windows. SessionStart teaches the
-  short form, and PreToolUse replaces only that literal leading token with the
+- Agents use `agw` on every platform. SessionStart teaches that short form, and
+  PreToolUse replaces only that literal leading token with the
   active package launcher before evaluation and execution. A workspace shim
-  cannot shadow it, and no PATH or shell-profile change is required.
+  cannot shadow it, and no PATH or shell-profile change is required. The
+  packaged `agw.cmd` remains available as a Windows compatibility detail.
 - Hooks and SessionStart do not modify the process, user, or machine PATH. Both
   host manifests dispatch through their host-provided plugin root, and the
   Windows launcher works when Python and Windows System32 are already

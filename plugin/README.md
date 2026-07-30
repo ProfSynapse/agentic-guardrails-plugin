@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.10` is the Windows-first stable release.
+> **Release status:** `0.3.11` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -106,7 +106,8 @@ so the agent self-corrects instead of fighting the rails:
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
 | unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
-| opaque write-capable script | `agw run --output PATH -- command` (add a narrow `--output-root` only for strict sidecar observation) |
+| one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
+| repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 
 Structured Office operations are also available:
@@ -163,11 +164,17 @@ dry runs, publish through same-directory stages, and record verified pre-images
 or ABSENT tombstones. `agw run` executes a command only after every declared
 output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders, so unrelated app or sync-client updates are ignored.
-Explicit, bounded `--output-root` manifests detect unclaimed observed changes;
-intentional companion files can be declared with relative patterns. Because a
-directory diff cannot prove process ownership, root observations should be used
-only for narrow, stable folders. Compact, bounded stdout/stderr tails are
-included in JSON results. `publish-file` validates a staged hash, captures one
+Reviewed repeated tools can install a data-only, script-hash-bound manifest with
+`agw workflow trust`, then use `agw run --workflow ID`; a repository manifest is
+inert until that explicit user-confirmed trust step. Explicit, bounded
+`--output-root` manifests detect unclaimed observed changes, and relative
+patterns can identify intentional companion files. This is after-the-fact
+detection, not prevention or recovery for unknown files, and it cannot prove
+which process caused a change. Use only narrow, stable roots and declare
+deterministic sidecars exactly whenever possible. See the
+[trusted-workflow reference](skills/agentic-guardrails/references/trusted-workflows.md).
+Compact, bounded stdout/stderr tails are included in JSON results. `publish-file`
+validates a staged hash, captures one
 target pre-image,
 retries only atomic replacement for a bounded interval, and preserves the stage
 when a sync client keeps the target busy.

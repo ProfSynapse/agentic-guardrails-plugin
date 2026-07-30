@@ -41,6 +41,7 @@ scripts/core/presentation.py
 scripts/core/profiles.py
 scripts/core/shellparse.py
 scripts/core/store.py
+scripts/core/workflows.py
 policies
 commands
 skills
