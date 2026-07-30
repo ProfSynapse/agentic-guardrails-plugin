@@ -30,6 +30,7 @@ scripts/core/decisions.py
 scripts/core/enforcement.py
 scripts/core/engine.py
 scripts/core/events.py
+scripts/core/launcher.py
 scripts/core/mcpshell.py
 scripts/core/miniyaml.py
 scripts/core/mutations.py

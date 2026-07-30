@@ -1193,44 +1193,38 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
     name = cmd.name
     cfg = cfg or {}
 
-    # trusted agw verbs
+    # Trusted agw verbs. Bare names must resolve to the exact active package;
+    # maintained adapters normally expand the short form before evaluation.
     if name in {"agw", "agw.py", "agw.cmd"}:
         head = cmd.argv[0]
         root = os.path.realpath(plugin_root) if plugin_root else ""
-        if name == "agw.cmd":
-            if "/" in head or "\\" in head or os.path.isabs(head):
-                real = os.path.realpath(head if os.path.isabs(head)
-                                        else os.path.join(event.cwd or ".", head))
-            else:
-                resolved = shutil.which(head)
-                real = os.path.realpath(resolved) if resolved else ""
-            expected = os.path.realpath(os.path.join(root, "bin", "agw.cmd")) \
-                if root else ""
-            try:
-                trusted = bool(real and expected) and \
-                    os.path.commonpath([real, root]) == root and \
-                    os.path.normcase(real) == os.path.normcase(expected)
-            except ValueError:
-                trusted = False
-            if not trusted:
-                return Decision(
-                    DENY,
-                    "This Windows launcher could not be verified as the packaged "
-                    "Guardrails launcher.",
-                    "builtin:agw-impostor",
-                    enforcement_class=NON_WAIVABLE_INVARIANT,
-                    presentation_context=DecisionContext.AGW_UNKNOWN,
-                )
-        elif "/" in head or "\\" in head:
+        expected_rel = {
+            "agw": os.path.join("bin", "agw"),
+            "agw.cmd": os.path.join("bin", "agw.cmd"),
+            "agw.py": os.path.join("scripts", "agw", "agw.py"),
+        }[name]
+        expected = os.path.realpath(os.path.join(root, expected_rel)) if root else ""
+        if "/" in head or "\\" in head or os.path.isabs(head):
             real = os.path.realpath(head if os.path.isabs(head)
                                     else os.path.join(event.cwd or ".", head))
-            try:
-                trusted = not root or os.path.commonpath([real, root]) == root
-            except ValueError:
-                trusted = False
-            if not trusted:
-                return Decision(DENY, "An `agw` outside the guardrails plugin is not "
-                                      "trusted.", "builtin:agw-impostor")
+        else:
+            resolved = shutil.which(head)
+            real = os.path.realpath(resolved) if resolved else ""
+        try:
+            trusted = bool(real and expected and root) and \
+                os.path.commonpath([real, root]) == root and \
+                os.path.normcase(real) == os.path.normcase(expected)
+        except ValueError:
+            trusted = False
+        if not trusted:
+            return Decision(
+                DENY,
+                "This launcher could not be verified as the active packaged "
+                "Guardrails launcher.",
+                "builtin:agw-impostor",
+                enforcement_class=NON_WAIVABLE_INVARIANT,
+                presentation_context=DecisionContext.AGW_UNKNOWN,
+            )
         args = cmd.argv[1:]
         verb = next((a for a in args if not a.startswith("-")), "")
         if not verb and any(a in {"-h", "--help", "-V", "--version"} for a in args):

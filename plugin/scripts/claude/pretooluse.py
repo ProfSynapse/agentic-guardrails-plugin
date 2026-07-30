@@ -33,11 +33,25 @@ PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 102
 
 def main():
     payload = json.load(sys.stdin)
-    from core import approvals, auditlog, enforcement, engine, events, mutations, preimages, \
-        presentation, store
+    from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
+        preimages, presentation, store
     from core.decisions import GuardrailDecision
 
-    event = to_event(payload)
+    evaluation_payload = payload
+    rewritten_command = None
+    if payload.get("tool_name") in {"Bash", "PowerShell"}:
+        tool_input = payload.get("tool_input") or {}
+        shell = "powershell" if payload.get("tool_name") == "PowerShell" else "posix"
+        rewritten_command = launcher.rewrite_shortcut(
+            tool_input.get("command", ""), PLUGIN_ROOT, shell=shell
+        )
+        if rewritten_command:
+            evaluation_payload = dict(payload)
+            evaluation_payload["tool_input"] = launcher.updated_tool_input(
+                payload, rewritten_command
+            )
+
+    event = to_event(evaluation_payload)
     policy = engine.load_policy(PLUGIN_ROOT)
     cfg = engine.resolve_settings(policy)
     decision = engine.evaluate(event, policy, PLUGIN_ROOT)
@@ -114,21 +128,25 @@ def main():
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
-        json.dump(out, sys.stdout)
+        json.dump(launcher.attach_rewrite(
+            out, payload, rewritten_command, may_run=True
+        ), sys.stdout)
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
-        json.dump({"systemMessage": f"agentic-guardrails ({label}): would have "
-                                    f"{decision.action.upper()} — {decision.reason}"},
-                  sys.stdout)
+        out = {"systemMessage": f"agentic-guardrails ({label}): would have "
+                                f"{decision.action.upper()} — {decision.reason}"}
+        json.dump(launcher.attach_rewrite(
+            out, payload, rewritten_command, may_run=True
+        ), sys.stdout)
         return
 
     if effective.action == events.ASK and decision.memo_key and cfg.get("session_memory"):
         fingerprint = presentation.operation_fingerprint(
-            payload, [event], decision.policy_revision
+            evaluation_payload, [event], decision.policy_revision
         )
         approvals.record_pending_approval(
-            payload, event.session_id, decision.memo_key,
+            evaluation_payload, event.session_id, decision.memo_key,
             decision.policy_revision, fingerprint,
         )
 
@@ -136,7 +154,7 @@ def main():
     if effective.action in (events.ALLOW, events.ASK, events.DENY):
         if effective.action == events.ASK:
             prompt_decision = GuardrailDecision.from_legacy(decision)
-            request = presentation.build_prompt(prompt_decision, payload, [event])
+            request = presentation.build_prompt(prompt_decision, evaluation_payload, [event])
             reason = request.action + "\n\n" + request.primary_text()
         elif effective.action == events.DENY:
             reason = presentation.build_denial_feedback(
@@ -152,6 +170,10 @@ def main():
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
+
+    out = launcher.attach_rewrite(
+        out, payload, rewritten_command, may_run=effective.action != events.DENY
+    )
 
     # Opportunistic retention: keep the store under a configured budget.
     try:

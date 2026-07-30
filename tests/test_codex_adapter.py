@@ -101,6 +101,35 @@ def test_bash_rm_denied():
     assert "agw archive" in _reason(out)
 
 
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_short_agw_is_rewritten_to_active_package(tool):
+    out = run_hook({
+        "tool_name": tool,
+        "tool_input": {"command": "agw status --json", "description": "status"},
+        "cwd": REPO,
+        "session_id": f"short-agw-{tool}",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    updated = specific["updatedInput"]
+    assert updated["description"] == "status"
+    expected = "agw.cmd" if os.name == "nt" else os.path.join("bin", "agw")
+    assert expected in updated["command"]
+    assert updated["command"].endswith(" status --json")
+
+
+def test_short_agw_rewrite_never_hides_a_denied_compound_command():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {"command": "agw status; Remove-Item important.txt"},
+        "cwd": REPO,
+        "session_id": "short-agw-compound-deny",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+
+
 def test_bash_benign_defers():
     out = run_hook({"tool_name": "Bash", "tool_input": {"command": "git status"},
                     "cwd": "/tmp", "session_id": "c1"})

@@ -2,7 +2,6 @@
 """Claude SessionStart adapter: bootstrap the store, warm caches, and inject
 the agw vocabulary as context (skill auto-trigger is fallible; this is not)."""
 import json
-import ntpath
 import os
 import sys
 
@@ -12,9 +11,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 def _launcher(platform=None):
     platform = os.name if platform is None else platform
-    if platform == "nt":
-        return f'"{ntpath.join(PLUGIN_ROOT, "bin", "agw.cmd")}"'
-    return f'"{os.path.join(PLUGIN_ROOT, "bin", "agw").replace(chr(92), "/")}"'
+    return "agw.cmd" if platform == "nt" else "agw"
 
 
 _AGW = _launcher()
@@ -26,8 +23,9 @@ _WINDOWS_PREREQUISITE = (
     if os.name == "nt" else ""
 )
 
-CONTEXT = f"""agentic-guardrails is active. Use the exact packaged launcher \
-`{_AGW}`.{_WINDOWS_PREREQUISITE} Treat CLI help as authoritative: request only \
+CONTEXT = f"""agentic-guardrails is active. Use `{_AGW}`; the trusted PreToolUse \
+hook resolves it to this active package before policy evaluation and execution.\
+{_WINDOWS_PREREQUISITE} Treat CLI help as authoritative: request only \
 the narrowest relevant help (`--help`, `<verb> --help`, or `office <operation> \
 --help`); never load or repeat a full command catalog.
 Operating principles:

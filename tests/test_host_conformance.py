@@ -1,6 +1,7 @@
 """Release-blocking parity contracts for maintained and planned hosts."""
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from claude import adapter_common as claude_adapter
 from claude.adapter_common import to_event
 from codex import adapter_common as codex_adapter
 from codex.adapter_common import to_events
-from core import engine, events
+from core import engine, events, launcher
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,9 +68,9 @@ def test_monitor_normalizer_contract_is_explicit_and_literal_only():
     ("Bash", "rm important.txt", events.DENY),
     ("PowerShell", "Remove-Item important.txt", events.DENY),
     ("Monitor", "rm important.txt", events.DENY),
-    ("Bash", "agw status", events.ALLOW),
-    ("PowerShell", "agw status", events.ALLOW),
-    ("Monitor", "agw status", events.ALLOW),
+    ("Bash", "agw status", events.DENY),
+    ("PowerShell", "agw status", events.DENY),
+    ("Monitor", "agw status", events.DENY),
 ])
 def test_claude_and_codex_reach_same_core_decision(tool, command, expected):
     payload = {"tool_name": tool, "tool_input": {"command": command},
@@ -86,12 +87,48 @@ def test_sessionstart_uses_platform_native_launcher():
     from codex import sessionstart as codex_start
 
     for module in (claude_start, codex_start):
-        assert module._launcher("nt").endswith('bin\\agw.cmd"')
-        assert module._launcher("posix").endswith('bin/agw"')
-        expected = "agw.cmd" if os.name == "nt" else "bin/agw"
+        assert module._launcher("nt") == "agw.cmd"
+        assert module._launcher("posix") == "agw"
+        expected = "agw.cmd" if os.name == "nt" else "`agw`"
         assert expected in module.CONTEXT
-        if os.name == "nt":
-            assert "`agw <cmd>`" not in module.CONTEXT
+        assert str(PLUGIN) not in module.CONTEXT
+        assert "trusted PreToolUse hook" in module.CONTEXT
+
+
+def test_short_launcher_expansion_is_exact_and_boundary_aware():
+    windows = launcher.rewrite_shortcut(
+        "  agw.cmd status --json", str(PLUGIN), platform="nt", shell="powershell"
+    )
+    assert windows.startswith("  & '")
+    assert "bin\\agw.cmd' status --json" in windows
+
+    posix = launcher.rewrite_shortcut(
+        "agw status --json", str(PLUGIN), platform="posix", shell="posix"
+    )
+    assert str(PLUGIN / "bin" / "agw") in posix
+    assert posix.endswith(" status --json")
+
+    for command in ("agwx status", "./agw status", "'agw' status",
+                    "echo agw status", "MODE=test agw status"):
+        assert launcher.rewrite_shortcut(
+            command, str(PLUGIN), platform="posix", shell="posix"
+        ) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
+def test_windows_short_launcher_expansion_executes_real_cli(tmp_path):
+    command = launcher.rewrite_shortcut(
+        "agw.cmd status --json", str(PLUGIN), platform="nt", shell="powershell"
+    )
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"))
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        text=True, capture_output=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["archive_bytes"] == 0
+    assert status["incomplete_office_transactions"] == []
 
 
 def test_sessionstart_uses_host_approval_without_security_workarounds():

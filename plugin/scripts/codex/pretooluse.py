@@ -49,11 +49,25 @@ ASK_MODAL_TIMEOUT = int(os.environ.get("AGW_ASK_MODAL_TIMEOUT", 100))
 
 def main(approval_provider=None):
     payload = json.load(sys.stdin)
-    from core import approvals, auditlog, enforcement, engine, events, mutations, preimages, \
-        presentation, store
+    from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
+        preimages, presentation, store
     from core.decisions import GuardrailDecision
 
-    evlist = to_events(payload)
+    evaluation_payload = payload
+    rewritten_command = None
+    if payload.get("tool_name") in {"Bash", "PowerShell"}:
+        tool_input = payload.get("tool_input") or {}
+        rewritten_command = launcher.rewrite_shortcut(
+            tool_input.get("command", ""), PLUGIN_ROOT,
+            shell="powershell" if os.name == "nt" else "posix",
+        )
+        if rewritten_command:
+            evaluation_payload = dict(payload)
+            evaluation_payload["tool_input"] = launcher.updated_tool_input(
+                payload, rewritten_command
+            )
+
+    evlist = to_events(evaluation_payload)
     policy = engine.load_policy(PLUGIN_ROOT)
     cfg = engine.resolve_settings(policy)
     observe = cfg.get("enforcement") == "observe"
@@ -158,14 +172,19 @@ def main(approval_provider=None):
     # Advisory findings never prompt/block; safety invariants retain their
     # ASK/DENY action at every enforcement level.
     if memoed:
-        json.dump({"systemMessage": f"agentic-guardrails: already approved this session "
-                                    f"({decision.rule_id}); not re-asking."}, sys.stdout)
+        out = {"systemMessage": f"agentic-guardrails: already approved this session "
+                                f"({decision.rule_id}); not re-asking."}
+        json.dump(launcher.attach_rewrite(
+            out, payload, rewritten_command, may_run=True
+        ), sys.stdout)
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
-        json.dump({"systemMessage": f"agentic-guardrails ({label}): would have "
-                                    f"{decision.action.upper()} - {decision.reason}"},
-                  sys.stdout)
+        out = {"systemMessage": f"agentic-guardrails ({label}): would have "
+                                f"{decision.action.upper()} - {decision.reason}"}
+        json.dump(launcher.attach_rewrite(
+            out, payload, rewritten_command, may_run=True
+        ), sys.stdout)
         return
 
     # Codex can't render a hook 'ask' prompt, so an emitted ASK would silently
@@ -176,7 +195,7 @@ def main(approval_provider=None):
     if action == events.ASK:
         sid = payload.get("session_id", "")
         prompt_decision = GuardrailDecision.from_legacy(decision)
-        request = presentation.build_prompt(prompt_decision, payload, evlist)
+        request = presentation.build_prompt(prompt_decision, evaluation_payload, evlist)
         try:
             provider = approval_provider or approvals.default_provider(ASK_MODAL_TIMEOUT)
             response = approvals.request_approval(prompt_decision, request, provider)
@@ -228,6 +247,10 @@ def main(approval_provider=None):
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
+
+    out = launcher.attach_rewrite(
+        out, payload, rewritten_command, may_run=action != events.DENY
+    )
 
     # Opportunistic retention: keep the store under a configured budget.
     try:

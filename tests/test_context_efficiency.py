@@ -52,6 +52,22 @@ def test_always_on_context_is_small_and_has_no_operation_catalog():
         assert len(context.split()) <= 330
         assert "append-table-row" not in context
         assert "office <operation>" in context
+        assert str(PLUGIN) not in context
+        assert "trusted PreToolUse hook" in context
+
+
+def test_short_launcher_removes_repeated_package_path_tokens():
+    operation = " run --json --output artifact.xlsx -- node build.mjs"
+    for platform, short, binary in (
+        ("nt", "agw.cmd", PLUGIN / "bin" / "agw.cmd"),
+        ("posix", "agw", PLUGIN / "bin" / "agw"),
+    ):
+        legacy = f'"{binary}"{operation}'
+        compact = f"{short}{operation}"
+        assert _estimated_tokens(compact) < _estimated_tokens(legacy) * 0.65
+        module_value = claude_start._launcher(platform)
+        assert module_value == short
+        assert codex_start._launcher(platform) == short
 
 
 def test_always_on_context_encodes_operating_principles():

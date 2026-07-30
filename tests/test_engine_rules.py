@@ -11,6 +11,12 @@ from core.events import ALLOW, ASK, DENY, DEFER, EDIT, MCP, POLICY_ENFORCEMENT, 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 
 
+def _agw(command):
+    launcher = os.path.join(REPO, "bin", "agw")
+    assert command == "agw" or command.startswith("agw ")
+    return f'"{launcher}"{command[3:]}'
+
+
 def _ev(kind, **kw):
     return ToolEvent(kind=kind, tool=kw.pop("tool", "Write"), **kw)
 
@@ -44,7 +50,7 @@ def test_agw_read_only_verbs_allowed(evaluate):
     for command in ("agw scan .", "agw diff report.docx", "agw status",
                     "agw log", "agw doctor", "agw office info report.docx",
                     "agw office get-text report.docx"):
-        assert evaluate(command).action == ALLOW, command
+        assert evaluate(_agw(command)).action == ALLOW, command
 
 
 def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
@@ -59,26 +65,35 @@ def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
         "agw run --output tracker.xlsx -- node build_tracker.mjs",
     )
     for command in commands:
-        assert evaluate(command).action == ALLOW, command
+        assert evaluate(_agw(command)).action == ALLOW, command
 
 
 def test_agw_unknown_verbs_ask_nonwaivably(evaluate):
     commands = ("agw future-operation file.txt", "agw --json")
     for command in commands:
-        decision = evaluate(command)
+        decision = evaluate(_agw(command))
         assert decision.action == ASK, command
         assert decision.enforcement_class.name == "NON_WAIVABLE_INVARIANT"
 
 
 def test_agw_help_has_no_empty_unknown_verb(evaluate):
-    for command in ("agw --help", "agw -h", "agw.py --version"):
+    script = os.path.join(REPO, "scripts", "agw", "agw.py")
+    for command in (_agw("agw --help"), _agw("agw -h"),
+                    f'"{script}" --version'):
         decision = evaluate(command)
         assert decision.action == ALLOW
         assert "unknown" not in (decision.reason or "").lower()
 
 
 def test_agw_prune_always_asks(evaluate):
-    assert evaluate("agw prune --yes-i-am-a-human").action == ASK
+    assert evaluate(_agw("agw prune --yes-i-am-a-human")).action == ASK
+
+
+def test_unresolved_bare_agw_names_are_never_privileged(evaluate):
+    for command in ("agw status", "agw.cmd status", "agw.py --version"):
+        decision = evaluate(command)
+        assert decision.action == DENY
+        assert decision.rule_id == "builtin:agw-impostor"
 
 
 def test_packaged_agw_cmd_requires_exact_trusted_origin(policy, tmp_path, monkeypatch):
