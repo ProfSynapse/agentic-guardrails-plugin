@@ -156,6 +156,30 @@ def test_short_agw_pipeline_receiver_is_rewritten_to_active_package(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
+def test_short_agw_later_statement_is_rewritten_to_active_package(tmp_path):
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": (
+                "$oldText = 'before'; $newText = 'after'; "
+                "agw file replace 'ledger.txt' --old $oldText --new $newText "
+                "--dry-run --json"
+            ),
+            "description": "validate replacement",
+        },
+        "cwd": str(tmp_path),
+        "session_id": "short-agw-statement-codex",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    updated = specific["updatedInput"]
+    assert updated["description"] == "validate replacement"
+    assert "; & '" in updated["command"]
+    assert "bin\\agw.cmd' file replace 'ledger.txt'" in updated["command"]
+    assert "; agw file replace" not in updated["command"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
 def test_pipeline_rewrite_never_hides_a_denied_later_statement():
     out = run_hook({
         "tool_name": "PowerShell",
@@ -164,6 +188,21 @@ def test_pipeline_rewrite_never_hides_a_denied_later_statement():
         },
         "cwd": REPO,
         "session_id": "short-agw-pipeline-compound-codex",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
+def test_statement_rewrite_never_hides_a_denied_earlier_statement():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": "Remove-Item important.txt; agw status"
+        },
+        "cwd": REPO,
+        "session_id": "short-agw-statement-compound-codex",
     })
     specific = out["hookSpecificOutput"]
     assert specific["permissionDecision"] == "deny"

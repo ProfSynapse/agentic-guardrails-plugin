@@ -155,6 +155,36 @@ def test_windows_short_launcher_rewrites_literal_pipeline_receiver():
     assert "| agw file write" not in rewritten
 
 
+def test_windows_short_launcher_rewrites_literal_later_statement():
+    original = (
+        "$oldText = 'before'; $newText = 'after'; "
+        "agw file replace 'ledger.md' --old $oldText --new $newText "
+        "--dry-run --json"
+    )
+    rewritten = launcher.rewrite_shortcut(
+        original, str(PLUGIN), platform="nt", shell="powershell",
+    )
+    assert "$oldText = 'before'; $newText = 'after'; & '" in rewritten
+    assert "bin\\agw.cmd' file replace 'ledger.md'" in rewritten
+    assert "--old $oldText --new $newText --dry-run --json" in rewritten
+    assert "; agw file replace" not in rewritten
+
+
+def test_windows_short_launcher_rewrites_after_completed_here_string():
+    original = (
+        "$oldText = @'\nbefore\n'@\n"
+        "$newText = @'\nafter\n'@\n"
+        "agw file replace 'ledger.md' --old $oldText --new $newText "
+        "--dry-run --json"
+    )
+    rewritten = launcher.rewrite_shortcut(
+        original, str(PLUGIN), platform="nt", shell="powershell",
+    )
+    assert "$oldText = @'\nbefore\n'@\n" in rewritten
+    assert "$newText = @'\nafter\n'@\n& '" in rewritten
+    assert "bin\\agw.cmd' file replace 'ledger.md'" in rewritten
+
+
 def test_windows_pipeline_receiver_encodes_static_unicode_arguments():
     filename = "🗺 ledger 日本語.md"
     original = (
@@ -287,6 +317,30 @@ def test_windows_pipeline_receiver_writes_stdin_with_recovery(tmp_path):
     ]
     assert len(records) == 1
     assert records[0]["kind"] == "absent_tombstone"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
+def test_windows_later_statement_runs_file_replace_dry_run(tmp_path):
+    target = tmp_path / "replace target.txt"
+    target.write_text("before", encoding="utf-8")
+    escaped = str(target).replace("'", "''")
+    command = launcher.rewrite_shortcut(
+        "$oldText = 'before'; $newText = 'after'; "
+        f"agw file replace '{escaped}' --old $oldText --new $newText "
+        "--dry-run --json",
+        str(PLUGIN), platform="nt", shell="powershell",
+    )
+    home = tmp_path / "agw-home"
+    env = dict(os.environ, AGW_HOME=str(home))
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        text=True, encoding="utf-8", capture_output=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert target.read_text(encoding="utf-8") == "before"
+    assert not (home / "transactions").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
