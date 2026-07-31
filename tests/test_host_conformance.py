@@ -15,6 +15,26 @@ from core import engine, events, launcher
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugin"
+UNICODE_FILENAMES = (
+    "\U0001f5fa map.md",                         # non-BMP map
+    "\U0001f600 grin.md",                        # non-BMP face
+    "\U0001f469\U0001f3fd\u200d\U0001f4bb developer.md",  # modifier + ZWJ
+    "\u2615\ufe0f coffee.md",                    # BMP + variation selector
+    "\U0001f1ef\U0001f1f5 flag.md",              # regional-indicator pair
+    "#\ufe0f\u20e3 keycap.md",                    # variation selector + combining keycap
+    ("\U0001f468\u200d\U0001f469\u200d"
+     "\U0001f467\u200d\U0001f466 family.md"),     # multi-ZWJ sequence
+    "\u00e9 precomposed.md",
+    "e\u0301 decomposed.md",
+    "\u65e5\u672c\u8a9e.md",
+    "\u0394elta.md",
+    "\u0645\u0631\u062d\u0628\u0627.md",
+)
+UNICODE_ERROR_FILENAMES = (
+    UNICODE_FILENAMES[0],   # non-BMP emoji
+    UNICODE_FILENAMES[2],   # modifier + ZWJ
+    UNICODE_FILENAMES[9],   # multibyte BMP characters
+)
 
 
 def _hooks(name):
@@ -115,24 +135,55 @@ def test_short_launcher_expansion_is_exact_and_boundary_aware():
         ) is None
 
 
-def test_windows_short_launcher_encodes_unicode_arguments_losslessly():
-    original = "agw file read '🗺 vault-map.md' --json"
+@pytest.mark.parametrize("filename", UNICODE_FILENAMES)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_windows_short_launcher_encodes_multiline_unicode_losslessly(filename, newline):
+    original = (
+        f"agw file read '{filename}' `{newline}"
+        "  --start-line 1 --limit 2000 `" + newline
+        + "  --max-bytes 262144 --json"
+    )
     rewritten = launcher.rewrite_shortcut(
         original, str(PLUGIN), platform="nt", shell="powershell",
     )
     assert "--agw-argv-b64" in rewritten
-    assert "🗺" not in rewritten
+    assert filename not in rewritten
     payload = rewritten.rsplit("'", 2)[1]
     assert launcher.decode_internal_argv(
         ["--agw-argv-b64", payload]
-    ) == ["file", "read", "🗺 vault-map.md", "--json"]
+    ) == [
+        "file", "read", filename, "--start-line", "1", "--limit", "2000",
+        "--max-bytes", "262144", "--json",
+    ]
+
+
+def test_windows_short_launcher_preserves_reported_h_drive_path_exactly():
+    expected = (
+        "H:\\Shared drives\\Synaptic Labs\\"
+        "\U0001f5fa Synaptic Labs Vault Map of Content.md"
+    )
+    rewritten = launcher.rewrite_shortcut(
+        f'agw file read "{expected}" `\r\n'
+        "  --start-line 1 --limit 2000 --max-bytes 262144 --json",
+        str(PLUGIN), platform="nt", shell="powershell",
+    )
+    payload = rewritten.rsplit("'", 2)[1]
+    assert launcher.decode_internal_argv(
+        ["--agw-argv-b64", payload]
+    ) == [
+        "file", "read", expected, "--start-line", "1", "--limit", "2000",
+        "--max-bytes", "262144", "--json",
+    ]
 
 
 def test_windows_unicode_rewrite_fails_closed_for_compound_shell_syntax():
     for command in (
-        "agw file read '🗺.md'; Remove-Item x",
-        "agw file read '🗺.md' | Out-String",
-        "agw file read '🗺.md' > output.txt",
+        "agw file read '\U0001f5fa.md'; Remove-Item x",
+        "agw file read '\U0001f5fa.md' | Out-String",
+        "agw file read '\U0001f5fa.md' > output.txt",
+        "agw file read '\U0001f5fa.md' `\n  ; Remove-Item x",
+        "agw file read '\U0001f5fa.md'\n  Remove-Item x",
+        "agw file read '\U0001f5fa.md' ` \n  --json",
     ):
         assert launcher.rewrite_shortcut(
             command, str(PLUGIN), platform="nt", shell="powershell",
@@ -172,6 +223,51 @@ def test_windows_short_launcher_reads_emoji_filename_without_mojibake(tmp_path):
     payload = json.loads(result.stdout)
     assert Path(payload["path"]).name == "🗺 vault-map.md"
     assert payload["content"] == "unicode launcher fixture\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
+def test_windows_multiline_launcher_preserves_unicode_success_and_error_paths(tmp_path):
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"))
+    for filename in UNICODE_FILENAMES:
+        target = tmp_path / filename
+        content = f"content:{filename}\n"
+        target.write_text(content, encoding="utf-8", newline="")
+        command = launcher.rewrite_shortcut(
+            f"agw file read '{filename}' `\r\n"
+            "  --start-line 1 --limit 2000 `\r\n"
+            "  --max-bytes 262144 --json",
+            str(PLUGIN), platform="nt", shell="powershell",
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", command],
+            cwd=tmp_path, text=True, encoding="utf-8", capture_output=True,
+            env=env, timeout=30,
+        )
+        assert result.returncode == 0, (filename, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["path"] == str(target)
+        assert payload["content"] == content
+
+        if filename not in UNICODE_ERROR_FILENAMES:
+            continue
+        missing_name = "missing-" + filename
+        missing = tmp_path / missing_name
+        error_command = launcher.rewrite_shortcut(
+            f"agw file read '{missing_name}' `\r\n  --json",
+            str(PLUGIN), platform="nt", shell="powershell",
+        )
+        error = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", error_command],
+            cwd=tmp_path, text=True, encoding="utf-8", capture_output=True,
+            env=env, timeout=30,
+        )
+        assert error.returncode != 0, filename
+        error_payload = json.loads(error.stderr)
+        assert error_payload["error"]["details"]["path"] == str(missing)
+        message = error_payload["error"]["message"]
+        assert repr(missing_name)[1:-1] in message
+        mojibake = missing_name.encode("utf-8").decode("latin-1")
+        assert mojibake not in error_payload["error"]["details"]["path"]
 
 
 def test_sessionstart_uses_host_approval_without_security_workarounds():

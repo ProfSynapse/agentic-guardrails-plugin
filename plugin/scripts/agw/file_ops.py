@@ -156,7 +156,9 @@ def read_text_page(
     try:
         before = os.stat(target, follow_symlinks=False)
     except OSError as exc:
-        raise FileOperationError(f"target could not be read: {exc}") from exc
+        raise FileOperationError(
+            f"target could not be read: {exc}", {"path": target},
+        ) from exc
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise FileOperationError("target must be an ordinary local file")
     if profiles.is_placeholder(target, st=before):
@@ -173,7 +175,9 @@ def read_text_page(
         with open(target, "rb") as handle:
             raw = handle.read(MAX_TEXT_BYTES + 1)
     except OSError as exc:
-        raise FileOperationError(f"target could not be read: {exc}") from exc
+        raise FileOperationError(
+            f"target could not be read: {exc}", {"path": target},
+        ) from exc
     if len(raw) > MAX_TEXT_BYTES:
         raise FileOperationError(
             f"file exceeds the {MAX_TEXT_BYTES // (1024 * 1024)} MB text limit"

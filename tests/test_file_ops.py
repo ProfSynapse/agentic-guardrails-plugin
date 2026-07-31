@@ -146,6 +146,17 @@ def test_file_read_json_stdout_is_strict_and_paginated(tmp_path):
     assert payload["complete"] is False
 
 
+def test_file_read_json_error_preserves_exact_unicode_path(tmp_path):
+    target = tmp_path / "\U0001f5fa-\u00e9-\u65e5\u672c\u8a9e-missing.md"
+    result = run_agw("file", "read", str(target), "--json", check=False)
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"]["details"]["path"] == str(target)
+    assert target.name in payload["error"]["message"]
+    assert target.name.encode("utf-8").decode("latin-1") not in \
+        payload["error"]["message"]
+
+
 def test_file_read_cli_uses_returned_byte_continuation(tmp_path):
     target = tmp_path / "one-line.json"
     target.write_text('{"map":"' + ("🗺" * 30) + '"}\n', encoding="utf-8")
