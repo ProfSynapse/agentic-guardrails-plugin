@@ -140,6 +140,57 @@ def test_short_launcher_expansion_is_exact_and_boundary_aware():
         ) is None
 
 
+def test_windows_short_launcher_rewrites_literal_pipeline_receiver():
+    original = (
+        "$rows = @'\nfirst row\nsecond row é\n'@\n"
+        "$rows | agw file write 'temporary ledger.md' --content-file - "
+        "--expected-hash absent --json"
+    )
+    rewritten = launcher.rewrite_shortcut(
+        original, str(PLUGIN), platform="nt", shell="powershell",
+    )
+    assert "$rows = @'\nfirst row\nsecond row é\n'@\n" in rewritten
+    assert "$rows | & '" in rewritten
+    assert "bin\\agw.cmd' file write 'temporary ledger.md'" in rewritten
+    assert "| agw file write" not in rewritten
+
+
+def test_windows_pipeline_receiver_encodes_static_unicode_arguments():
+    filename = "🗺 ledger 日本語.md"
+    original = (
+        "Write-Output 'row' | agw file write "
+        f"'{filename}' --content-file - --expected-hash absent --json"
+    )
+    rewritten = launcher.rewrite_shortcut(
+        original, str(PLUGIN), platform="nt", shell="powershell",
+    )
+    assert "Write-Output 'row' | & '" in rewritten
+    assert filename not in rewritten
+    payload = rewritten.rsplit("'", 2)[1]
+    assert launcher.decode_internal_argv(
+        ["--agw-argv-b64", payload]
+    ) == [
+        "file", "write", filename, "--content-file", "-",
+        "--expected-hash", "absent", "--json",
+    ]
+
+
+@pytest.mark.parametrize("command", [
+    "Write-Output '| agw status'",
+    "$text = @'\n| agw status\n'@\nWrite-Output $text",
+    "Write-Output x | 'agw' status",
+    "Write-Output x | & agw status",
+    r"Write-Output x | .\agw status",
+    "Write-Output x | agwx status",
+    "Write-Output x | ForEach-Object { agw status }",
+    "Write-Output x | agw status > status.json",
+])
+def test_windows_pipeline_rewrite_does_not_trust_data_or_ambiguous_heads(command):
+    assert launcher.rewrite_shortcut(
+        command, str(PLUGIN), platform="nt", shell="powershell",
+    ) is None
+
+
 @pytest.mark.parametrize("filename", UNICODE_FILENAMES)
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_windows_short_launcher_encodes_multiline_unicode_losslessly(filename, newline):
@@ -209,6 +260,33 @@ def test_windows_short_launcher_expansion_executes_real_cli(tmp_path):
     status = json.loads(result.stdout)
     assert status["archive_bytes"] == 0
     assert status["incomplete_office_transactions"] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
+def test_windows_pipeline_receiver_writes_stdin_with_recovery(tmp_path):
+    target = tmp_path / "🗺 pipeline ledger 日本語.txt"
+    escaped = str(target).replace("'", "''")
+    command = launcher.rewrite_shortcut(
+        "@'\nfirst row\nsecond row\n'@ | agw file write "
+        f"'{escaped}' --content-file - --expected-hash absent --json",
+        str(PLUGIN), platform="nt", shell="powershell",
+    )
+    home = tmp_path / "agw-home"
+    env = dict(os.environ, AGW_HOME=str(home))
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        text=True, encoding="utf-8", capture_output=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert target.read_text(encoding="utf-8").splitlines() == [
+        "first row", "second row",
+    ]
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (home / "transactions").glob("*.json")
+    ]
+    assert len(records) == 1
+    assert records[0]["kind"] == "absent_tombstone"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
