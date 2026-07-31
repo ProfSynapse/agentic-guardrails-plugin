@@ -12,6 +12,7 @@ import pytest
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "codex", "pretooluse.py")
+AGW_SOURCE = os.path.join(REPO, "scripts", "agw", "agw.py")
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 
@@ -99,6 +100,19 @@ def test_bash_rm_denied():
                     "cwd": "/tmp", "session_id": "c1"})
     assert _decision(out) == "deny"
     assert "agw archive" in _reason(out)
+
+
+def test_active_agw_python_help_is_not_treated_as_opaque_script():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": f'"{sys.executable}" "{AGW_SOURCE}" checkout --help'
+        },
+        "cwd": REPO,
+        "session_id": "active-agw-source-help",
+    })
+    assert _decision(out) != "deny"
+    assert "pre-execution output contract" not in _reason(out)
 
 
 @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])

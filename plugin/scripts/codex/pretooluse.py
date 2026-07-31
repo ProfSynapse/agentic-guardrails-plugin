@@ -104,7 +104,9 @@ def main(approval_provider=None):
     label = payload.get("tool_name", "") or "modification"
     # Prestate failures are safety invariants. Unlike advisory policy choices,
     # they cannot be approved away or suppressed by observe mode.
-    mutation_plan = mutations.plan(evlist, engine.clobber_targets)
+    mutation_plan = mutations.plan(
+        evlist, engine.clobber_targets, plugin_root=PLUGIN_ROOT
+    )
     invariant_failure = ""
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
