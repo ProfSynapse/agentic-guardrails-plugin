@@ -79,6 +79,47 @@ def _has_powershell_control_syntax(command: str) -> bool:
     return bool(quote)
 
 
+def _collapse_powershell_line_continuations(command: str) -> str:
+    """Remove only PowerShell's exact backtick-newline continuation.
+
+    A backtick must be the final character on the physical line. Backticks in
+    single-quoted strings are literal, and any whitespace between a backtick
+    and newline intentionally leaves the newline for fail-closed handling.
+    """
+    out = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "'" and not in_double:
+            if in_single and index + 1 < len(command) and command[index + 1] == "'":
+                out.extend((char, char))
+                index += 2
+                continue
+            in_single = not in_single
+            out.append(char)
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            out.append(char)
+            index += 1
+            continue
+        if char == "`" and not in_single and index + 1 < len(command):
+            following = command[index + 1]
+            if following == "\n":
+                index += 2
+                continue
+            if following == "\r" and index + 2 < len(command) \
+                    and command[index + 2] == "\n":
+                index += 3
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] = None,
                      shell: str = "posix") -> str | None:
     """Return an exact-launcher command, or ``None`` when no shortcut matched.
@@ -103,10 +144,11 @@ def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] 
         if shell == "powershell":
             replacement = "& '" + target.replace("'", "''") + "'"
             if any(ord(char) > 127 for char in command):
-                if _has_powershell_control_syntax(command):
+                normalized = _collapse_powershell_line_continuations(command)
+                if _has_powershell_control_syntax(normalized):
                     return None
                 try:
-                    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+                    parsed = extract_commands(normalized, dialect=DIALECT_POWERSHELL)
                 except ParseUncertain:
                     return None
                 if len(parsed.commands) != 1 or parsed.flags:
