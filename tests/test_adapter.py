@@ -9,6 +9,7 @@ import pytest
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "claude", "pretooluse.py")
+AGW_SOURCE = os.path.join(REPO, "scripts", "agw", "agw.py")
 
 
 def run_hook(payload, env_extra=None):
@@ -43,6 +44,21 @@ def test_bash_benign_defers():
     out = run_hook({"tool_name": "Bash", "tool_input": {"command": "git status"},
                     "cwd": "/tmp", "session_id": "t1", "hook_event_name": "PreToolUse"})
     assert _decision(out) == "defer"
+
+
+def test_active_agw_python_help_is_not_treated_as_opaque_script():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": f'"{sys.executable}" "{AGW_SOURCE}" checkout --help'
+        },
+        "cwd": REPO,
+        "session_id": "active-agw-source-help",
+        "hook_event_name": "PreToolUse",
+    })
+    assert _decision(out) != "deny"
+    reason = out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+    assert "pre-execution output contract" not in reason
 
 
 @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])

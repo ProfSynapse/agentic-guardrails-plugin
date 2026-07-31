@@ -30,9 +30,13 @@ _LOCAL_MUTATION_NAMES = {
     "truncate",
 }
 _SCRIPT_INTERPRETERS = {
-    "python", "python3", "py", "node", "ruby", "perl", "php",
-    "powershell", "pwsh", "bash", "sh", "zsh",
+    "python", "python3", "pythonw", "py", "node", "nodejs", "ruby", "perl", "php",
+    "powershell", "pwsh", "bash", "sh", "zsh", "ksh", "dash", "ash",
 }
+_VERSIONED_SCRIPT_INTERPRETER = re.compile(
+    r"^(?:pythonw?|node(?:js)?|ruby|perl|php|powershell|pwsh|bash|zsh|ksh)"
+    r"\d+(?:\.\d+)*$"
+)
 _SCRIPT_SUFFIXES = {
     ".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".php",
     ".ps1", ".psm1", ".sh", ".bash",
@@ -41,6 +45,9 @@ _SCRIPT_WRITE_EVIDENCE = re.compile(
     r"(?ix)(?:"
     r"writeFile(?:Sync)?\s*\(|appendFile(?:Sync)?\s*\(|createWriteStream\s*\(|"
     r"\.write_(?:text|bytes)\s*\(|\.to_excel\s*\(|"
+    r"\bFile\.write\s*\(|"
+    r"\bFile\.open\s*\([^\n]{0,300},\s*['\"](?:w|a|x|r\+|w\+|a\+)|"
+    r"\bfile_put_contents\s*\(|"
     r"\bopen\s*\([^\n]{0,300},\s*['\"](?:w|a|x|r\+|w\+|a\+)"
     r"|\.save\s*\("
     r"|\b(?:os\.replace|os\.rename|shutil\.(?:copy|copy2|move))\s*\("
@@ -97,6 +104,12 @@ def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
     return False
 
 
+def _is_script_interpreter(name: str) -> bool:
+    return name in _SCRIPT_INTERPRETERS or bool(
+        _VERSIONED_SCRIPT_INTERPRETER.fullmatch(name)
+    )
+
+
 def _write_capable_script(command: str, cwd: str, dialect: str = None) -> str:
     """Return a bounded local script path when static text shows file writes."""
     try:
@@ -104,7 +117,7 @@ def _write_capable_script(command: str, cwd: str, dialect: str = None) -> str:
     except ParseUncertain:
         return ""
     for cmd in parsed.commands:
-        if cmd.name not in _SCRIPT_INTERPRETERS:
+        if not _is_script_interpreter(cmd.name):
             continue
         script = ""
         for token in cmd.argv[1:]:
@@ -132,6 +145,60 @@ def _write_capable_script(command: str, cwd: str, dialect: str = None) -> str:
     return ""
 
 
+def _trusted_agw_help(
+    command: str,
+    cwd: str,
+    plugin_root: str,
+    dialect: str = None,
+) -> bool:
+    """Recognize only the active package's read-only Python help entrypoint."""
+    if not plugin_root:
+        return False
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return False
+    if len(parsed.commands) != 1 or parsed.flags:
+        return False
+    cmd = parsed.commands[0]
+    if cmd.name != "py" and not re.fullmatch(
+            r"pythonw?(?:\d+(?:\.\d+)*)?", cmd.name):
+        return False
+    script_index = -1
+    for index, token in enumerate(cmd.argv[1:], 1):
+        lowered = token.lower()
+        if lowered in {"-c", "-e", "--eval", "-m"}:
+            return False
+        if token.startswith("-"):
+            continue
+        if os.path.splitext(lowered)[1] == ".py":
+            script_index = index
+            break
+    if script_index < 0:
+        return False
+    raw_script = cmd.argv[script_index]
+    if any(char in raw_script for char in "$`*?[]{}()"):
+        return False
+    script = os.path.realpath(
+        raw_script if os.path.isabs(raw_script)
+        else os.path.join(cwd or os.getcwd(), raw_script)
+    )
+    root = os.path.realpath(plugin_root)
+    expected = os.path.realpath(os.path.join(root, "scripts", "agw", "agw.py"))
+    try:
+        trusted = os.path.commonpath([script, root]) == root \
+            and os.path.normcase(script) == os.path.normcase(expected)
+    except ValueError:
+        trusted = False
+    if not trusted:
+        return False
+    args = cmd.argv[script_index + 1:]
+    return (
+        any(value in {"-h", "--help"} for value in args)
+        and "--agw-argv-b64" not in args
+    )
+
+
 def _matching_trusted_workflow(command: str, cwd: str, dialect: str = None) -> str:
     """Find a valid integration only to produce a compact remediation hint."""
     try:
@@ -139,7 +206,7 @@ def _matching_trusted_workflow(command: str, cwd: str, dialect: str = None) -> s
     except ParseUncertain:
         return ""
     for cmd in parsed.commands:
-        if cmd.name not in _SCRIPT_INTERPRETERS:
+        if not _is_script_interpreter(cmd.name):
             continue
         try:
             workflow_id = workflows.matching_workflow(cmd.argv, cwd or os.getcwd())
@@ -177,7 +244,7 @@ def _tool_words(name: str) -> set[str]:
     return set(re.findall(r"[a-z]+", spaced.lower()))
 
 
-def plan(evlist, clobber_resolver) -> MutationPlan:
+def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
     """Return exact canonical targets, or an explicit incomplete plan."""
     result = MutationPlan()
     seen = set()
@@ -212,7 +279,10 @@ def plan(evlist, clobber_resolver) -> MutationPlan:
                 targets = clobber_resolver(
                     ev.command, ev.cwd, include_absent=True, dialect=dialect
                 )
-                opaque_script = _write_capable_script(
+                trusted_help = _trusted_agw_help(
+                    ev.command, ev.cwd, plugin_root, dialect=dialect
+                )
+                opaque_script = "" if trusted_help else _write_capable_script(
                     ev.command, ev.cwd, dialect=dialect
                 )
                 if opaque_script:

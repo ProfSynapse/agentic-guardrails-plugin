@@ -341,12 +341,16 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
     max_seconds = float(request["max_seconds"])
     deadline = request["started_at"] + max_seconds
     # Reserve bounded time for termination, pipe draining, and JSON creation.
-    reserve = min(0.25, max(0.025, max_seconds * 0.05))
+    # Windows process/pipe teardown needs materially more than a few tens of
+    # milliseconds for short deadlines; the reserve remains capped so useful
+    # scan time dominates ordinary multi-second requests.
+    reserve = min(0.5, max(0.05, max_seconds * 0.20), max_seconds * 0.50)
     worker_deadline = max(request["started_at"], deadline - reserve)
     request = {**request, "worker_deadline": worker_deadline}
     latest = initial_result(request)
     final = fatal = None
     timed_out = False
+    termination_requested = False
 
     messages = queue.Queue()
     reader_done = threading.Event()
@@ -387,6 +391,10 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
             except (OSError, ValueError):
                 pass
             finally:
+                try:
+                    process.stdout.close()
+                except (OSError, ValueError):
+                    pass
                 reader_done.set()
 
         reader = threading.Thread(target=read_messages, daemon=True)
@@ -405,6 +413,11 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
                             stderr_parts[:] = [combined[-MAX_STDERR_TAIL_CHARS:]]
             except (OSError, ValueError):
                 pass
+            finally:
+                try:
+                    process.stderr.close()
+                except (OSError, ValueError):
+                    pass
 
         stderr_reader = threading.Thread(target=read_stderr, daemon=True)
         stderr_reader.start()
@@ -434,6 +447,7 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
         final = latest
     finally:
         if process is not None and process.poll() is None:
+            termination_requested = True
             process.terminate()
             try:
                 process.wait(timeout=max(0.0, min(0.15, deadline - time.monotonic())))
@@ -449,10 +463,6 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
             reader.join(timeout=max(0.0, deadline - time.monotonic()))
         if stderr_reader is not None:
             stderr_reader.join(timeout=max(0.0, deadline - time.monotonic()))
-        if process is not None and process.stdout is not None:
-            process.stdout.close()
-        if process is not None and process.stderr is not None:
-            process.stderr.close()
         if process is not None and process.stdin is not None:
             process.stdin.close()
 
@@ -512,7 +522,7 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
     elapsed = max(0.0, time.monotonic() - request["started_at"])
     final["elapsed_seconds"] = round(min(elapsed, max_seconds), 6)
     final["deadline_enforced"] = True
-    final["worker_terminated"] = bool(timed_out)
+    final["worker_terminated"] = bool(termination_requested)
     worker_alive = process is not None and process.poll() is None
     final["worker_cleanup"] = "complete" if not worker_alive else "incomplete"
     final["_worker_pid"] = process.pid if process is not None else None

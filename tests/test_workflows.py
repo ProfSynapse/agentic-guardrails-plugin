@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -12,6 +13,7 @@ from core.events import ALLOW, ASK, EXEC, ToolEvent
 
 
 PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
+AGW_SOURCE = os.path.join(PLUGIN, "scripts", "agw", "agw.py")
 
 
 def _write_manifest(tmp_path, script, *, workflow_id="example.writer", outputs=None,
@@ -77,6 +79,12 @@ def test_arbitrary_opaque_python_script_remains_blocked(tmp_path):
     ("launcher", "name", "source"),
     [
         ("node", "writer.js", "require('fs').writeFileSync('out.txt', 'x')\n"),
+        ("python3.12", "writer.py", "open('out.txt', 'w').write('x')\n"),
+        ("ruby3.2", "writer.rb", "File.write('out.txt', 'x')\n"),
+        ("php8.3", "writer.php", "<?php file_put_contents('out.txt', 'x'); ?>\n"),
+        ("pwsh7 -File", "writer.ps1", "Set-Content -LiteralPath out.txt -Value x\n"),
+        ("bash5", "writer.sh", "#!/bin/sh\ntouch out.txt\n"),
+        ("dash", "writer.sh", "#!/bin/sh\ntouch out.txt\n"),
         ("powershell -File", "writer.ps1", "Set-Content -LiteralPath out.txt -Value x\n"),
         ("bash", "writer.sh", "#!/bin/sh\ntouch out.txt\n"),
     ],
@@ -93,6 +101,79 @@ def test_other_opaque_write_capable_scripts_remain_blocked(
     assert plan.mutating is True
     assert plan.complete is False
     assert "pre-execution output contract" in plan.reason
+
+
+def test_versioned_ruby_read_only_script_is_not_misclassified(tmp_path):
+    script = tmp_path / "reader.rb"
+    script.write_text("File.open('input.txt', 'r') { |file| file.read }\n", encoding="utf-8")
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell", command=f'ruby3.2 "{script}"', cwd=str(tmp_path)
+    )
+    plan = mutations.plan([event], engine.clobber_targets, plugin_root=PLUGIN)
+    assert plan.mutating is False
+    assert plan.complete is True
+
+
+@pytest.mark.parametrize("args", [
+    ["--help"],
+    ["checkout", "--help"],
+    ["office", "validate-preservation", "--help"],
+])
+def test_active_agw_python_entrypoint_help_is_read_only(args):
+    command = subprocess.list2cmdline([sys.executable, AGW_SOURCE, *args]) \
+        if os.name == "nt" else shlex.join([sys.executable, AGW_SOURCE, *args])
+    event = ToolEvent(kind=EXEC, tool="PowerShell" if os.name == "nt" else "Bash",
+                      command=command, cwd=PLUGIN)
+    plan = mutations.plan(
+        [event], engine.clobber_targets, plugin_root=PLUGIN
+    )
+    assert plan.mutating is False
+    assert plan.complete is True
+    assert plan.targets == []
+
+
+@pytest.mark.parametrize("launcher", ["py -3.12", "python3.12", "pythonw3.12"])
+def test_versioned_python_launcher_normalizes_for_active_agw_help(launcher):
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell",
+        command=f'{launcher} "{AGW_SOURCE}" checkout --help', cwd=PLUGIN,
+    )
+    plan = mutations.plan(
+        [event], engine.clobber_targets, plugin_root=PLUGIN
+    )
+    assert plan.mutating is False
+    assert plan.complete is True
+
+
+def test_copied_agw_help_and_active_nonhelp_remain_blocked(tmp_path):
+    copied = tmp_path / "agw.py"
+    copied.write_text(open(AGW_SOURCE, encoding="utf-8").read(), encoding="utf-8")
+    for command in (
+        f'python "{copied}" --help',
+        f'python "{AGW_SOURCE}" status',
+        f'python "{AGW_SOURCE}" --agw-argv-b64 --help',
+    ):
+        event = ToolEvent(kind=EXEC, tool="PowerShell", command=command, cwd=PLUGIN)
+        plan = mutations.plan(
+            [event], engine.clobber_targets, plugin_root=PLUGIN
+        )
+        assert plan.mutating is True
+        assert plan.complete is False
+        assert "pre-execution output contract" in plan.reason
+
+
+def test_active_agw_help_chained_with_another_command_remains_blocked(tmp_path):
+    writer = tmp_path / "writer.py"
+    writer.write_text("open('out.txt', 'w').write('x')\n", encoding="utf-8")
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell",
+        command=f'python "{AGW_SOURCE}" --help; python "{writer}"', cwd=PLUGIN,
+    )
+    plan = mutations.plan(
+        [event], engine.clobber_targets, plugin_root=PLUGIN
+    )
+    assert plan.mutating is True
+    assert plan.complete is False
 
 
 def test_trusted_matching_script_executes_and_existing_output_has_preimage(tmp_path):
