@@ -21,7 +21,7 @@ from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
 
 
 _SHORTCUT = re.compile(r"^(?P<indent>\s*)(?P<name>agw(?:\.cmd)?)(?=$|\s)", re.IGNORECASE)
-_PIPELINE_SHORTCUT = re.compile(r"agw(?:\.cmd)?(?=$|\s)", re.IGNORECASE)
+_LATER_SHORTCUT = re.compile(r"agw(?:\.cmd)?(?=$|\s)", re.IGNORECASE)
 _INTERNAL_ARGV_FLAG = "--agw-argv-b64"
 _MAX_INTERNAL_ARGV_BYTES = 64 * 1024
 _MAX_INTERNAL_ARGC = 256
@@ -163,8 +163,8 @@ def _powershell_segment_end(command: str, start: int) -> tuple[int, bool]:
     return len(command), bool(quote or depth)
 
 
-def _skip_powershell_pipeline_space(command: str, start: int) -> int:
-    """Skip whitespace and exact backtick-newline continuations after a pipe."""
+def _skip_powershell_boundary_space(command: str, start: int) -> int:
+    """Skip whitespace and exact backtick-newline continuations after a boundary."""
     index = start
     while index < len(command):
         if command[index].isspace():
@@ -181,8 +181,8 @@ def _skip_powershell_pipeline_space(command: str, start: int) -> int:
     return index
 
 
-def _powershell_pipeline_shortcut_spans(command: str):
-    """Yield literal top-level ``| agw`` command spans outside data regions."""
+def _powershell_later_shortcut_spans(command: str):
+    """Yield literal later ``agw`` command spans outside data regions."""
     spans = []
     quote = ""
     here_quote = ""
@@ -257,17 +257,24 @@ def _powershell_pipeline_shortcut_spans(command: str):
             index += 1
             continue
         if char == "`" and index + 1 < len(command):
-            index += 2
+            index += 3 if command[index + 1:index + 3] == "\r\n" else 2
             continue
         if char in "([{":
             depth += 1
         elif char in ")]}":
             depth = max(0, depth - 1)
-        elif char == "|" and depth == 0 \
+        boundary_end = None
+        if char == "|" and depth == 0 \
                 and command[index:index + 2] != "||" \
                 and (index == 0 or command[index - 1] != "|"):
-            start = _skip_powershell_pipeline_space(command, index + 1)
-            match = _PIPELINE_SHORTCUT.match(command, start)
+            boundary_end = index + 1
+        elif char == ";" and depth == 0:
+            boundary_end = index + 1
+        elif char in "\r\n" and depth == 0:
+            boundary_end = index + (2 if command[index:index + 2] == "\r\n" else 1)
+        if boundary_end is not None:
+            start = _skip_powershell_boundary_space(command, boundary_end)
+            match = _LATER_SHORTCUT.match(command, start)
             if match:
                 end, ambiguous = _powershell_segment_end(command, start)
                 spans.append((start, match.end(), end, ambiguous))
@@ -281,9 +288,9 @@ def _powershell_pipeline_shortcut_spans(command: str):
     return spans
 
 
-def _rewrite_powershell_pipeline_shortcuts(command: str, target: str) -> str | None:
-    """Attest literal downstream launchers while preserving pipeline stdin."""
-    spans = _powershell_pipeline_shortcut_spans(command)
+def _rewrite_powershell_later_shortcuts(command: str, target: str) -> str | None:
+    """Attest literal later launchers while preserving statement semantics."""
+    spans = _powershell_later_shortcut_spans(command)
     if not spans:
         return None
     replacements = []
@@ -323,9 +330,9 @@ def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] 
     """Return an exact-launcher command, or ``None`` when no shortcut matched.
 
     A literal leading command token is eligible. On Windows PowerShell, the
-    same literal token is also eligible as a top-level pipeline receiver so
-    ``--content-file -`` can retain stdin. Assignments, wrappers, quoted names,
-    paths, statement tokens, and ambiguous pipeline segments remain untrusted.
+    same literal token is also eligible as a later top-level pipeline receiver
+    or statement command so stdin and preceding value setup are retained.
+    Wrappers, quoted names, paths, and ambiguous segments remain untrusted.
     """
     if not isinstance(command, str) or not plugin_root:
         return None
@@ -334,7 +341,7 @@ def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] 
     if not match:
         if platform == "nt" and shell == "powershell":
             target = ntpath.join(plugin_root, "bin", "agw.cmd")
-            return _rewrite_powershell_pipeline_shortcuts(command, target)
+            return _rewrite_powershell_later_shortcuts(command, target)
         return None
 
     name = match.group("name")
