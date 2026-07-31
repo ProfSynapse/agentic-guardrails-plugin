@@ -14,7 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -61,11 +61,14 @@ def _run_dispatch(artifact, host, payload, tmp_path, env_extra=None):
     dispatch = artifact / "scripts" / host / "_dispatch.py"
     result = subprocess.run(
         [sys.executable, str(dispatch), "pretooluse"],
-        input=json.dumps(payload), capture_output=True, text=True, env=env,
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        capture_output=True, env=env,
         cwd=str(artifact.parent), timeout=30,
     )
-    assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+    stderr = result.stderr.decode("utf-8", "replace")
+    assert result.returncode == 0, stderr
+    stdout = result.stdout.decode("utf-8")
+    return json.loads(stdout) if stdout.strip() else {}
 
 
 def _packed_core(artifact, source, env_extra=None):
@@ -167,7 +170,42 @@ def test_packed_windows_hook_uses_python3_launcher(packed_plugin, host):
     hooks = _manifest(packed_plugin / "hooks" / hooks_name)["hooks"]
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = hooks[lifecycle][0]["hooks"][0]["commandWindows"]
-        assert command.startswith("py.exe -3 ")
+        assert command.startswith("py.exe -3 -X utf8 ")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows hook encoding regression")
+@pytest.mark.parametrize("host", ["claude", "codex"])
+@pytest.mark.parametrize("filename", [
+    "\U0001f5fa vault-map.md",
+    "\U0001f600 grin.md",
+    "\U0001f469\U0001f3fd\u200d\U0001f4bb developer.md",
+    "\u2615\ufe0f coffee.md",
+    "\U0001f1ef\U0001f1f5 flag.md",
+    "#\ufe0f\u20e3 keycap.md",
+    "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 family.md",
+    "\u00e9 precomposed.md",
+    "e\u0301 decomposed.md",
+    "\u65e5\u672c\u8a9e.md",
+    "\u0394elta.md",
+    "\u0645\u0631\u062d\u0628\u0627.md",
+])
+def test_packed_hook_preserves_utf8_command_under_legacy_windows_stdio(
+        packed_plugin, tmp_path, host, filename):
+    expected = "H:\\Shared drives\\Synaptic Labs\\" + filename
+    out = _run_dispatch(
+        packed_plugin, host,
+        {"tool_name": "PowerShell",
+         "tool_input": {"command": f'agw file read "{expected}" --json'},
+         "cwd": str(tmp_path), "session_id": f"utf8-hook-{host}"},
+        tmp_path,
+        {"PYTHONUTF8": "0", "PYTHONIOENCODING": "cp1252"},
+    )
+    command = out["hookSpecificOutput"]["updatedInput"]["command"]
+    assert "--agw-argv-b64" in command
+    assert expected not in command
+    encoded = command.rsplit("'", 2)[1]
+    decoded = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert decoded == ["file", "read", expected, "--json"]
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])
