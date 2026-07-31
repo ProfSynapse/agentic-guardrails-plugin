@@ -20,6 +20,21 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 EVENT = sys.argv[1] if len(sys.argv) > 1 else "pretooluse"
 
 
+def _configure_utf8_stdio():
+    """Decode the host hook envelope as UTF-8 on every Windows code page.
+
+    Hook payloads are UTF-8 JSON bytes.  A redirected Windows Python process
+    can otherwise select a legacy locale encoding (for example CP1252), which
+    silently turns an emoji in ``tool_input.command`` into mojibake before the
+    trusted launcher has a chance to place the arguments in its ASCII envelope.
+    """
+    for stream, errors in ((sys.stdin, "strict"), (sys.stdout, "replace"),
+                           (sys.stderr, "replace")):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors=errors)
+
+
 def _ask(reason):
     """Emit a PreToolUse ASK decision. No-op for events that cannot block."""
     if EVENT != "pretooluse":
@@ -46,6 +61,7 @@ def main():
         _ask("could not find its adapter for %s" % EVENT)
         return
     try:
+        _configure_utf8_stdio()
         sys.argv = [target]
         runpy.run_path(target, run_name="__main__")
     except SystemExit:

@@ -55,7 +55,7 @@ def test_maintained_hooks_register_every_shell_surface(manifest, lifecycle):
 def test_windows_hooks_use_python3_launcher_and_plugin_root(manifest, root_name):
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = _hooks(manifest)[lifecycle][0]["hooks"][0]["commandWindows"]
-        assert command.startswith("py.exe -3 ")
+        assert command.startswith("py.exe -3 -X utf8 ")
         assert "${" + root_name + "}" in command
 
 

@@ -9,7 +9,7 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" pretooluse || python \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" pretooluse",
             "timeout": 15,
             "statusMessage": "guardrails check",
-            "commandWindows": "py.exe -3 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" pretooluse"
+            "commandWindows": "py.exe -3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" pretooluse"
           }
         ]
       }
@@ -22,7 +22,7 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" posttooluse || python \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" posttooluse",
             "timeout": 10,
-            "commandWindows": "py.exe -3 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" posttooluse"
+            "commandWindows": "py.exe -3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" posttooluse"
           }
         ]
       }
@@ -35,7 +35,7 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" sessionstart || python \"${CLAUDE_PLUGIN_ROOT}/scripts/claude/_dispatch.py\" sessionstart",
             "timeout": 15,
-            "commandWindows": "py.exe -3 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" sessionstart"
+            "commandWindows": "py.exe -3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}\\scripts\\claude\\_dispatch.py\" sessionstart"
           }
         ]
       }
