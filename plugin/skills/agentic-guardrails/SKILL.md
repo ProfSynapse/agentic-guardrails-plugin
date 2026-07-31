@@ -9,9 +9,11 @@ description: >
 
 # Agentic Guardrails
 
-Keep file operations recoverable. Use `agw` on every platform; the trusted hook
-finds the active package. Never emit an installation path. `agw.cmd` is
-compatibility-only.
+Use `agw`; the trusted hook finds the package. Never emit installation paths;
+`agw.cmd` is compatibility-only. Load this skill
+and references only from exact host-supplied paths; never infer or search plugin-
+cache paths. If `agw` is unrecognized, stop; ask the user to approve Guardrails
+hooks in the host UI and start a new task. Never use a cache path or change PATH.
 
 ## Discover commands progressively
 

@@ -255,3 +255,5 @@ def test_sessionstart_uses_native_platform_launcher():
     assert "Use `agw`" in context
     assert "Use `agw.cmd`" not in context
     assert "bin/agw" not in context
+    assert "exact host-supplied `SKILL.md` location" in context
+    assert "plugin-cache path" in context

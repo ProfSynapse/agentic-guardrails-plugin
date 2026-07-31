@@ -1,26 +1,28 @@
 # Office safety
 
-Use targeted operations for exact changes and style-preserving
-checkout/edit/publish for substantial Excel work. CSV checkout is explicitly
-lossy. Consult leaf `--help` instead of examples stored in context.
+Use targeted operations for exact changes and preserved checkout/edit/publish
+for substantial Excel work. CSV checkout is lossy. Consult leaf `--help`.
 
-Writes validate a staged package, archive one live pre-image, reject drift, and
-replace atomically. Dry runs change nothing. Lossy OOXML mutations are refused.
-`set-cell` may use a surgical adapter when it can preserve unknown extensions and
-every unrelated part; other operations still refuse unsupported packages.
+Writes validate a stage, archive one pre-image, reject drift, and replace
+atomically. Dry runs change nothing. Pass read hashes to writes; never force
+publish conflicts. Use uniqueness constraints for retry-safe appends.
 
-Reads are compact and paginated. Pass returned hashes to coordinated writes. Use
-uniqueness constraints for retry-safe appends: identical retries are no-ops and
-differing duplicates conflict. Never force publish or hash conflicts.
+Reads are compact and paginated. Formula reads do not calculate formulas. Risks
+name exact parts; `normalize` removes only allowlisted metadata. On PowerShell,
+prefer stdin or JSON files and use one stdin payload per command.
 
-Use `read-table --include-formulas`, bounded `read-range --formulas`, or
-`validate-formulas`; none calculates formulas. Risks identify exact extensions
-and parts. `normalize` removes only allowlisted metadata.
+For `.xlsm`, keep the Drive file binary and available offline. `checkout`
+defaults to a non-synced Guardrails workspace. Open that copy in desktop Excel
+for broad edits, close Excel, then `publish`; publication revalidates protected
+package content, rejects live drift, snapshots, and replaces atomically. Never
+convert a VBA workbook to Google Sheets.
 
-On PowerShell, prefer stdin or JSON files. Use one stdin payload per command and
-keep formulas explicitly typed.
+`set-cell` is the only targeted `.xlsm` write: its surgical adapter changes one
+worksheet XML part and byte-preserves every unrelated part. Other `.xlsm`
+mutations remain refused. VBA, signatures, ActiveX, embeddings, custom UI,
+external links, connections, and data-model parts are immutable by default.
+Never use ad hoc openpyxl, ZIP/XML, Python, or Node mutation.
 
-Macro-enabled and complex packages may remain readable while writes are refused.
-Never fall back to ad hoc `openpyxl`, ZIP/XML, Python, or Node mutation when the
-Guardrails Office operation refuses the file. Use `publish-file` for a validated
-temporary workbook that must be hash-guarded onto a busy synced target.
+Use `office validate-preservation` to check a staged copy explicitly.
+`publish-file` checks `.xlsm` against an existing target automatically; a new
+target requires an explicit preservation baseline.

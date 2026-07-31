@@ -51,8 +51,9 @@ the full GitHub URL above instead of the owner/repo shorthand.
 codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
 ```
 
-Then run `/plugins` inside Codex, install **Agentic Guardrails**, and trust its
-hooks with `/hooks`. The full walkthrough — including the `apply_patch` deletion
+Then run `/plugins` inside Codex, install **Agentic Guardrails**, and approve its
+hooks in the host's trust UI (`/hooks` in Codex CLI; desktop may show a trust
+dialog). The full walkthrough — including the `apply_patch` deletion
 guard and a smoke test to confirm interception on your build — is in
 [CODEX.md](CODEX.md).
 
@@ -103,6 +104,7 @@ so the agent self-corrects instead of fighting the rails:
 | unlinking a Windows junction | `agw unlink-link LINK --expected-target TARGET` |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
 | rebuilding a styled workbook | `agw checkout workbook.xlsx --mode preserve` → `agw publish` |
+| editing a Drive-hosted macro workbook | `agw checkout workbook.xlsm` → edit the external working copy in Excel → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
 | unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
@@ -119,6 +121,7 @@ agw office read-table workbook.xlsx --table RecordsTable --include-formulas --js
 agw office read-range workbook.xlsx --sheet Records --range A1:D20 --formulas --json
 agw office validate-formulas workbook.xlsx --json
 agw office normalize workbook.xlsx --output normalized.xlsx --expected-output-hash absent --json
+agw office validate-preservation staged.xlsm --against original.xlsm --json
 agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json '["RecordID","Status"]' --create-sheet
 agw office append-table-row workbook.xlsx --table RecordsTable --row-json '{"RecordID":"R-2"}' --unique-column RecordID
 agw office update-table-row workbook.xlsx --table RecordsTable --key-column RecordID --key R-2 --set-json '{"Status":"Closed"}'
@@ -148,10 +151,15 @@ hashes. `ensure-table` is idempotent and can create an explicitly requested
 sheet or convert an explicit rectangular range. Appends can enforce atomic
 single or composite uniqueness with `--unique-column` or
 `--unique-columns-json`. Read-only inspection reports detected preservation
-risks; mutation refuses unsupported or lossy OOXML. A cell-only `set-cell` can
-use a surgical adapter that retains x14/x15 extension content and every
-unrelated OOXML part. Excel table writes support `.xlsx`; macro-enabled and
-unsupported complex OOXML files are refused. Word
+risks; mutation refuses unsupported or lossy OOXML. A cell-only `set-cell` uses
+a surgical adapter for `.xlsm` and extension-heavy workbooks, retaining every
+unrelated OOXML part byte-for-byte. Preserved `.xlsx`/`.xlsm` checkouts default
+to a non-synced Guardrails workspace so desktop Excel can safely edit the staged
+copy. Publish validates the package, refuses live drift, archives one exact
+pre-image, and atomically replaces the synced target. VBA, signatures, ActiveX,
+embedded objects, custom UI, external links, connections, and data-model parts
+must match the checkout baseline. Other Excel table writes support `.xlsx` and
+remain refused for `.xlsm`. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
@@ -174,10 +182,10 @@ which process caused a change. Use only narrow, stable roots and declare
 deterministic sidecars exactly whenever possible. See the
 [trusted-workflow reference](skills/agentic-guardrails/references/trusted-workflows.md).
 Compact, bounded stdout/stderr tails are included in JSON results. `publish-file`
-validates a staged hash, captures one
-target pre-image,
+validates a staged hash and Office package, captures one target pre-image,
 retries only atomic replacement for a bounded interval, and preserves the stage
-when a sync client keeps the target busy.
+when a sync client keeps the target busy. An `.xlsm` stage is compared with the
+live target automatically; creating a new target requires `--preserve-against`.
 
 Approval prompts for sensitive reads and credential searches show a sanitized
 filename or search scope, the detected risk category, and the specific reason

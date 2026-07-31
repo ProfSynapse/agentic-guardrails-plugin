@@ -397,8 +397,8 @@ def test_publish_busy_preserves_live_and_stage(tmp_path, monkeypatch):
 
 
 def test_cli_publish_file_validates_stage_and_publishes(tmp_path, agw_home):
-    target = tmp_path / "live.xlsx"
-    stage = tmp_path / "build.xlsx"
+    target = tmp_path / "live.bin"
+    stage = tmp_path / "build.bin"
     target.write_bytes(b"old")
     stage.write_bytes(b"new")
     result = run_agw(

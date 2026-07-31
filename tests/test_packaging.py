@@ -170,7 +170,8 @@ def test_packed_windows_hook_uses_python3_launcher(packed_plugin, host):
     hooks = _manifest(packed_plugin / "hooks" / hooks_name)["hooks"]
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = hooks[lifecycle][0]["hooks"][0]["commandWindows"]
-        assert command.startswith("py.exe -3 -X utf8 ")
+        assert command.startswith("py.exe -3 ")
+        assert "-X utf8" not in command
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows hook encoding regression")

@@ -37,6 +37,10 @@ def test_one_discoverable_skill_with_progressive_references():
 
     root_text = skill_files[0].read_text(encoding="utf-8")
     assert len(root_text) < LEGACY_DISCOVERABLE_SKILL_CHARS * 0.20
+    assert "exact host-supplied paths" in root_text
+    assert "never infer or search plugin-" in root_text
+    assert "approve Guardrails" in root_text and "host UI" in root_text
+    assert "Never use a cache path or change PATH" in root_text
     assert "office <operation> --help" in root_text
     references = sorted((skill_files[0].parent / "references").glob("*.md"))
     assert {path.name for path in references} == {
@@ -54,6 +58,8 @@ def test_always_on_context_is_small_and_has_no_operation_catalog():
         assert "office <operation>" in context
         assert str(PLUGIN) not in context
         assert "trusted PreToolUse hook" in context
+        assert "exact host-supplied `SKILL.md` location" in context
+        assert "plugin-cache path" in context
 
 
 def test_short_launcher_removes_repeated_package_path_tokens():
@@ -123,6 +129,7 @@ def test_each_office_leaf_help_is_bounded_and_single_purpose():
     operations = (
         "info", "get-text", "replace-text", "set-cell", "append-rows",
         "read-table", "read-range", "validate-formulas", "normalize",
+        "validate-preservation",
         "ensure-table", "append-table-row", "update-table-row", "outline",
         "read-blocks", "patch",
     )
@@ -153,6 +160,23 @@ def test_file_and_run_help_are_progressive_and_compact():
     assert len(write) <= 1_000
     assert len(read) <= 900
     assert len(run) <= 800
+
+
+def test_xlsm_help_discloses_external_workspace_and_preservation_only_where_needed():
+    top = _help()
+    checkout = _help("checkout")
+    publish = _help("publish-file")
+    validate = _help("office", "validate-preservation")
+    assert "--workspace-dir" not in top
+    assert "--workspace-dir" in checkout
+    assert "non-synced Guardrails workspace" in checkout
+    assert "--preserve-against" in publish
+    assert "--expected-preservation-hash" in publish
+    assert "--against" in validate
+    assert "--expected-original-hash" in validate
+    assert len(checkout) <= 900
+    assert len(publish) <= 1_400
+    assert len(validate) <= 1_000
 
 
 def test_workflow_help_discloses_trust_details_only_at_the_leaf():

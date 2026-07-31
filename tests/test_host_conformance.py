@@ -55,7 +55,10 @@ def test_maintained_hooks_register_every_shell_surface(manifest, lifecycle):
 def test_windows_hooks_use_python3_launcher_and_plugin_root(manifest, root_name):
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = _hooks(manifest)[lifecycle][0]["hooks"][0]["commandWindows"]
-        assert command.startswith("py.exe -3 -X utf8 ")
+        # Codex trusts the exact hook-definition hash. Keep the manifest command
+        # stable and put runtime/encoding changes in the dispatcher instead.
+        assert command.startswith("py.exe -3 ")
+        assert "-X utf8" not in command
         assert "${" + root_name + "}" in command
 
 
@@ -113,6 +116,8 @@ def test_sessionstart_uses_platform_native_launcher():
         assert "Use `agw.cmd`" not in module.CONTEXT
         assert str(PLUGIN) not in module.CONTEXT
         assert "trusted PreToolUse hook" in module.CONTEXT
+        assert "exact host-supplied `SKILL.md` location" in module.CONTEXT
+        assert "never infer, shorten, search for, or expose" in module.CONTEXT
 
 
 def test_short_launcher_expansion_is_exact_and_boundary_aware():

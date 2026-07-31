@@ -51,8 +51,9 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    `codex plugin marketplace upgrade`
    (the bumped `version` in `.codex-plugin/plugin.json` busts the cache).
 2. **Trust the hooks** - Codex requires command hooks to be trusted before they
-   run. Run `/hooks` inside Codex and trust `agentic-guardrails`. (Enterprise:
-   ship them as managed hooks via `requirements.toml` to skip the prompt.)
+   run. Approve `agentic-guardrails` in the host's hook-trust UI. Codex CLI uses
+   `/hooks`; desktop builds may show a trust dialog instead. (Enterprise: ship
+   managed hooks via `requirements.toml` to skip the prompt.)
 3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
    Operational syntax is not duplicated into user-level prompts.
 4. **Short launcher** - invoke `agw` on every platform. The
@@ -63,6 +64,11 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    `agw.cmd`; that suffix remains a backward-compatible implementation detail.
    The launcher invokes Python explicitly and never asks Windows to open a `.py`
    file by file association.
+
+   Codex records trust against each hook definition's exact hash. Keep manifest
+   launcher commands stable and put behavior changes in the dispatchers; changing
+   a command makes Codex skip it until the user reviews it again in the host's
+   hook-trust UI (`/hooks` in Codex CLI).
 
 ## How the shared hook shim picks the host
 

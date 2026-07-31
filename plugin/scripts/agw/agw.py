@@ -271,13 +271,34 @@ def cmd_checkout(args):
         _err("file is a cloud-only placeholder - hydrate it first ('Always keep on "
              "this device' / 'Available offline')")
     folder = os.path.dirname(src)
-    ws = os.path.join(folder, "_workspace")
+    ext = os.path.splitext(src)[1].lower()
+    preserve_office = args.mode == "preserve" or (
+        args.mode == "auto" and ext in {".xlsx", ".xlsm"}
+    )
+    if args.workspace_dir:
+        ws = os.path.abspath(os.path.expanduser(args.workspace_dir))
+    elif preserve_office:
+        workspace_root = os.path.abspath(os.path.expanduser(
+            os.environ.get("AGW_WORKSPACE_HOME")
+            or os.path.join(store.agw_home(), "workspaces")
+        ))
+        stem = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in os.path.splitext(os.path.basename(src))[0]
+        )[:48] or "office"
+        ws = os.path.join(
+            workspace_root,
+            f"{stem}-{office_tx._target_id(src)[:12]}",
+        )
+    else:
+        ws = os.path.join(folder, "_workspace")
     result = converters.to_open_format(src, ws, mode=args.mode)
     state = store.state_load()
     state["checkouts"][src] = {
         "working": result["dest"], "workings": result.get("dests", [result["dest"]]),
         "base_sha256": store.file_sha256(src), "mode": result["mode"],
         "checkout_mode": result.get("checkout_mode", "data"),
+        "workspace": ws,
     }
     store.state_save(state)
     store.oplog_append({"op": "checkout", "src": src, "working": result["dest"]})
@@ -285,7 +306,7 @@ def cmd_checkout(args):
         if result.get("checkout_mode") == "preserve" else \
         (" (lossy data checkout)" if result.get("lossy") else "")
     _out(args, f"checked out -> {result['dest']}{note}",
-         {"src": src, **result})
+         {"src": src, "workspace": ws, **result})
 
 
 def cmd_convert(args):
@@ -362,14 +383,23 @@ def cmd_publish(args):
     os.close(fd)
     result = converters.to_original_format(working, src, tmp_out)
     try:
-        if os.path.splitext(src)[1].lower() in {".xlsx", ".xlsm"}:
+        office_validation = None
+        extension = os.path.splitext(src)[1].lower()
+        if extension == ".xlsm":
+            office_validation = office_tx.validate_package_preservation(
+                src, tmp_out, expected_original_sha256=live_hash or ""
+            )
+        elif extension == ".xlsx":
             office_tx._package_preflight(tmp_out, mutating=False)
+            office_validation = {"verified": True, "package": "valid-ooxml"}
         published = file_ops.publish_staged_file(
             src, tmp_out, expected_hash=live_hash or "absent",
             operation="checkout-publish", retry_seconds=args.retry_seconds,
         )
         if not published.get("changed") and os.path.exists(tmp_out):
             os.unlink(tmp_out)
+    except office_tx.TransactionError as exc:
+        _office_err(args, exc)
     except (OSError, file_ops.FileOperationError) as exc:
         _file_err(args, exc)
     entry["base_sha256"] = store.file_sha256(src)
@@ -383,6 +413,7 @@ def cmd_publish(args):
                f" (restore with `agw restore {os.path.basename(src)}`){versioning}",
          {"src": src, "conversion": result["mode"],
           "checkout_mode": entry.get("checkout_mode", "data"),
+          "office_validation": office_validation,
           "publication": published})
 
 
@@ -610,15 +641,51 @@ def cmd_workflow(args):
 
 def cmd_publish_file(args):
     try:
+        staged = os.path.abspath(os.path.expanduser(args.staged))
+        target = os.path.abspath(os.path.expanduser(args.target))
+        staged_extension = os.path.splitext(staged)[1].lower()
+        target_extension = os.path.splitext(target)[1].lower()
+        office_validation = None
+        effective_expected_hash = args.expected_hash
+        if not effective_expected_hash and os.path.isfile(target):
+            effective_expected_hash = store.file_sha256(target)
+        if staged_extension in {".xlsx", ".xlsm"} \
+                or target_extension in {".xlsx", ".xlsm"}:
+            if staged_extension != target_extension:
+                raise file_ops.FileOperationError(
+                    "Office publish requires matching staged and target extensions"
+                )
+            office_tx._package_preflight(staged, mutating=False)
+            if target_extension == ".xlsm":
+                baseline = os.path.abspath(os.path.expanduser(
+                    args.preserve_against or target
+                ))
+                if not os.path.isfile(baseline):
+                    raise file_ops.FileOperationError(
+                        "new .xlsm publication requires --preserve-against ORIGINAL"
+                    )
+                expected_baseline = args.expected_preservation_hash
+                if not expected_baseline and os.path.normcase(baseline) == os.path.normcase(target):
+                    expected_baseline = args.expected_hash
+                office_validation = office_tx.validate_package_preservation(
+                    baseline, staged,
+                    expected_original_sha256=expected_baseline,
+                )
+            else:
+                office_validation = {"verified": True, "package": "valid-ooxml"}
         data = file_ops.publish_staged_file(
-            args.target, args.staged,
-            expected_hash=args.expected_hash,
+            target, staged,
+            expected_hash=effective_expected_hash,
             expected_stage_hash=args.expected_staged_hash,
             dry_run=args.dry_run,
             retry_seconds=args.retry_seconds,
         )
+    except office_tx.TransactionError as exc:
+        _office_err(args, exc)
     except (OSError, file_ops.FileOperationError) as exc:
         _file_err(args, exc)
+    if office_validation is not None:
+        data["office_validation"] = office_validation
     _out(
         args,
         (("would publish" if data.get("dry_run") else "published")
@@ -735,12 +802,23 @@ def cmd_office(args):
     path = _resolve(args.path)
     try:
         if args.op == "info":
-            if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm") and args.scope:
+            if args.scope == "preservation":
+                data = office_tx.package_preservation_manifest(path)
+            elif os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm") and args.scope:
                 import office_excel
                 data = office_excel.workbook_info(path, scope=args.scope)
             else:
                 data = office.info(path)
             human = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        elif args.op == "validate-preservation":
+            data = office_tx.validate_package_preservation(
+                args.against, path,
+                expected_original_sha256=args.expected_original_hash,
+            )
+            human = (
+                f"verified {data['protected_part_count']} protected Office part(s); "
+                "macros and package integrations unchanged"
+            )
         elif args.op == "normalize":
             data = office_tx.normalize_safe_metadata(
                 path, args.output,
@@ -990,7 +1068,12 @@ def main(argv=None):
     add("checkout", cmd_checkout, (["path"], {}),
         (["--mode"], {"choices": ["auto", "preserve", "data"],
                        "default": "auto",
-                       "help": "preserve .xlsx behavior by default; data is lossy"}),
+                       "help": "preserve .xlsx/.xlsm by default; data is lossy"}),
+        (["--workspace-dir"], {
+            "default": "",
+            "help": ("working-copy directory; preserved Excel defaults to a "
+                     "non-synced Guardrails workspace"),
+        }),
         help="create a tracked working copy")
     add("convert", cmd_convert, (["path"], {}), (["--dest"], {"default": ""}),
         help="convert to an editable working format")
@@ -1008,6 +1091,14 @@ def main(argv=None):
         }),
         (["--expected-staged-hash"], {
             "default": "", "help": "expected staged SHA-256",
+        }),
+        (["--preserve-against"], {
+            "default": "", "metavar": "ORIGINAL",
+            "help": "Office preservation baseline; required for a new .xlsm target",
+        }),
+        (["--expected-preservation-hash"], {
+            "default": "", "metavar": "SHA256",
+            "help": "expected SHA-256 of --preserve-against",
         }),
         (["--retry-seconds"], {
             "type": float, "default": 5.0,
@@ -1203,13 +1294,21 @@ def main(argv=None):
     )
 
     add_office(
-        "info", "Inspect Office structure and preservation risks",
-        (["--scope"], {"choices": ["tables", "names"], "default": "",
+        "info", "Inspect Office structure and risks",
+        (["--scope"], {"choices": ["tables", "names", "preservation"], "default": "",
                         "help": "limit Excel details"}),
         example="agw office info workbook.xlsx --scope tables --json",
     )
     add_office(
-        "normalize", "Remove only allowlisted OOXML compatibility metadata",
+        "validate-preservation", "Verify protected Excel content",
+        (["--against"], {"required": True, "help": "original .xlsx/.xlsm baseline"}),
+        (["--expected-original-hash"], {
+            "default": "", "help": "expected SHA-256 of the original baseline",
+        }),
+        example="agw office validate-preservation staged.xlsm --against original.xlsm --json",
+    )
+    add_office(
+        "normalize", "Remove allowlisted OOXML metadata",
         (["--output"], {"required": True, "help": "normalized .xlsx output path"}),
         expected_hash,
         (["--expected-output-hash"], {
@@ -1290,7 +1389,7 @@ def main(argv=None):
         example="agw office ensure-table workbook.xlsx --sheet Data --table Orders --headers-file headers.json --dry-run",
     )
     add_office(
-        "append-table-row", "Append one typed row with optional uniqueness",
+        "append-table-row", "Append one typed table row",
         table, sheet,
         (["--row-json"], {"default": "", "help": "JSON row object or - for stdin"}),
         (["--row-file"], {"default": "", "help": "JSON row file"}),
@@ -1303,7 +1402,7 @@ def main(argv=None):
         example="agw office append-table-row workbook.xlsx --table Orders --row-file row.json --unique-column ID",
     )
     add_office(
-        "update-table-row", "Update one exact-key Excel table row",
+        "update-table-row", "Update one exact-key table row",
         table, sheet,
         (["--key-column"], {"default": "", "help": "exact key column (required)"}),
         (["--key"], {"default": "", "help": "string key"}),
