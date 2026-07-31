@@ -115,6 +115,30 @@ def test_short_launcher_expansion_is_exact_and_boundary_aware():
         ) is None
 
 
+def test_windows_short_launcher_encodes_unicode_arguments_losslessly():
+    original = "agw file read '🗺 vault-map.md' --json"
+    rewritten = launcher.rewrite_shortcut(
+        original, str(PLUGIN), platform="nt", shell="powershell",
+    )
+    assert "--agw-argv-b64" in rewritten
+    assert "🗺" not in rewritten
+    payload = rewritten.rsplit("'", 2)[1]
+    assert launcher.decode_internal_argv(
+        ["--agw-argv-b64", payload]
+    ) == ["file", "read", "🗺 vault-map.md", "--json"]
+
+
+def test_windows_unicode_rewrite_fails_closed_for_compound_shell_syntax():
+    for command in (
+        "agw file read '🗺.md'; Remove-Item x",
+        "agw file read '🗺.md' | Out-String",
+        "agw file read '🗺.md' > output.txt",
+    ):
+        assert launcher.rewrite_shortcut(
+            command, str(PLUGIN), platform="nt", shell="powershell",
+        ) is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
 def test_windows_short_launcher_expansion_executes_real_cli(tmp_path):
     command = launcher.rewrite_shortcut(
@@ -129,6 +153,25 @@ def test_windows_short_launcher_expansion_executes_real_cli(tmp_path):
     status = json.loads(result.stdout)
     assert status["archive_bytes"] == 0
     assert status["incomplete_office_transactions"] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher execution")
+def test_windows_short_launcher_reads_emoji_filename_without_mojibake(tmp_path):
+    target = ROOT / "tests" / "fixtures" / "🗺 vault-map.md"
+    escaped = str(target).replace("'", "''")
+    command = launcher.rewrite_shortcut(
+        f"agw file read '{escaped}' --json",
+        str(PLUGIN), platform="nt", shell="powershell",
+    )
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"))
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        text=True, encoding="utf-8", capture_output=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["path"]).name == "🗺 vault-map.md"
+    assert payload["content"] == "unicode launcher fixture\n"
 
 
 def test_sessionstart_uses_host_approval_without_security_workarounds():

@@ -8,14 +8,75 @@ The ``agw.cmd`` spelling remains accepted for backward compatibility.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import ntpath
 import os
 import re
 import shlex
 from typing import Optional
 
+from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
+
 
 _SHORTCUT = re.compile(r"^(?P<indent>\s*)(?P<name>agw(?:\.cmd)?)(?=$|\s)", re.IGNORECASE)
+_INTERNAL_ARGV_FLAG = "--agw-argv-b64"
+_MAX_INTERNAL_ARGV_BYTES = 64 * 1024
+_MAX_INTERNAL_ARGC = 256
+
+
+def encode_internal_argv(argv: list[str]) -> str:
+    """Encode exact Unicode argv into an ASCII-only launcher envelope."""
+    if not isinstance(argv, list) or len(argv) > _MAX_INTERNAL_ARGC or not all(
+            isinstance(value, str) and "\0" not in value for value in argv):
+        raise ValueError("argument vector is invalid or too large")
+    raw = json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) > _MAX_INTERNAL_ARGV_BYTES:
+        raise ValueError("argument vector exceeds the internal launcher limit")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_internal_argv(argv: list[str]) -> list[str]:
+    """Decode an internal launcher envelope, or return ordinary argv unchanged."""
+    values = list(argv)
+    if not values or values[0] != _INTERNAL_ARGV_FLAG:
+        return values
+    if len(values) != 2 or len(values[1]) > (_MAX_INTERNAL_ARGV_BYTES * 2):
+        raise ValueError("malformed argument envelope")
+    try:
+        raw = base64.b64decode(values[1], altchars=b"-_", validate=True)
+        decoded = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed argument envelope") from exc
+    if len(raw) > _MAX_INTERNAL_ARGV_BYTES or not isinstance(decoded, list) \
+            or len(decoded) > _MAX_INTERNAL_ARGC or not all(
+                isinstance(value, str) and "\0" not in value for value in decoded):
+        raise ValueError("argument envelope contains an invalid vector")
+    return decoded
+
+
+def _has_powershell_control_syntax(command: str) -> bool:
+    """Detect unquoted syntax that an argv envelope must not discard."""
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            if char == "`" and quote == '"':
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and index + 1 < len(command) and command[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in ";|&<>()\r\n":
+            return True
+        index += 1
+    return bool(quote)
 
 
 def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] = None,
@@ -41,6 +102,21 @@ def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] 
         target = ntpath.join(plugin_root, "bin", "agw.cmd")
         if shell == "powershell":
             replacement = "& '" + target.replace("'", "''") + "'"
+            if any(ord(char) > 127 for char in command):
+                if _has_powershell_control_syntax(command):
+                    return None
+                try:
+                    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+                except ParseUncertain:
+                    return None
+                if len(parsed.commands) != 1 or parsed.flags:
+                    return None
+                argv = parsed.commands[0].argv
+                if not argv or argv[0].casefold() not in {"agw", "agw.cmd"}:
+                    return None
+                payload = encode_internal_argv(argv[1:])
+                return (match.group("indent") + replacement + " "
+                        + _INTERNAL_ARGV_FLAG + " '" + payload + "'")
         else:
             replacement = shlex.quote(target.replace("\\", "/"))
     else:

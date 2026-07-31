@@ -1,0 +1,1 @@
+unicode launcher fixture

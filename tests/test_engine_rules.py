@@ -132,6 +132,38 @@ def test_packaged_agw_cmd_requires_exact_trusted_origin(policy, tmp_path, monkey
     ).action == ALLOW
 
 
+def test_packaged_agw_decodes_internal_unicode_arguments(policy, tmp_path):
+    from core import launcher
+
+    packaged = os.path.join(REPO, "bin", "agw.cmd")
+    payload = launcher.encode_internal_argv(
+        ["file", "read", "🗺 vault-map.md", "--json"]
+    )
+    decision = engine.evaluate(
+        _ev(
+            "exec", tool="PowerShell",
+            command=f'"{packaged}" --agw-argv-b64 "{payload}"',
+            cwd=str(tmp_path),
+        ),
+        policy, REPO,
+    )
+    assert decision.action == ALLOW
+
+
+def test_packaged_agw_rejects_malformed_internal_arguments(policy, tmp_path):
+    packaged = os.path.join(REPO, "bin", "agw.cmd")
+    decision = engine.evaluate(
+        _ev(
+            "exec", tool="PowerShell",
+            command=f'"{packaged}" --agw-argv-b64 "not-base64!"',
+            cwd=str(tmp_path),
+        ),
+        policy, REPO,
+    )
+    assert decision.action == DENY
+    assert decision.rule_id == "builtin:agw-launcher-envelope"
+
+
 def test_workspace_or_path_agw_cmd_shim_is_never_privileged(policy, tmp_path, monkeypatch):
     shim = tmp_path / "agw.cmd"
     shim.write_text("not the packaged launcher")

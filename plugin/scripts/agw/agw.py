@@ -32,6 +32,7 @@ PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.di
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 from core import archive_transactions as archive_tx  # noqa: E402
+from core import launcher                   # noqa: E402
 from core import workflows                  # noqa: E402
 import converters                           # noqa: E402
 import file_ops                             # noqa: E402
@@ -453,7 +454,8 @@ def cmd_file(args):
         if args.file_op == "read":
             data = file_ops.read_text_page(
                 args.path, start_line=args.start_line,
-                limit=args.limit, max_bytes=args.max_bytes,
+                start_byte=args.start_byte, limit=args.limit,
+                max_bytes=args.max_bytes,
             )
         elif args.file_op == "write":
             content = _read_text_payload(args.content_file, "content")
@@ -942,6 +944,11 @@ def cmd_prune(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        argv = launcher.decode_internal_argv(argv)
+    except ValueError as exc:
+        _err(f"invalid trusted-launcher arguments: {exc}", code=2)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="machine-readable output")
@@ -1055,10 +1062,15 @@ def main(argv=None):
     add_file(
         "read", "Read bounded UTF-8 text without scanning sibling files",
         (["--start-line"], {"type": int, "default": 1, "help": "first line; 1-based"}),
+        (["--start-byte"], {
+            "type": int, "default": None,
+            "help": "exact continuation offset returned by a prior read",
+        }),
         (["--limit"], {"type": int, "default": file_ops.DEFAULT_READ_LINES,
                         "help": "maximum lines"}),
         (["--max-bytes"], {"type": int, "default": file_ops.DEFAULT_READ_BYTES,
-                            "help": "maximum UTF-8 output bytes"}),
+                            "help": ("optional output budget; default 32768, maximum "
+                                     "262144; usually omit")}),
         example="agw file read app.log --start-line 201 --limit 100 --json",
     )
     add_file(

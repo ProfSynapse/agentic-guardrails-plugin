@@ -141,7 +141,11 @@ def test_file_and_run_help_are_progressive_and_compact():
     assert "--content-file" not in family
     assert "--start-line" not in family
     assert "--start-line" in read
+    assert "--start-byte" in read
     assert "--max-bytes" in read
+    assert "default 32768" in read
+    assert "maximum 262144" in read
+    assert "usually omit" in read
     assert "--content-file" in write
     assert "--patch" not in write
     assert "--output" in run

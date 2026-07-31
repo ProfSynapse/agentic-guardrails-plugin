@@ -20,6 +20,8 @@ Treat CLI help as authoritative. Request only the narrowest unknown scope:
 
 Do not reproduce the command catalog. Prefer compact JSON, bounded reads, and
 pagination. On PowerShell, use stdin or a file for fragile structured JSON.
+For `file read`, normally omit `--max-bytes`. Continue with the exact
+`next_start_line` or `next_start_byte` returned; never guess a larger budget.
 
 ## Route by intent
 
