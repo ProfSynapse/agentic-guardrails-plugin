@@ -2,6 +2,7 @@
 import ctypes
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -172,11 +173,12 @@ def test_xlsx_checkout_defaults_to_style_preserving_workbook(tmp_path, agw_home)
 
     checkout = run_agw("checkout", str(source), "--json")
     checkout_data = json.loads(checkout.stdout)
-    working = tmp_path / "_workspace" / "dashboard.xlsx"
+    working = Path(checkout_data["dest"])
     assert checkout_data["checkout_mode"] == "preserve"
     assert checkout_data["lossy"] is False
+    assert working.is_relative_to(Path(agw_home))
     assert working.exists()
-    assert not list((tmp_path / "_workspace").glob("*.csv"))
+    assert not list(working.parent.glob("*.csv"))
 
     edited = openpyxl.load_workbook(working)
     edited["Dashboard"]["C2"] = "new"

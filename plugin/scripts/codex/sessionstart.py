@@ -16,15 +16,14 @@ def _launcher(platform=None):
 
 _AGW = _launcher()
 _WINDOWS_PREREQUISITE = (
-    " On Windows, the packaged Guardrails CLI automatically selects an accessible "
-    "Python 3 interpreter (python, then py.exe -3). If neither works, explain "
-    "that prerequisite in ordinary "
-    "language; do not change PATH or rely on a file association."
+    " On Windows, it selects Python 3 via python, then py.exe -3. If neither "
+    "works, explain the prerequisite; do not change PATH or use file associations."
     if os.name == "nt" else ""
 )
 
 CONTEXT = f"""agentic-guardrails is active. Use `{_AGW}`; the trusted PreToolUse \
-hook resolves it to this package.\
+hook resolves it. If loading its skill, use the exact host-supplied `SKILL.md` \
+location; never infer, shorten, search for, or expose a plugin-cache path.\
 {_WINDOWS_PREREQUISITE} Treat CLI help as authoritative: request only \
 the narrowest relevant help (`--help`, `<verb> --help`, or `office <operation> \
 --help`); never load or repeat a full command catalog.
@@ -33,7 +32,7 @@ Operating principles:
 use direct, file-specific operations. Avoid variables, globs, command substitution, \
 splatting, dynamic path joins, or mixed shell scripts that obscure mutations.
 - Separate discovery/read, validation/dry-run, mutation, and verification. Do not \
-bundle unrelated writes merely to save calls. Prefer the smallest reversible \
+bundle unrelated writes. Prefer the smallest reversible \
 operation plus compact JSON, pagination, or file/stdin input over clever quoting.
 For write scripts, declare every output; exact mode scans no siblings. Use reviewed \
 workflows for repeats; observed roots only detect sidecars.

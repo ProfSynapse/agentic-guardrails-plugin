@@ -22,3 +22,8 @@ tree. Use `publish-file` to validate and hash a temporary artifact before one
 recoverable atomic replacement. Busy/sharing-violation retries are bounded; a
 failed publish leaves the live target unchanged and preserves the staged output.
 Keep the Guardrails archive store outside the synced root.
+
+Preserved Excel checkouts default outside the synced tree. For `.xlsm`, hydrate
+the live file, edit only the checkout in desktop Excel, close Excel, validate
+macro/package preservation, and publish with the recorded live hash. If another
+editor or service changed the Drive copy, treat it as a conflict and re-checkout.

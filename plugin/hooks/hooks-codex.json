@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" pretooluse",
-            "commandWindows": "py.exe -3 -X utf8 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" pretooluse",
             "timeout": 120,
             "statusMessage": "guardrails check"
           }
@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" posttooluse",
-            "commandWindows": "py.exe -3 -X utf8 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" posttooluse",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" posttooluse",
             "timeout": 10
           }
         ]
@@ -34,7 +34,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart || python \"${PLUGIN_ROOT}/scripts/codex/_dispatch.py\" sessionstart",
-            "commandWindows": "py.exe -3 -X utf8 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" sessionstart",
+            "commandWindows": "py.exe -3 \"${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.py\" sessionstart",
             "timeout": 15
           }
         ]

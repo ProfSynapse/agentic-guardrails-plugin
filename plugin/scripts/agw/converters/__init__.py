@@ -36,7 +36,7 @@ def to_open_format(src: str, dest_dir: str, mode: str = "auto") -> dict:
     ext = os.path.splitext(src)[1].lower()
     caps = capabilities()
 
-    if mode == "preserve" or (ext == ".xlsx" and mode == "auto"):
+    if mode == "preserve" or (ext in {".xlsx", ".xlsm"} and mode == "auto"):
         dest = os.path.join(dest_dir, name)
         shutil.copy2(src, dest)
         return {"dest": dest, "mode": "copy", "format": ext.lstrip(".") or "bin",

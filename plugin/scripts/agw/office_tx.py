@@ -387,6 +387,217 @@ def _package_state(path: str) -> dict:
     return state
 
 
+_PRESERVED_PART_PREFIXES = (
+    "_xmlsignatures/",
+    "customxml/",
+    "customui/",
+    "xl/activex/",
+    "xl/ctrlprops/",
+    "xl/dialogsheets/",
+    "xl/embeddings/",
+    "xl/externallinks/",
+    "xl/macrosheets/",
+    "xl/model/",
+)
+_PRESERVED_PART_NAMES = {
+    "xl/connections.xml",
+    "xl/vbaproject.bin",
+    "xl/vbaprojectsignature.bin",
+}
+_PRESERVED_MARKERS = (
+    "activex", "customui", "customxml", "dialogsheets", "digitalsignature",
+    "externallink", "macrosheet", "macroenabled", "oleobject", "vbaproject",
+    "vmldrawing",
+)
+
+
+def _preserved_category(name: str) -> str:
+    lower = name.replace("\\", "/").lower().lstrip("/")
+    if "vbaprojectsignature" in lower or lower.startswith("_xmlsignatures/"):
+        return "signature"
+    if "vbaproject" in lower:
+        return "vba"
+    if lower.startswith("xl/activex/"):
+        return "activex"
+    if lower.startswith(("xl/embeddings/", "xl/ctrlprops/")):
+        return "embedded"
+    if lower.startswith(("xl/dialogsheets/", "xl/macrosheets/")):
+        return "legacy_macro"
+    if lower.startswith("xl/drawings/") and lower.endswith(".vml"):
+        return "legacy_controls"
+    if lower.startswith("customxml/"):
+        return "custom_xml"
+    if lower.startswith("customui/"):
+        return "custom_ui"
+    if lower.startswith("xl/externallinks/"):
+        return "external_links"
+    if lower == "xl/connections.xml":
+        return "connections"
+    if lower.startswith("xl/model/"):
+        return "data_model"
+    return ""
+
+
+def _preserved_part(name: str) -> bool:
+    lower = name.replace("\\", "/").lower().lstrip("/")
+    return (
+        lower in _PRESERVED_PART_NAMES
+        or any(lower.startswith(prefix) for prefix in _PRESERVED_PART_PREFIXES)
+        or (lower.startswith("xl/drawings/") and lower.endswith(".vml"))
+        or "vbaproject" in lower
+    )
+
+
+def _preserved_relationships(payload: bytes) -> list[dict]:
+    root = ElementTree.fromstring(payload)
+    result = []
+    for node in root:
+        rel_type = node.attrib.get("Type", "")
+        target = node.attrib.get("Target", "")
+        signal = f"{rel_type} {target}".lower()
+        if any(marker in signal for marker in _PRESERVED_MARKERS):
+            result.append({
+                "type": rel_type,
+                "target": target.replace("\\", "/"),
+                "target_mode": node.attrib.get("TargetMode", ""),
+            })
+    return sorted(result, key=lambda item: (
+        item["type"], item["target"], item["target_mode"]
+    ))
+
+
+def _preserved_content_types(payload: bytes) -> list[dict]:
+    root = ElementTree.fromstring(payload)
+    result = []
+    for node in root:
+        part_name = node.attrib.get("PartName", "")
+        content_type = node.attrib.get("ContentType", "")
+        extension = node.attrib.get("Extension", "")
+        signal = f"{part_name} {content_type} {extension}".lower()
+        if _preserved_part(part_name) or any(
+                marker in signal for marker in _PRESERVED_MARKERS):
+            result.append({
+                "part_name": part_name.replace("\\", "/"),
+                "extension": extension,
+                "content_type": content_type,
+            })
+    return sorted(result, key=lambda item: (
+        item["part_name"], item["extension"], item["content_type"]
+    ))
+
+
+def package_preservation_manifest(path: str) -> dict:
+    """Describe content that a staged Excel edit must preserve exactly."""
+    path = os.path.abspath(os.path.expanduser(path))
+    _package_preflight(path, mutating=False)
+    extension = os.path.splitext(path)[1].lower()
+    if extension not in {".xlsx", ".xlsm"}:
+        raise UnsupportedOfficeFile(
+            "package preservation manifests support .xlsx and .xlsm"
+        )
+    parts = {}
+    relationships = {}
+    content_types = []
+    with zipfile.ZipFile(path) as package:
+        for item in package.infolist():
+            name = item.filename.replace("\\", "/")
+            payload = package.read(item)
+            if _preserved_part(name):
+                parts[name] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                    "category": _preserved_category(name) or "protected",
+                }
+            if name.lower().endswith(".rels"):
+                selected = _preserved_relationships(payload)
+                if selected:
+                    relationships[name] = selected
+            elif name.lower() == "[content_types].xml":
+                content_types = _preserved_content_types(payload)
+    categories = {}
+    for item in parts.values():
+        category = item["category"]
+        categories[category] = categories.get(category, 0) + 1
+    return {
+        "schema": "agw-office-preservation-v1",
+        "path": path,
+        "extension": extension,
+        "file_sha256": store.file_sha256(path),
+        "protected_parts": parts,
+        "protected_relationships": relationships,
+        "protected_content_types": content_types,
+        "categories": categories,
+        "protected_part_count": len(parts),
+    }
+
+
+def validate_package_preservation(
+    original_path: str,
+    candidate_path: str,
+    *,
+    expected_original_sha256: str = "",
+) -> dict:
+    """Verify that a candidate retains active and integration-bearing parts."""
+    original = package_preservation_manifest(original_path)
+    candidate = package_preservation_manifest(candidate_path)
+    wanted = str(expected_original_sha256 or "").strip().lower()
+    if wanted and original["file_sha256"].lower() != wanted:
+        raise TransactionConflict(
+            "CONFLICT: preservation baseline hash does not match expected version"
+        )
+    risks = []
+    if original["extension"] != candidate["extension"]:
+        risks.append({
+            "code": "office_extension_changed", "part": "package",
+            "message": (
+                f"extension changed from {original['extension']} "
+                f"to {candidate['extension']}"
+            ),
+        })
+    before_parts = original["protected_parts"]
+    after_parts = candidate["protected_parts"]
+    for name in sorted(set(before_parts) | set(after_parts)):
+        if name not in after_parts:
+            message = "protected Office part was removed"
+            code = "removed_protected_ooxml_part"
+        elif name not in before_parts:
+            message = "protected Office part was added"
+            code = "added_protected_ooxml_part"
+        elif before_parts[name]["sha256"] != after_parts[name]["sha256"]:
+            message = "protected Office part was altered"
+            code = "altered_protected_ooxml_part"
+        else:
+            continue
+        risks.append({
+            "code": code,
+            "feature": (before_parts.get(name) or after_parts[name])["category"],
+            "part": name,
+            "message": message,
+        })
+    for key, label in (
+        ("protected_relationships", "protected Office relationships changed"),
+        ("protected_content_types", "protected Office content types changed"),
+    ):
+        if original[key] != candidate[key]:
+            risks.append({
+                "code": f"altered_{key}", "feature": "package integration",
+                "part": "package", "message": label,
+            })
+    if risks:
+        raise PreservationError(risks)
+    return {
+        "verified": True,
+        "schema": original["schema"],
+        "original": original["path"],
+        "candidate": candidate["path"],
+        "original_hash": original["file_sha256"],
+        "candidate_hash": candidate["file_sha256"],
+        "protected_part_count": original["protected_part_count"],
+        "categories": original["categories"],
+        "macros_unchanged": True,
+    }
+
+
 def _mutable_part(name: str, extension: str, operation: str) -> bool:
     lower = name.lower()
     if lower in {"[content_types].xml", "docprops/core.xml", "docprops/app.xml"}:
@@ -502,7 +713,12 @@ def _package_preflight(path: str, *, mutating: bool = True) -> None:
         raise UnsupportedOfficeFile("file is not a valid Office OOXML package") from exc
 
 
-def _target_preflight(path: str, *, allow_preservation_risks: bool = False) -> str:
+def _target_preflight(
+    path: str,
+    *,
+    allow_preservation_risks: bool = False,
+    allow_macro_enabled: bool = False,
+) -> str:
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(path):
         raise TransactionError(f"not a regular file: {path}")
@@ -513,7 +729,7 @@ def _target_preflight(path: str, *, allow_preservation_risks: bool = False) -> s
         raise UnsupportedOfficeFile("Office target is not a regular file")
     if getattr(os.stat(path, follow_symlinks=False), "st_nlink", 1) > 1:
         raise UnsupportedOfficeFile("hard-linked Office targets are unsupported")
-    if os.path.splitext(path)[1].lower() == ".xlsm":
+    if os.path.splitext(path)[1].lower() == ".xlsm" and not allow_macro_enabled:
         raise UnsupportedOfficeFile(".xlsm mutation is unsupported; use .xlsx")
     if profiles.is_gdoc_stub(path):
         raise UnsupportedOfficeFile("Google Docs pointer stubs have no editable local content")
@@ -530,7 +746,7 @@ def _target_preflight(path: str, *, allow_preservation_risks: bool = False) -> s
         raise TransactionConflict(
             "file has an open Guardrails checkout; publish or resolve it first"
         )
-    _package_preflight(path)
+    _package_preflight(path, mutating=not allow_macro_enabled)
     risks = inspect_preservation_risks(path)
     if risks and not allow_preservation_risks:
         raise PreservationError(risks)
@@ -547,16 +763,22 @@ def execute_mutation(
     expected_sha256: Optional[str] = None,
     dry_run: bool = False,
     allow_preservation_risks: bool = False,
+    allow_macro_enabled: bool = False,
     preservation_validator: Optional[Callable[[str, str, str], dict]] = None,
 ) -> dict:
     """Apply one validated Office mutation and publish it atomically."""
+    if allow_macro_enabled and preservation_validator is None:
+        raise TransactionError(
+            "macro-enabled mutation requires an exact preservation validator"
+        )
     path = os.path.abspath(os.path.expanduser(path))
     lock_name = "office-" + _target_id(path)[:32]
     stage = ""
     receipt = None
     with store.Lock(lock_name, timeout=10.0):
         path = _target_preflight(
-            path, allow_preservation_risks=allow_preservation_risks
+            path, allow_preservation_risks=allow_preservation_risks,
+            allow_macro_enabled=allow_macro_enabled,
         )
         before = store.file_sha256(path)
         if expected_sha256 and before.lower() != expected_sha256.lower():
@@ -591,7 +813,7 @@ def execute_mutation(
             validation = _run_capturing_warnings(
                 lambda: validate(stage, mutation_plan), "validate"
             ) or {}
-            _package_preflight(stage)
+            _package_preflight(stage, mutating=not allow_macro_enabled)
             preservation = (
                 preservation_validator(path, stage, operation)
                 if preservation_validator is not None

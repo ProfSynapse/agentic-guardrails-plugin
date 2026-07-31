@@ -176,6 +176,15 @@ def info(path: str) -> dict:
     if ext in (".xlsx", ".xlsm"):
         import office_excel
         data = office_excel.workbook_info(path)
+        data["type"] = ext.lstrip(".")
+        if ext == ".xlsm":
+            manifest = office_tx.package_preservation_manifest(path)
+            data["macro_preservation"] = {
+                "schema": manifest["schema"],
+                "protected_part_count": manifest["protected_part_count"],
+                "categories": manifest["categories"],
+                "file_sha256": manifest["file_sha256"],
+            }
         # Preserve the legacy sheet-name mapping while returning richer data.
         data["sheet_list"] = data.pop("sheets")
         data["sheets"] = {
@@ -301,7 +310,8 @@ def set_cell(path: str, sheet: str, cell: str, value: str,
              dry_run: bool = False) -> dict:
     office_tx._package_preflight(path, mutating=False)
     risks = office_tx.inspect_preservation_risks(path)
-    if risks:
+    macro_enabled = _ext(path) == ".xlsm"
+    if risks or macro_enabled:
         import office_surgical
         state = {"new": _coerce(value, force_text)}
 
@@ -337,6 +347,7 @@ def set_cell(path: str, sheet: str, cell: str, value: str,
                 apply=surgical_apply, validate=surgical_validate,
                 expected_sha256=expected_sha256 or None, dry_run=dry_run,
                 allow_preservation_risks=True,
+                allow_macro_enabled=macro_enabled,
                 preservation_validator=surgical_preservation,
             )
         except (office_tx.TransactionError,
@@ -344,6 +355,10 @@ def set_cell(path: str, sheet: str, cell: str, value: str,
             raise OfficeError(str(exc)) from exc
         result["snapshot_version"] = result.pop("snapshot", None)
         result["preserved_risks"] = risks
+        if macro_enabled:
+            result["macro_preservation"] = (
+                office_tx.package_preservation_manifest(path)
+            )["categories"]
         return result
 
     openpyxl = _openpyxl()

@@ -56,8 +56,9 @@ the full GitHub URL above instead of the owner/repo shorthand.
 codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
 ```
 
-Then run `/plugins` inside Codex, install **Agentic Guardrails**, and trust its
-hooks with `/hooks`. The full walkthrough — including the `apply_patch` deletion
+Then run `/plugins` inside Codex, install **Agentic Guardrails**, and approve its
+hooks in the host's trust UI (`/hooks` in Codex CLI; desktop may show a trust
+dialog). The full walkthrough — including the `apply_patch` deletion
 guard and a smoke test to confirm interception on your build — is in
 [plugin/CODEX.md](plugin/CODEX.md).
 
@@ -106,6 +107,7 @@ so the agent self-corrects instead of fighting the rails:
 |---|---|
 | `rm file` | `agw archive file` (reversible) |
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
+| editing a Drive-hosted macro workbook | `agw checkout workbook.xlsm` → edit the external working copy in Excel → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
@@ -115,6 +117,7 @@ Structured Office operations are also available:
 ~~~text
 agw office info workbook.xlsx --scope tables --json
 agw office read-table workbook.xlsx --table RecordsTable --columns RecordID,Status --limit 50 --json
+agw office validate-preservation staged.xlsm --against original.xlsm --json
 agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json '["RecordID","Status"]' --create-sheet
 agw office append-table-row workbook.xlsx --table RecordsTable --row-json '{"RecordID":"R-2"}' --unique-column RecordID
 agw office update-table-row workbook.xlsx --table RecordsTable --key-column RecordID --key R-2 --set-json '{"Status":"Closed"}'
@@ -144,8 +147,13 @@ hashes. `ensure-table` is idempotent and can create an explicitly requested
 sheet or convert an explicit rectangular range. Appends can enforce atomic
 single or composite uniqueness with `--unique-column` or
 `--unique-columns-json`. Read-only inspection reports detected preservation
-risks; mutation refuses unsupported or lossy OOXML. Excel table writes support
-`.xlsx`; macro-enabled and unsupported complex OOXML files are refused. Word
+risks; mutation refuses unsupported or lossy OOXML. `set-cell` uses a surgical
+adapter for `.xlsm`, retaining every unrelated package part byte-for-byte.
+Preserved `.xlsx`/`.xlsm` checkouts default to a non-synced Guardrails workspace
+for desktop Excel editing. Publish refuses live drift, validates VBA and other
+protected package content, archives one exact pre-image, and atomically replaces
+the synced target. Other Excel table writes support `.xlsx` and remain refused
+for `.xlsm`. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
