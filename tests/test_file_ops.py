@@ -87,6 +87,43 @@ def test_file_read_byte_bound_returns_only_complete_lines(tmp_path):
     assert result["next_start_line"] == 3
 
 
+def test_file_read_oversized_unicode_line_returns_exact_byte_continuations(tmp_path):
+    target = tmp_path / "map.txt"
+    original = ("🗺 route " * 20) + "\nnext\n"
+    target.write_text(original, encoding="utf-8", newline="")
+
+    chunks = []
+    page = file_ops.read_text_page(str(target), max_bytes=31)
+    while page["next_start_byte"] is not None:
+        assert page["partial_line"] is True
+        assert page["returned_bytes"] <= 31
+        chunks.append(page["content"])
+        page = file_ops.read_text_page(
+            str(target), start_byte=page["next_start_byte"], max_bytes=31,
+        )
+    chunks.append(page["content"])
+
+    assert "".join(chunks) == original.splitlines(keepends=True)[0]
+    assert page["partial_line"] is False
+    assert page["next_start_line"] == 2
+    final = file_ops.read_text_page(str(target), start_line=page["next_start_line"])
+    assert final["content"] == "next\n"
+    assert final["complete"] is True
+
+
+def test_file_read_rejects_guessed_byte_offsets_and_explains_budget(tmp_path):
+    target = tmp_path / "unicode.txt"
+    target.write_text("🗺 map\n", encoding="utf-8")
+    with pytest.raises(file_ops.FileOperationError, match="exact next_start_byte"):
+        file_ops.read_text_page(str(target), start_byte=1)
+    with pytest.raises(file_ops.FileOperationError, match="usually omit") as caught:
+        file_ops.read_text_page(
+            str(target), max_bytes=file_ops.MAX_READ_OUTPUT_BYTES + 1,
+        )
+    assert caught.value.details["default_bytes"] == file_ops.DEFAULT_READ_BYTES
+    assert caught.value.details["maximum_bytes"] == file_ops.MAX_READ_OUTPUT_BYTES
+
+
 def test_file_read_refuses_placeholder_before_open(tmp_path, monkeypatch):
     target = tmp_path / "cloud.txt"
     target.write_text("not opened", encoding="utf-8")
@@ -107,6 +144,23 @@ def test_file_read_json_stdout_is_strict_and_paginated(tmp_path):
     assert payload["content"] == "first\n"
     assert payload["next_start_line"] == 2
     assert payload["complete"] is False
+
+
+def test_file_read_cli_uses_returned_byte_continuation(tmp_path):
+    target = tmp_path / "one-line.json"
+    target.write_text('{"map":"' + ("🗺" * 30) + '"}\n', encoding="utf-8")
+    first = run_agw(
+        "file", "read", str(target), "--max-bytes", "29", "--json",
+    )
+    payload = json.loads(first.stdout)
+    assert payload["partial_line"] is True
+    assert payload["next_start_byte"] > 0
+    second = run_agw(
+        "file", "read", str(target), "--start-byte",
+        str(payload["next_start_byte"]), "--max-bytes", "29", "--json",
+    )
+    continuation = json.loads(second.stdout)
+    assert continuation["start_byte"] == payload["next_start_byte"]
 
 
 def test_exact_unified_patch_and_replace(tmp_path):

@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.11` is the Windows-first stable release.
+> **Release status:** `0.3.12` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -31,8 +31,9 @@ don't fire there. Tracking:
   detection if a human edited it in the meantime.
 - Cloud-only placeholder files and `.gdoc` pointer stubs (the classic synced-
   folder data-loss traps) are detected and protected.
-- Exact UTF-8 text reads are bounded and paginated through `agw file read`,
-  with hashes and continuation metadata instead of unbounded shell output.
+- Exact UTF-8 text reads are bounded and paginated through `agw file read`.
+  The default output budget is normally sufficient; oversized lines return an
+  exact byte continuation instead of requiring a larger guessed limit.
 - Sensitive-read and credential-search prompts name the sanitized filename or
   scope, detected risk category, and the reason approval was triggered.
 - Anything archived comes back with `agw restore` or `agw undo`.

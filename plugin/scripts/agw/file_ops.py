@@ -1,6 +1,7 @@
 """Atomic, recoverable operations for ordinary text files."""
 from __future__ import annotations
 
+import bisect
 import hashlib
 import errno
 import fnmatch
@@ -129,17 +130,26 @@ def read_text_page(
     path: str,
     *,
     start_line: int = 1,
+    start_byte: Optional[int] = None,
     limit: int = DEFAULT_READ_LINES,
     max_bytes: int = DEFAULT_READ_BYTES,
 ) -> dict:
     """Read one bounded, stable page from an exact UTF-8 text file."""
     if start_line < 1:
         raise FileOperationError("start line must be at least 1")
+    if start_byte is not None and start_byte < 0:
+        raise FileOperationError("start byte must be at least 0")
     if limit < 1:
         raise FileOperationError("line limit must be at least 1")
     if max_bytes < 1 or max_bytes > MAX_READ_OUTPUT_BYTES:
         raise FileOperationError(
-            f"max bytes must be between 1 and {MAX_READ_OUTPUT_BYTES}"
+            f"--max-bytes must be between 1 and {MAX_READ_OUTPUT_BYTES}; "
+            f"usually omit it to use the {DEFAULT_READ_BYTES}-byte default",
+            {
+                "max_bytes": max_bytes,
+                "default_bytes": DEFAULT_READ_BYTES,
+                "maximum_bytes": MAX_READ_OUTPUT_BYTES,
+            },
         )
 
     target = resolve_target(path)
@@ -193,7 +203,12 @@ def read_text_page(
             "CONFLICT: file changed while it was being read", {"path": target},
         )
 
+    decoded = text.encode("utf-8")
     lines = text.splitlines(keepends=True)
+    encoded_lines = [line.encode("utf-8") for line in lines]
+    line_offsets = [0]
+    for encoded_line in encoded_lines:
+        line_offsets.append(line_offsets[-1] + len(encoded_line))
     line_count = len(lines)
     if start_line > line_count + 1:
         raise FileOperationError(
@@ -201,6 +216,69 @@ def read_text_page(
             {"path": target, "start_line": start_line,
              "line_count": line_count},
         )
+
+    if start_byte is not None:
+        if start_byte > len(decoded):
+            raise FileOperationError(
+                "start byte is beyond the end of the decoded UTF-8 file",
+                {"path": target, "start_byte": start_byte,
+                 "decoded_utf8_bytes": len(decoded)},
+            )
+        try:
+            decoded[:start_byte].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise FileOperationError(
+                "start byte must be a UTF-8 character boundary; use the exact "
+                "next_start_byte returned by the previous read",
+                {"path": target, "start_byte": start_byte},
+            ) from exc
+
+        if start_byte == len(decoded):
+            index = line_count
+        else:
+            index = bisect.bisect_right(line_offsets, start_byte) - 1
+        line_number = index + 1
+        line_end = line_offsets[index + 1] if index < line_count else start_byte
+        remaining = decoded[start_byte:line_end]
+        candidate = remaining[:max_bytes]
+        content = candidate.decode("utf-8", errors="ignore")
+        chunk = content.encode("utf-8")
+        if remaining and not chunk:
+            first_character_bytes = len(remaining.decode("utf-8")[0].encode("utf-8"))
+            raise FileOperationError(
+                "the output budget is smaller than the next UTF-8 character; use "
+                f"--max-bytes {first_character_bytes} or omit the option",
+                {"path": target, "start_byte": start_byte,
+                 "minimum_next_bytes": first_character_bytes,
+                 "default_bytes": DEFAULT_READ_BYTES,
+                 "maximum_bytes": MAX_READ_OUTPUT_BYTES},
+            )
+        reached_line_end = len(chunk) == len(remaining)
+        next_line = line_number + 1 if reached_line_end and index + 1 < line_count else None
+        next_byte = None if reached_line_end else start_byte + len(chunk)
+        complete = reached_line_end and index + 1 >= line_count
+        return {
+            "path": target,
+            "content": content,
+            "encoding": "utf-8",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "total_bytes": len(raw),
+            "decoded_utf8_bytes": len(decoded),
+            "returned_bytes": len(chunk),
+            "max_bytes": max_bytes,
+            "maximum_bytes": MAX_READ_OUTPUT_BYTES,
+            "line_count": line_count,
+            "start_line": line_number,
+            "end_line": line_number if chunk else None,
+            "start_byte": start_byte,
+            "partial_line": not reached_line_end,
+            "complete": complete,
+            "stop_reason": None if complete else ("max_bytes" if next_byte is not None else "limit"),
+            "next_start_line": next_line,
+            "next_start_byte": next_byte,
+            "byte_offset_basis": "decoded_utf8",
+            "placeholder_detection": "checked",
+        }
 
     index = start_line - 1
     selected = []
@@ -217,13 +295,42 @@ def read_text_page(
         returned_bytes += encoded_size
         index += 1
     if not selected and index < requested_end:
-        line_bytes = len(lines[index].encode("utf-8"))
-        raise FileOperationError(
-            "requested line exceeds the output byte limit; raise --max-bytes "
-            "or use a format-specific reader",
-            {"path": target, "line": index + 1, "line_bytes": line_bytes,
-             "max_bytes": max_bytes, "maximum": MAX_READ_OUTPUT_BYTES},
-        )
+        line_bytes = encoded_lines[index]
+        candidate = line_bytes[:max_bytes]
+        content = candidate.decode("utf-8", errors="ignore")
+        chunk = content.encode("utf-8")
+        if not chunk:
+            first_character_bytes = len(lines[index][0].encode("utf-8"))
+            raise FileOperationError(
+                "the output budget is smaller than the next UTF-8 character; use "
+                f"--max-bytes {first_character_bytes} or omit the option",
+                {"path": target, "line": index + 1,
+                 "minimum_next_bytes": first_character_bytes,
+                 "default_bytes": DEFAULT_READ_BYTES,
+                 "maximum_bytes": MAX_READ_OUTPUT_BYTES},
+            )
+        return {
+            "path": target,
+            "content": content,
+            "encoding": "utf-8",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "total_bytes": len(raw),
+            "decoded_utf8_bytes": len(decoded),
+            "returned_bytes": len(chunk),
+            "max_bytes": max_bytes,
+            "maximum_bytes": MAX_READ_OUTPUT_BYTES,
+            "line_count": line_count,
+            "start_line": index + 1,
+            "end_line": index + 1,
+            "start_byte": line_offsets[index],
+            "partial_line": True,
+            "complete": False,
+            "stop_reason": "max_bytes",
+            "next_start_line": None,
+            "next_start_byte": line_offsets[index] + len(chunk),
+            "byte_offset_basis": "decoded_utf8",
+            "placeholder_detection": "checked",
+        }
     if not stop_reason and index < line_count:
         stop_reason = "limit"
     complete = index >= line_count
@@ -235,13 +342,20 @@ def read_text_page(
         "encoding": "utf-8",
         "sha256": hashlib.sha256(raw).hexdigest(),
         "total_bytes": len(raw),
+        "decoded_utf8_bytes": len(decoded),
         "returned_bytes": returned_bytes,
+        "max_bytes": max_bytes,
+        "maximum_bytes": MAX_READ_OUTPUT_BYTES,
         "line_count": line_count,
         "start_line": start_line,
         "end_line": end_line,
+        "start_byte": None,
+        "partial_line": False,
         "complete": complete,
         "stop_reason": stop_reason or None,
         "next_start_line": None if complete else index + 1,
+        "next_start_byte": None,
+        "byte_offset_basis": "decoded_utf8",
         "placeholder_detection": "checked",
     }
 

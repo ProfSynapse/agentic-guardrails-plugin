@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 
-from . import policy_health, powershell_bind, profiles as prof
+from . import launcher, policy_health, powershell_bind, profiles as prof
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     ToolEvent, worst
@@ -1087,7 +1087,7 @@ def _agw_file_read_target(args: list[str]) -> str:
     )
     if operation_index is None or tail[operation_index] != "read":
         return ""
-    value_options = {"--start-line", "--limit", "--max-bytes"}
+    value_options = {"--start-line", "--start-byte", "--limit", "--max-bytes"}
     index = operation_index + 1
     while index < len(tail):
         value = tail[index]
@@ -1269,7 +1269,17 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 enforcement_class=NON_WAIVABLE_INVARIANT,
                 presentation_context=DecisionContext.AGW_UNKNOWN,
             )
-        args = cmd.argv[1:]
+        try:
+            args = launcher.decode_internal_argv(cmd.argv[1:])
+        except ValueError:
+            return Decision(
+                DENY,
+                "The trusted Guardrails launcher received a malformed internal "
+                "argument envelope.",
+                "builtin:agw-launcher-envelope",
+                enforcement_class=NON_WAIVABLE_INVARIANT,
+                presentation_context=DecisionContext.AGW_UNKNOWN,
+            )
         verb = next((a for a in args if not a.startswith("-")), "")
         if not verb and any(a in {"-h", "--help", "-V", "--version"} for a in args):
             return Decision(ALLOW, "", "builtin:agw-info")
