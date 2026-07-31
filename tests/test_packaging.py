@@ -14,7 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.3.15"
+VERSION = "0.3.16"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",

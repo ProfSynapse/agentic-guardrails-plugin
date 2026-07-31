@@ -79,6 +79,46 @@ def test_short_agw_is_rewritten_to_active_package(tool):
     assert updated["command"].endswith(" status --json")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
+def test_short_agw_pipeline_receiver_is_rewritten_to_active_package(tmp_path):
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": (
+                "@'\nfirst row\nsecond row\n'@ | agw file write "
+                "'ledger.txt' --content-file - --expected-hash absent --json"
+            ),
+            "description": "write ledger",
+        },
+        "cwd": str(tmp_path),
+        "session_id": "short-agw-pipeline-claude",
+        "hook_event_name": "PreToolUse",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    updated = specific["updatedInput"]
+    assert updated["description"] == "write ledger"
+    assert "| & '" in updated["command"]
+    assert "bin\\agw.cmd' file write 'ledger.txt'" in updated["command"]
+    assert "| agw file write" not in updated["command"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
+def test_pipeline_rewrite_never_hides_a_denied_later_statement():
+    out = run_hook({
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": "Write-Output x | agw status; Remove-Item important.txt"
+        },
+        "cwd": REPO,
+        "session_id": "short-agw-pipeline-compound-claude",
+        "hook_event_name": "PreToolUse",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+
+
 def test_short_agw_rewrite_never_hides_a_denied_compound_command():
     out = run_hook({
         "tool_name": "PowerShell",
