@@ -261,4 +261,4 @@ def test_publish_file_implicitly_guards_drift_during_preservation_check(
         "external-edit"
     assert stage.exists()
     error = json.loads(capsys.readouterr().err)["error"]
-    assert error["code"] == "file_hash_conflict"
+    assert error["code"] == "preimage_hash_conflict"

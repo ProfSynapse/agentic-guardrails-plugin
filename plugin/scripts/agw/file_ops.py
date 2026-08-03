@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import bisect
+from contextlib import ExitStack
 import hashlib
 import errno
 import fnmatch
+import json
 import multiprocessing
 import os
 import re
@@ -13,6 +15,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from typing import Callable, Optional
 
 from core import engine, preimages, profiles, store
@@ -40,7 +43,27 @@ class FileOperationError(RuntimeError):
 
 
 class FileConflict(FileOperationError):
-    error_code = "file_hash_conflict"
+    error_code = "file_conflict"
+
+
+class PreimageHashConflict(FileConflict):
+    error_code = "preimage_hash_conflict"
+
+
+class PatchContextConflict(FileConflict):
+    error_code = "patch_context_conflict"
+
+
+class PatchHunkCountMismatch(FileConflict):
+    error_code = "patch_hunk_count_mismatch"
+
+
+class ReplaceMatchConflict(FileConflict):
+    error_code = "replace_match_conflict"
+
+
+class FileTransactionError(FileOperationError):
+    error_code = "file_transaction_error"
 
 
 class PublishBusy(FileOperationError):
@@ -96,14 +119,14 @@ def _check_expected(path: str, expected: str) -> Optional[str]:
         return current
     if wanted in {"absent", "missing", "new"}:
         if current is not None:
-            raise FileConflict("CONFLICT: target exists but absence was expected", {
+            raise PreimageHashConflict("CONFLICT: target exists but absence was expected", {
                 "path": path, "expected": "absent", "actual": current,
             })
         return current
     if not _HASH_RE.fullmatch(wanted):
         raise FileOperationError("expected hash must be a SHA-256 or 'absent'")
     if current is None or current.lower() != wanted:
-        raise FileConflict("CONFLICT: file hash does not match expected version", {
+        raise PreimageHashConflict("CONFLICT: file hash does not match expected version", {
             "path": path, "expected": wanted, "actual": current or "absent",
         })
     return current
@@ -190,7 +213,7 @@ def read_text_page(
     try:
         after = os.stat(target, follow_symlinks=False)
     except OSError as exc:
-        raise FileConflict(
+        raise PreimageHashConflict(
             "CONFLICT: file changed while it was being read",
             {"path": target, "error": str(exc)},
         ) from exc
@@ -203,7 +226,7 @@ def read_text_page(
         int(after.st_size), int(after.st_mtime_ns),
     )
     if identity_before != identity_after:
-        raise FileConflict(
+        raise PreimageHashConflict(
             "CONFLICT: file changed while it was being read", {"path": target},
         )
 
@@ -425,13 +448,13 @@ def write_text(
             if store.file_sha256(stage) != after:
                 raise FileOperationError("staged file failed hash verification")
             if _current_hash(target) != before:
-                raise FileConflict("CONFLICT: file changed while content was staged", {
+                raise PreimageHashConflict("CONFLICT: file changed while content was staged", {
                     "path": target, "expected": before or "absent",
                     "actual": _current_hash(target) or "absent",
                 })
             receipt = _snapshot(target, operation, MAX_TEXT_BYTES)
             if _current_hash(target) != before:
-                raise FileConflict("CONFLICT: file changed before publication")
+                raise PreimageHashConflict("CONFLICT: file changed before publication")
             os.replace(stage, target)
             stage = ""
             if store.file_sha256(target) != after:
@@ -477,7 +500,7 @@ def transform_text(
         raise FileOperationError("text transform returned invalid content")
     current = _current_hash(target)
     if current != baseline:
-        raise FileConflict(
+        raise PreimageHashConflict(
             "CONFLICT: file changed while the transformation was prepared",
             {
                 "path": target,
@@ -496,11 +519,13 @@ def replace_text(original: str, old: str, new: str, *, replace_all: bool = False
     if not old:
         raise FileOperationError("old text must not be empty")
     if count == 0:
-        raise FileConflict("CONFLICT: old text was not found", {"matches": 0})
+        raise ReplaceMatchConflict(
+            "CONFLICT: old text was not found", {"matches": 0, "expected_matches": 1},
+        )
     if count != 1 and not replace_all:
-        raise FileConflict(
+        raise ReplaceMatchConflict(
             "CONFLICT: old text is not unique; use --all after review",
-            {"matches": count},
+            {"matches": count, "expected_matches": 1},
         )
     return original.replace(old, new) if replace_all else original.replace(old, new, 1)
 
@@ -516,17 +541,30 @@ def apply_unified_patch(original: str, patch: str) -> str:
     result = []
     source_index = 0
     index = 0
+    hunk_number = 0
     while index < len(lines):
         match = _HUNK_RE.match(lines[index])
         if not match:
             index += 1
             continue
+        hunk_number += 1
+        header = lines[index]
+        header_patch_line = index + 1
         old_start = int(match.group(1))
         old_count = int(match.group(2) or 1)
+        new_start = int(match.group(3))
         new_count = int(match.group(4) or 1)
         hunk_start = max(0, old_start - 1)
         if hunk_start < source_index or hunk_start > len(source):
-            raise FileConflict("CONFLICT: patch hunk is out of range")
+            raise PatchContextConflict(
+                "CONFLICT: patch hunk is out of range",
+                {
+                    "hunk": hunk_number,
+                    "header": header,
+                    "patch_line": header_patch_line,
+                    "target_line": old_start,
+                },
+            )
         result.extend(source[source_index:hunk_start])
         source_index = hunk_start
         seen_old = 0
@@ -544,9 +582,15 @@ def apply_unified_patch(original: str, patch: str) -> str:
             marker, content = line[0], line[1:]
             if marker in {" ", "-"}:
                 if source_index >= len(source) or source[source_index] != content:
-                    raise FileConflict("CONFLICT: patch context does not match target", {
-                        "line": source_index + 1,
-                    })
+                    raise PatchContextConflict(
+                        "CONFLICT: patch context does not match target",
+                        {
+                            "hunk": hunk_number,
+                            "header": header,
+                            "patch_line": index + 1,
+                            "target_line": source_index + 1,
+                        },
+                    )
                 source_index += 1
                 seen_old += 1
             if marker in {" ", "+"}:
@@ -554,11 +598,368 @@ def apply_unified_patch(original: str, patch: str) -> str:
                 seen_new += 1
             index += 1
         if seen_old != old_count or seen_new != new_count:
-            raise FileOperationError("patch hunk counts do not match its header")
+            def hunk_range(start, count):
+                return str(start) if count == 1 else f"{start},{count}"
+
+            suffix_at = header.find("@@", 2)
+            suffix = header[suffix_at + 2:] if suffix_at >= 0 else ""
+            suggested = (
+                f"@@ -{hunk_range(old_start, seen_old)} "
+                f"+{hunk_range(new_start, seen_new)} @@{suffix}"
+            )
+            raise PatchHunkCountMismatch(
+                "CONFLICT: patch hunk counts do not match its header",
+                {
+                    "hunk": hunk_number,
+                    "header": header,
+                    "patch_line": header_patch_line,
+                    "expected": {
+                        "old_lines": old_count,
+                        "new_lines": new_count,
+                    },
+                    "observed": {
+                        "old_lines": seen_old,
+                        "new_lines": seen_new,
+                    },
+                    "suggested_header": suggested,
+                },
+            )
     result.extend(source[source_index:])
     newline = "\r\n" if "\r\n" in original else "\n"
     final_newline = newline if original.endswith(("\n", "\r")) else ""
     return newline.join(result) + final_newline
+
+
+def _plan_path(value: str, working: str, label: str) -> str:
+    raw = str(value or "").strip()
+    if not raw or "\x00" in raw or any(char in raw for char in "*?["):
+        raise FileOperationError(f"{label} must be a literal path")
+    return os.path.abspath(os.path.join(working, os.path.expanduser(raw))) \
+        if not os.path.isabs(os.path.expanduser(raw)) \
+        else os.path.abspath(os.path.expanduser(raw))
+
+
+def _plan_payload(item: dict, inline_key: str, file_key: str, working: str,
+                  label: str) -> str:
+    inline = item.get(inline_key)
+    source = item.get(file_key)
+    if (inline is None) == (source is None):
+        raise FileOperationError(
+            f"{label} requires exactly one of {inline_key} or {file_key}"
+        )
+    if inline is not None:
+        if not isinstance(inline, str):
+            raise FileOperationError(f"{inline_key} must be a string")
+        text = inline
+    else:
+        text = read_utf8(_plan_path(source, working, file_key), label)
+    if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+        raise FileOperationError(
+            f"{label} exceeds the {MAX_TEXT_BYTES // (1024 * 1024)} MB text limit"
+        )
+    return text
+
+
+def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
+    """Materialize exact text proposals without changing any target files."""
+    if not isinstance(spec, dict) or spec.get("version", 1) != 1:
+        raise FileOperationError("operations file must use version 1")
+    supplied = spec.get("operations")
+    if not isinstance(supplied, list) or not supplied:
+        raise FileOperationError("operations file requires a non-empty operations list")
+    working = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
+    if not os.path.isdir(working):
+        raise FileOperationError("plan working directory does not exist")
+    planned = []
+    identities = set()
+    for number, item in enumerate(supplied, 1):
+        if not isinstance(item, dict):
+            raise FileOperationError(
+                "each planned operation must be a JSON object", {"operation": number},
+            )
+        kind = str(item.get("op") or "").strip().lower()
+        if kind not in {"write", "patch", "replace"}:
+            raise FileOperationError(
+                "planned op must be write, patch, or replace", {"operation": number},
+            )
+        target = resolve_target(_plan_path(item.get("path"), working, "path"))
+        identity = os.path.normcase(os.path.realpath(target))
+        if identity in identities:
+            raise FileOperationError(
+                "a transaction may target each file only once",
+                {"operation": number, "path": target},
+            )
+        identities.add(identity)
+        before = _check_expected(target, str(item.get("expected_hash") or ""))
+        if kind == "write":
+            updated = _plan_payload(
+                item, "content", "content_file", working, "write content",
+            )
+        else:
+            if before is None:
+                raise FileOperationError(
+                    f"planned {kind} requires an existing file",
+                    {"operation": number, "path": target},
+                )
+            original = read_utf8(target, "target")
+            if kind == "patch":
+                patch = _plan_payload(
+                    item, "patch", "patch_file", working, "patch",
+                )
+                updated = apply_unified_patch(original, patch)
+            else:
+                old = _plan_payload(
+                    item, "old", "old_file", working, "old text",
+                )
+                new = _plan_payload(
+                    item, "new", "new_file", working, "new text",
+                )
+                updated = replace_text(
+                    original, old, new, replace_all=bool(item.get("all", False)),
+                )
+        payload = updated.encode("utf-8")
+        planned.append({
+            "number": number,
+            "op": kind,
+            "path": target,
+            "before_hash": before or "absent",
+            "after_hash": hashlib.sha256(payload).hexdigest(),
+            "changed": before != hashlib.sha256(payload).hexdigest(),
+            "content": updated,
+        })
+    return {
+        "schema": "agw-file-plan/v1",
+        "cwd": working,
+        "operations": planned,
+    }
+
+
+def create_file_plan(
+    spec: dict,
+    plan_path: str,
+    *,
+    cwd: str = "",
+    expected_plan_hash: str = "absent",
+) -> dict:
+    """Write a self-contained, hashable proposal while leaving targets untouched."""
+    plan = build_file_plan(spec, cwd=cwd)
+    target = resolve_target(plan_path)
+    target_identity = os.path.normcase(os.path.realpath(target))
+    if target_identity in {
+            os.path.normcase(os.path.realpath(item["path"]))
+            for item in plan["operations"]}:
+        raise FileOperationError("plan file must not also be a transaction target")
+    serialized = json.dumps(
+        plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ) + "\n"
+    written = write_text(
+        target, serialized, expected_hash=expected_plan_hash, operation="plan",
+    )
+    return {
+        "operation": "plan",
+        "plan_file": target,
+        "plan_hash": written["after_hash"],
+        "changed": written["changed"],
+        "operations": [
+            {key: item[key] for key in (
+                "number", "op", "path", "before_hash", "after_hash", "changed",
+            )}
+            for item in plan["operations"]
+        ],
+        "targets_changed": sum(bool(item["changed"]) for item in plan["operations"]),
+        "validation_scope": "content_and_target_versions",
+    }
+
+
+def _json_without_duplicates(text: str, label: str) -> dict:
+    def collect(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=collect)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise FileOperationError(f"{label} is not valid unambiguous JSON: {exc}") from exc
+
+
+def _restore_published(receipt, before: Optional[str], target: str):
+    if before is None:
+        if os.path.lexists(target):
+            if not os.path.isfile(target) or os.path.islink(target):
+                raise OSError("new target is no longer an ordinary file")
+            os.unlink(target)
+        return
+    fd, stage = tempfile.mkstemp(
+        prefix=".agw-rollback-", suffix=".tmp", dir=os.path.dirname(target),
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(receipt.artifact, stage)
+        if store.file_sha256(stage) != before:
+            raise OSError("recovery artifact failed hash verification")
+        os.replace(stage, target)
+        stage = ""
+    finally:
+        if stage and os.path.exists(stage):
+            os.unlink(stage)
+
+
+def apply_file_plan(plan_path: str, *, expected_plan_hash: str) -> dict:
+    """Apply every proposal under one lock; roll back the set on handled failure."""
+    plan_target = resolve_target(plan_path)
+    plan_digest = _check_expected(plan_target, expected_plan_hash)
+    if not expected_plan_hash:
+        raise FileOperationError("apply-plan requires --expected-plan-hash")
+    plan_text = read_utf8(plan_target, "plan file")
+    if hashlib.sha256(plan_text.encode("utf-8")).hexdigest() != plan_digest:
+        raise PreimageHashConflict(
+            "CONFLICT: plan file changed while it was being read",
+            {"path": plan_target, "expected": plan_digest},
+        )
+    plan = _json_without_duplicates(plan_text, "plan file")
+    if not isinstance(plan, dict) or plan.get("schema") != "agw-file-plan/v1":
+        raise FileOperationError("unsupported or missing file-plan schema")
+    supplied = plan.get("operations")
+    if not isinstance(supplied, list) or not supplied:
+        raise FileOperationError("plan contains no operations")
+    operations = []
+    identities = set()
+    total_bytes = 0
+    for number, item in enumerate(supplied, 1):
+        if not isinstance(item, dict) or item.get("number") != number:
+            raise FileOperationError("plan operation numbering is invalid")
+        target = str(item.get("path") or "")
+        if not os.path.isabs(target) or resolve_target(target) != os.path.abspath(target):
+            raise FileOperationError(
+                "plan targets must be normalized absolute paths", {"operation": number},
+            )
+        identity = os.path.normcase(os.path.realpath(target))
+        if identity in identities:
+            raise FileOperationError("plan contains duplicate targets")
+        identities.add(identity)
+        before_label = str(item.get("before_hash") or "")
+        if before_label != "absent" and not _HASH_RE.fullmatch(before_label):
+            raise FileOperationError("plan contains an invalid before hash")
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise FileOperationError("plan content must be UTF-8 text")
+        payload = content.encode("utf-8")
+        total_bytes += len(payload)
+        if len(payload) > MAX_TEXT_BYTES or total_bytes > MAX_TEXT_BYTES * 4:
+            raise FileOperationError("plan exceeds the bounded transaction size")
+        after = hashlib.sha256(payload).hexdigest()
+        if after != item.get("after_hash"):
+            raise FileOperationError(
+                "plan content does not match its after hash", {"operation": number},
+            )
+        operations.append({
+            "number": number, "op": str(item.get("op") or ""), "path": target,
+            "before_label": before_label, "before": None if before_label == "absent" else before_label,
+            "after": after, "payload": payload, "changed": before_label != after,
+        })
+        if operations[-1]["op"] not in {"write", "patch", "replace"}:
+            raise FileOperationError(
+                "plan contains an invalid operation", {"operation": number},
+            )
+    if os.path.normcase(os.path.realpath(plan_target)) in identities:
+        raise FileOperationError("plan file must not also be a transaction target")
+    stages = {}
+    changed = [item for item in operations if item["changed"]]
+    lock_identities = identities | {os.path.normcase(os.path.realpath(plan_target))}
+    with ExitStack() as held_locks:
+        for identity in sorted(lock_identities):
+            lock_name = "file-" + hashlib.sha256(
+                identity.encode("utf-8", "replace")
+            ).hexdigest()[:32]
+            held_locks.enter_context(store.Lock(lock_name, timeout=10.0))
+        _check_expected(plan_target, expected_plan_hash)
+        for item in operations:
+            _check_expected(item["path"], item["before_label"])
+        if not changed:
+            return {
+                "operation": "apply-plan", "plan_file": plan_target,
+                "plan_hash": plan_digest, "changed": 0, "operations": [],
+            }
+        try:
+            for item in changed:
+                fd, stage = tempfile.mkstemp(
+                    prefix=".agw-plan-", suffix=".tmp",
+                    dir=os.path.dirname(item["path"]),
+                )
+                stages[item["number"]] = stage
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(item["payload"])
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if store.file_sha256(stage) != item["after"]:
+                    raise FileOperationError("staged transaction file failed verification")
+            receipts = _snapshots(
+                [item["path"] for item in changed], "apply-plan", MAX_TEXT_BYTES,
+            )
+            for item in operations:
+                _check_expected(item["path"], item["before_label"])
+            published = []
+            try:
+                for item, receipt in zip(changed, receipts):
+                    stage = stages[item["number"]]
+                    os.replace(stage, item["path"])
+                    stages[item["number"]] = ""
+                    published.append((item, receipt))
+                    if store.file_sha256(item["path"]) != item["after"]:
+                        raise FileOperationError("published transaction file failed verification")
+            except Exception as exc:
+                rollback_errors = []
+                for item, receipt in reversed(published):
+                    try:
+                        _restore_published(receipt, item["before"], item["path"])
+                        if _current_hash(item["path"]) != item["before"]:
+                            raise OSError("restored target failed verification")
+                    except Exception as rollback_exc:
+                        rollback_errors.append({
+                            "path": item["path"], "error": str(rollback_exc),
+                            "snapshot_transaction_id": receipt.transaction_id,
+                        })
+                raise FileTransactionError(
+                    "file transaction failed; " + (
+                        "recovery is required for one or more targets"
+                        if rollback_errors else "all published changes were rolled back"
+                    ),
+                    {
+                        "cause": str(exc),
+                        "rolled_back": not rollback_errors,
+                        "rollback_errors": rollback_errors,
+                    },
+                ) from exc
+            transaction_id = uuid.uuid4().hex
+            result_operations = []
+            for item, receipt in zip(changed, receipts):
+                result_operations.append({
+                    "number": item["number"], "op": item["op"],
+                    "path": item["path"], "before_hash": item["before_label"],
+                    "after_hash": item["after"], "changed": 1,
+                    "snapshot_transaction_id": receipt.transaction_id,
+                    "snapshot_state": receipt.state,
+                })
+            store.oplog_append({
+                "op": "file-transaction", "transaction_id": transaction_id,
+                "plan_sha256": plan_digest, "operations": result_operations,
+            })
+            return {
+                "operation": "apply-plan", "transaction_id": transaction_id,
+                "plan_file": plan_target, "plan_hash": plan_digest,
+                "changed": len(result_operations), "operations": result_operations,
+            }
+        finally:
+            for stage in stages.values():
+                if stage and os.path.exists(stage):
+                    try:
+                        os.unlink(stage)
+                    except OSError:
+                        pass
 
 
 def run_declared(
@@ -623,6 +1024,7 @@ def run_declared(
                 "dry_run": True, "command": command, "cwd": working,
                 "outputs": preview, "output_roots": roots,
                 "output_patterns": patterns, "executed": False,
+                "validation_scope": "contract_only",
                 "output_observation": {
                     "mode": "root_manifest" if roots else "exact_outputs",
                     "complete": True,
@@ -632,7 +1034,7 @@ def run_declared(
         receipts = _snapshots(targets, "run")
         for path, digest in zip(targets, before):
             if _current_hash(path) != digest:
-                raise FileConflict(
+                raise PreimageHashConflict(
                     "CONFLICT: declared output changed before command execution",
                     {"path": path},
                 )
@@ -961,7 +1363,7 @@ def publish_staged_file(
         if not _HASH_RE.fullmatch(wanted_stage):
             raise FileOperationError("expected staged hash must be a SHA-256")
         if wanted_stage != after:
-            raise FileConflict(
+            raise PreimageHashConflict(
                 "CONFLICT: staged file hash does not match expected version",
                 {"path": stage, "expected": wanted_stage, "actual": after},
             )
@@ -1007,7 +1409,7 @@ def publish_staged_file(
         try:
             receipt = _snapshot(target, operation)
             if _current_hash(target) != before:
-                raise FileConflict("CONFLICT: target changed before publication")
+                raise PreimageHashConflict("CONFLICT: target changed before publication")
         except Exception:
             if copied_candidate and os.path.exists(candidate):
                 try:
