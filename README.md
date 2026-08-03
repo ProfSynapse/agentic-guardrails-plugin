@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.17` is the Windows-first stable release.
+> **Release status:** `0.3.18` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -163,8 +163,10 @@ can install a data-only, script-hash-bound manifest with `agw workflow trust`
 and then use `agw run --workflow ID`. A repository cannot trust its own
 manifest merely by placing it beside a script. Exact existing outputs receive
 verified pre-images and exact absent outputs receive tombstones before launch.
-Optional observed roots only detect unclaimed after-the-fact changes; they do
-not prevent writes or recover an unknown file. See the
+Exact outputs are independent of optional observed roots, so a recoverable state
+file can be paired with a separate dynamic cache root. Observed roots only detect
+unclaimed after-the-fact changes; they do not prevent writes or recover an
+unknown file. See the
 [trusted-workflow reference](plugin/skills/agentic-guardrails/references/trusted-workflows.md).
 
 Folder scans are metadata-only and hard-bounded by a parent process. Use

@@ -201,6 +201,43 @@ def test_trusted_matching_script_executes_and_existing_output_has_preimage(tmp_p
     assert versions and open(versions[-1]["dest"], encoding="utf-8").read() == "before"
 
 
+def test_trusted_workflow_separates_exact_state_from_observed_cache(tmp_path):
+    state = tmp_path / "state"
+    cache = tmp_path / "cache"
+    state.mkdir()
+    cache.mkdir()
+    marker = state / "session.json"
+    marker.write_text("before", encoding="utf-8")
+    script = tmp_path / "summon.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('state/session.json').write_text('after')\n"
+        "Path('cache/summon-a1b2c3.py').write_text('# runner')\n",
+        encoding="utf-8",
+    )
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script,
+        roots=["{cwd}/state", "{cwd}/cache"],
+        outputs=[{
+            "path": "{cwd}/state/session.json", "expected": "present",
+        }],
+        observed=[{
+            "path": "{cwd}/cache", "patterns": ["summon-*.py"],
+        }],
+    )
+    _trust(manifest_path, digest)
+
+    result = _run_resolved(
+        "example.writer", [sys.executable, str(script)], tmp_path,
+    )
+
+    assert result["ok"] is True
+    assert result["output_roots"] == [str(cache)]
+    assert result["unclaimed_observed_changes"] == []
+    assert marker.read_text(encoding="utf-8") == "after"
+    assert store.list_versions(str(marker))
+
+
 def test_absent_nested_output_gets_preexecution_tombstone(tmp_path):
     script = tmp_path / "writer.py"
     script.write_text(

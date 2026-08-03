@@ -310,6 +310,65 @@ def test_declared_sidecar_pattern_is_allowed(tmp_path):
     assert result["undeclared_outputs"] == []
 
 
+def test_exact_state_output_is_independent_of_dynamic_cache_root(tmp_path):
+    state = tmp_path / "state"
+    cache = tmp_path / "cache"
+    state.mkdir()
+    cache.mkdir()
+    marker = state / "session.json"
+    marker.write_text('{"status":"before"}\n', encoding="utf-8")
+    sidecar = cache / "summon-a1b2c3.py"
+    script = tmp_path / "summon.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('{\\\"status\\\":\\\"after\\\"}\\n')\n"
+        "Path(sys.argv[2]).write_text('# cached runner\\n')\n",
+        encoding="utf-8",
+    )
+    before = store.file_sha256(str(marker))
+
+    result = file_ops.run_declared(
+        [sys.executable, str(script), str(marker), str(sidecar)],
+        [str(marker)], expected_hashes=[before], cwd=str(tmp_path),
+        output_roots=[str(cache)], output_patterns=["summon-*.py"],
+    )
+
+    assert result["ok"] is True
+    assert result["output_roots"] == [str(cache)]
+    assert result["unclaimed_observed_changes"] == []
+    assert marker.read_text(encoding="utf-8") == '{"status":"after"}\n'
+    assert sidecar.read_text(encoding="utf-8") == "# cached runner\n"
+    versions = store.list_versions(str(marker))
+    assert len(versions) == 1
+    assert Path(versions[0]["dest"]).read_text(encoding="utf-8") == \
+        '{"status":"before"}\n'
+
+
+def test_cli_dry_run_accepts_exact_output_outside_observed_root(tmp_path):
+    state = tmp_path / "state"
+    cache = tmp_path / "cache"
+    state.mkdir()
+    cache.mkdir()
+    marker = state / "session.json"
+    marker.write_text("before", encoding="utf-8")
+
+    result = run_agw(
+        "run", "--output", str(marker),
+        "--expected-hash", store.file_sha256(str(marker)),
+        "--output-root", str(cache),
+        "--output-pattern", "summon-*.py",
+        "--dry-run", "--json", "--", "not-started-during-dry-run",
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["dry_run"] is True
+    assert payload["executed"] is False
+    assert payload["outputs"][0]["path"] == str(marker)
+    assert payload["output_roots"] == [str(cache)]
+    assert store.discover_archive_transactions() == []
+
+
 def test_declared_exact_output_does_not_observe_parent_or_ambient_changes(
         tmp_path, monkeypatch):
     output = tmp_path / "report.xlsx"

@@ -157,6 +157,8 @@ def test_file_and_run_help_are_progressive_and_compact():
     assert "--patch" not in write
     assert "--output" in run
     assert "--expected-hash" in run
+    assert "root-independent output with recovery" in run
+    assert "not an output boundary" in run
     assert len(write) <= 1_000
     assert len(read) <= 900
     assert len(run) <= 800

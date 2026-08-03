@@ -37,11 +37,11 @@ Placeholders: `{cwd}`, `{script_dir}`, `{script_name}`, `{script_stem}`,
 
 Exact existing outputs get pre-images; absent ones get tombstones before launch.
 Tampering, script drift, ambiguity, traversal, and out-of-root paths fail closed.
-Observed roots are bounded post-run detection, not prevention or recovery.
+Observed roots may be separate; they detect changes after execution and do not
+provide prevention or recovery. Pattern matches are not pre-imaged.
 
-Professor Synapse and similar tools should declare their marker, database,
-sidecars, and temp file. Random names need explicit arguments or deterministic
-placeholders; directory diffs are not recovery.
+Declare state, sidecars, and temp files. Diffs are not recovery; random names
+need arguments or deterministic placeholders.
 
 The machine-local seal is not an OS sandbox: a process able to replace its key
 and records can forge trust. Keep `AGW_HOME` private and outside synced folders.
