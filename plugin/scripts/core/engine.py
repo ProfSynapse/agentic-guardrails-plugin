@@ -1322,6 +1322,14 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                  if value and not value.startswith("-")), ""
             )
             if workflow_op == "trust":
+                try:
+                    workflow_op_index = args.index("trust", verb_index + 1)
+                except ValueError:
+                    workflow_op_index = -1
+                manifest = ""
+                if workflow_op_index >= 0 and workflow_op_index + 1 < len(args):
+                    candidate = args[workflow_op_index + 1]
+                    manifest = candidate if candidate and not candidate.startswith("-") else ""
                 return Decision(
                     ASK,
                     "Installing or replacing a trusted workflow grants a specific, "
@@ -1332,12 +1340,13 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                     presentation_context=DecisionContext.AGW_MUTATION,
                     presentation_details={
                         "operation": "trust workflow",
-                        "target_kind": "workflow manifest",
+                        "targets": [manifest] if manifest else [],
+                        "target_kind": "file",
                         "signal": "persistent script output authorization",
                         "trigger": "The agent requested a new or replacement trusted workflow record.",
                     },
                 )
-            if workflow_op not in {"list", "info"}:
+            if workflow_op not in {"list", "info", "validate", "status", "init"}:
                 return Decision(
                     ASK, "This workflow operation is not recognized.",
                     "builtin:agw-workflow-unknown",

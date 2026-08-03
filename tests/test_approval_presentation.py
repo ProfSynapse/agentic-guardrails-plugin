@@ -224,6 +224,33 @@ def test_known_reversible_guardrails_change_recommends_allow():
     assert approvals._default_button_id(request, 100, 101) == 100
 
 
+def test_trusted_workflow_prompt_names_reviewed_manifest_and_effect():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:agw-workflow-trust",
+        policy_revision="revision-a",
+        presentation_context=events.DecisionContext.AGW_MUTATION,
+        presentation_details={
+            "operation": "trust workflow",
+            "targets": ["C:/private/contracts/summoner.json"],
+            "target_kind": "file",
+        },
+    )
+    event = events.ToolEvent(
+        kind=events.EXEC, command="PRIVATE-CANARY raw trust command",
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "workflow-trust"}, [event],
+    )
+    rendered = request.action + "\n" + request.primary_text()
+    assert request.action == \
+        "The agent wants Guardrails to trust a versioned script workflow."
+    assert "Target: File: summoner.json" in rendered
+    assert "persistent, hash-bound output contract" in rendered
+    assert "declared outputs" in rendered
+    assert "PRIVATE-CANARY" not in rendered
+    assert "Files managed by Guardrails" not in rendered
+
+
 def test_cancel_recommendation_is_native_dialog_default():
     _decision, request = _request()
     assert request.default_choice == "cancel"

@@ -541,6 +541,22 @@ def cmd_file(args):
                 expected_hash=args.expected_hash, dry_run=args.dry_run,
                 operation="replace",
             )
+        elif args.file_op == "plan":
+            raw = _read_text_payload(args.operations_file, "operations")
+            try:
+                spec = json.loads(raw, object_pairs_hook=_json_object_no_duplicates)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise file_ops.FileOperationError(
+                    f"operations file is not valid unambiguous JSON: {exc}"
+                ) from exc
+            data = file_ops.create_file_plan(
+                spec, args.plan_file, cwd=args.cwd,
+                expected_plan_hash=args.expected_plan_hash,
+            )
+        elif args.file_op == "apply-plan":
+            data = file_ops.apply_file_plan(
+                args.plan_file, expected_plan_hash=args.expected_plan_hash,
+            )
         else:
             raise file_ops.FileOperationError("unknown file operation")
     except (OSError, file_ops.FileOperationError) as exc:
@@ -550,6 +566,20 @@ def cmd_file(args):
             _out(args, data["content"], data)
         else:
             sys.stdout.write(data["content"])
+    elif args.file_op == "plan":
+        _out(
+            args,
+            (f"planned {len(data['operations'])} operation(s) in "
+             f"{data['plan_file']} ({data['plan_hash']})"),
+            data,
+        )
+    elif args.file_op == "apply-plan":
+        _out(
+            args,
+            (f"applied {data['changed']} planned change(s)"
+             + (f" ({data['transaction_id']})" if data.get("transaction_id") else "")),
+            data,
+        )
     else:
         _out(
             args,
@@ -573,6 +603,7 @@ def cmd_run(args):
                     "with --output, --expected-hash, --output-root, or --output-pattern"
                 )
             workflow = workflows.resolve_run(args.workflow, command, args.cwd)
+            command = workflow["command"]
             outputs = workflow["outputs"]
             expected_hashes = workflow["expected_hashes"]
             output_roots = workflow["output_roots"]
@@ -619,8 +650,16 @@ def cmd_workflow(args):
                     "review the manifest and pass --approve-trust; the host will "
                     "also request confirmation"
                 )
+            def show_phase(item):
+                if args.progress:
+                    print(
+                        f"agw: workflow phase {item['phase']} "
+                        f"({item['elapsed_seconds']:.3f}s)", file=sys.stderr,
+                    )
+
             data = workflows.trust_manifest(
                 args.manifest, args.expected_manifest_hash, replace=args.replace,
+                phase_callback=show_phase,
             )
             human = (
                 ("trusted" if data["changed"] else "already trusted")
@@ -646,9 +685,50 @@ def cmd_workflow(args):
                 "trusted_at": record["trusted_at"], "verified": True,
             }
             human = f"trusted workflow {manifest['id']} ({manifest['command']['runtime']})"
+        elif args.workflow_op == "validate":
+            validated = workflows.validate_manifest_file(
+                args.manifest, args.expected_manifest_hash,
+            )
+            validated.pop("manifest", None)
+            data = validated
+            human = (
+                f"valid workflow {data['workflow']} ({data['schema']}); "
+                f"{data['outputs']} exact output(s)"
+            )
+        elif args.workflow_op == "status":
+            data = workflows.manifest_status(args.manifest)
+            human = f"workflow {data['workflow']}: {data['status']}"
+        elif args.workflow_op == "init":
+            built = workflows.initialize_manifest(
+                args.script, args.manifest, workflow_id=args.workflow_id,
+                runtime=args.runtime, args=args.arg, outputs=args.output,
+                expected=args.expected, allowed_roots=args.allowed_root,
+                description=args.description,
+            )
+            serialized = json.dumps(
+                built["manifest"], ensure_ascii=True, indent=2,
+            ) + "\n"
+            written = file_ops.write_text(
+                args.manifest, serialized,
+                expected_hash=args.expected_manifest_hash,
+                operation="workflow-init",
+            )
+            data = {
+                "ok": True, "workflow": built["manifest"]["id"],
+                "schema": built["manifest"]["schema"],
+                "manifest": written["path"],
+                "manifest_sha256": written["after_hash"],
+                "script_sha256": built["manifest"]["command"]["script_sha256"],
+                "arguments_bound": True,
+                "argument_count": len(built["manifest"]["command"]["args"]),
+                "outputs": len(built["manifest"]["outputs"]),
+                "changed": written["changed"],
+                "snapshot_transaction_id": written.get("snapshot_transaction_id", ""),
+            }
+            human = f"initialized workflow manifest {data['workflow']} at {data['manifest']}"
         else:
             raise workflows.WorkflowError("unknown workflow operation")
-    except (OSError, workflows.WorkflowError) as exc:
+    except (OSError, file_ops.FileOperationError, workflows.WorkflowError) as exc:
         _file_err(args, exc)
     _out(args, human, data)
 
@@ -1200,6 +1280,48 @@ def main(argv=None):
         file_expected, file_dry_run,
         example="agw file replace app.js --old-file old.txt --new-file new.txt --expected-hash SHA256",
     )
+    plan_parser = file_sub.add_parser(
+        "plan", parents=[common],
+        help="materialize a validated multi-file text transaction",
+        description=("Validate every write, patch, and replacement and write one "
+                     "self-contained plan without changing target files."),
+        epilog=("operations JSON:\n"
+                "  {\"version\":1,\"operations\":[{\"op\":\"patch\","
+                "\"path\":\"app.js\",\"patch_file\":\"change.diff\","
+                "\"expected_hash\":\"SHA256\"}]}\n"
+                "payloads: write content|content_file; patch patch|patch_file; "
+                "replace old|old_file plus new|new_file\n"
+                "example:\n  agw file plan --operations-file ops.json "
+                "--plan-file change.agw-plan --expected-plan-hash absent --json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    plan_parser.add_argument(
+        "--operations-file", required=True,
+        help="version-1 operations JSON file or - for stdin",
+    )
+    plan_parser.add_argument("--plan-file", required=True, help="plan output path")
+    plan_parser.add_argument(
+        "--expected-plan-hash", default="absent",
+        help="expected existing plan SHA-256, or absent",
+    )
+    plan_parser.add_argument(
+        "--cwd", default="", help="base folder for relative paths in operations JSON",
+    )
+    plan_parser.set_defaults(fn=cmd_file)
+    apply_plan_parser = file_sub.add_parser(
+        "apply-plan", parents=[common],
+        help="apply a hash-bound multi-file plan as one transaction",
+        description=("Verify the plan hash and every target precondition, capture all "
+                     "pre-images, then publish the complete set with rollback on failure."),
+        epilog=("example:\n  agw file apply-plan change.agw-plan "
+                "--expected-plan-hash SHA256 --json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    apply_plan_parser.add_argument("plan_file", help="self-contained plan file")
+    apply_plan_parser.add_argument(
+        "--expected-plan-hash", required=True, help="exact SHA-256 of the plan file",
+    )
+    apply_plan_parser.set_defaults(fn=cmd_file)
     add(
         "run", cmd_run,
         (["--workflow"], {"default": "", "metavar": "ID",
@@ -1214,7 +1336,7 @@ def main(argv=None):
                                "help": "SHA-256/absent per output"}),
         (["--cwd"], {"default": "", "metavar": "DIR", "help": "working folder"}),
         (["--dry-run"], {"action": "store_true",
-                          "help": "validate without executing"}),
+                          "help": "contract-only; no execution"}),
         (["command"], {"nargs": argparse.REMAINDER, "metavar": "...",
                         "help": "command after --"}),
         help="run a command with declared, recoverable outputs",
@@ -1222,9 +1344,7 @@ def main(argv=None):
     workflow_parser = sub.add_parser(
         "workflow", parents=[common],
         help="inspect or explicitly trust script output contracts",
-        description=("Trusted workflow records bind a data-only manifest to an "
-                     "exact script hash. Choose an operation, then request only "
-                     "that operation's help."),
+        description="Hash-bound script contracts; choose an operation for leaf help.",
     )
     workflow_sub = workflow_parser.add_subparsers(
         dest="workflow_op", required=True, metavar="operation",
@@ -1249,6 +1369,10 @@ def main(argv=None):
         "--replace", action="store_true",
         help="replace a different trusted record with the same id after review",
     )
+    workflow_trust.add_argument(
+        "--progress", action="store_true",
+        help="report trust phases to stderr",
+    )
     workflow_trust.set_defaults(fn=cmd_workflow)
     workflow_list = workflow_sub.add_parser(
         "list", parents=[common], help="list trusted workflow ids",
@@ -1259,6 +1383,44 @@ def main(argv=None):
     )
     workflow_info.add_argument("workflow_id", help="trusted workflow id")
     workflow_info.set_defaults(fn=cmd_workflow)
+    workflow_validate = workflow_sub.add_parser(
+        "validate", parents=[common],
+        help="validate an inert manifest and script hash without trusting it",
+    )
+    workflow_validate.add_argument("manifest", help="literal manifest JSON file")
+    workflow_validate.add_argument(
+        "--expected-manifest-hash", default="",
+        help="optional expected manifest SHA-256",
+    )
+    workflow_validate.set_defaults(fn=cmd_workflow)
+    workflow_status = workflow_sub.add_parser(
+        "status", parents=[common],
+        help="compare a manifest with this machine's trusted record",
+    )
+    workflow_status.add_argument("manifest", help="literal manifest JSON file")
+    workflow_status.set_defaults(fn=cmd_workflow)
+    workflow_init = workflow_sub.add_parser(
+        "init", parents=[common],
+        help="generate a validated v2 manifest with escaped Unicode",
+    )
+    workflow_init.add_argument("--script", required=True, help="versioned script path")
+    workflow_init.add_argument("--manifest", required=True, help="manifest output path")
+    workflow_init.add_argument("--id", dest="workflow_id", required=True,
+                               help="stable workflow id")
+    workflow_init.add_argument("--runtime", choices=["python", "node", "powershell"],
+                               default="", help="inferred from script extension")
+    workflow_init.add_argument("--arg", action="append", default=[],
+                               help="exact bound script argument; repeat")
+    workflow_init.add_argument("--output", action="append", default=[], required=True,
+                               help="exact output template; repeat")
+    workflow_init.add_argument("--expected", action="append", default=[],
+                               help="any/absent/present/SHA-256 per output")
+    workflow_init.add_argument("--allowed-root", action="append", default=[], required=True,
+                               help="permitted output-root template; repeat")
+    workflow_init.add_argument("--description", default="", help="short reviewed purpose")
+    workflow_init.add_argument("--expected-manifest-hash", default="absent",
+                               help="expected existing manifest SHA-256, or absent")
+    workflow_init.set_defaults(fn=cmd_workflow)
     add("move", cmd_move, (["src"], {}), (["dest"], {}),
         help="logged, undoable move or rename")
     sub._name_parser_map["rename"] = sub._name_parser_map["move"]

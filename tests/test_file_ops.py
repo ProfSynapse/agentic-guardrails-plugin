@@ -205,6 +205,53 @@ def test_patch_context_conflict_creates_no_snapshot(tmp_path):
     assert store.list_versions(str(target)) == []
 
 
+def test_patch_count_mismatch_reports_correctable_hunk_details():
+    patch = "@@ -1,3 +1,2 @@\n alpha\n-beta\n+BETA\n"
+    with pytest.raises(file_ops.PatchHunkCountMismatch) as caught:
+        file_ops.apply_unified_patch("alpha\nbeta\n", patch)
+    assert caught.value.error_code == "patch_hunk_count_mismatch"
+    assert caught.value.details == {
+        "hunk": 1,
+        "header": "@@ -1,3 +1,2 @@",
+        "patch_line": 1,
+        "expected": {"old_lines": 3, "new_lines": 2},
+        "observed": {"old_lines": 2, "new_lines": 2},
+        "suggested_header": "@@ -1,2 +1,2 @@",
+    }
+
+
+def test_file_conflicts_have_operation_specific_json_codes(tmp_path):
+    target = tmp_path / "app.txt"
+    target.write_text("actual\n", encoding="utf-8")
+    patch_file = tmp_path / "change.diff"
+    patch_file.write_text(
+        "@@ -1 +1 @@\n-expected\n+changed\n", encoding="utf-8",
+    )
+    patch_result = run_agw(
+        "file", "patch", str(target), "--patch", str(patch_file), "--json",
+        check=False,
+    )
+    assert patch_result.returncode == 3
+    patch_error = json.loads(patch_result.stderr)["error"]
+    assert patch_error["code"] == "patch_context_conflict"
+    assert patch_error["details"]["hunk"] == 1
+    assert patch_error["details"]["patch_line"] == 2
+
+    replace_result = run_agw(
+        "file", "replace", str(target), "--old", "missing", "--new", "new",
+        "--json", check=False,
+    )
+    assert json.loads(replace_result.stderr)["error"]["code"] == \
+        "replace_match_conflict"
+
+    write_result = run_agw(
+        "file", "write", str(target), "--content-file", str(patch_file),
+        "--expected-hash", "0" * 64, "--json", check=False,
+    )
+    assert json.loads(write_result.stderr)["error"]["code"] == \
+        "preimage_hash_conflict"
+
+
 def test_transform_without_expected_hash_rejects_concurrent_external_edit(tmp_path):
     target = tmp_path / "data.json"
     target.write_text('{"value":1}\n', encoding="utf-8")
@@ -249,8 +296,134 @@ def test_declared_run_dry_run_does_not_execute_or_snapshot(tmp_path):
         expected_hashes=["absent"], cwd=str(tmp_path), dry_run=True,
     )
     assert result["executed"] is False
+    assert result["validation_scope"] == "contract_only"
     assert not output.exists()
     assert store.discover_archive_transactions() == []
+
+
+def test_file_plan_then_apply_changes_all_targets_with_preimages(tmp_path):
+    first = tmp_path / "first.md"
+    second = tmp_path / "index.md"
+    first.write_text("alpha\nbeta\n", encoding="utf-8")
+    second.write_text("- old\n", encoding="utf-8")
+    plan_path = tmp_path / "change.agw-plan"
+    spec = {
+        "version": 1,
+        "operations": [
+            {
+                "op": "patch", "path": str(first),
+                "patch": "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n",
+                "expected_hash": store.file_sha256(str(first)),
+            },
+            {
+                "op": "replace", "path": str(second),
+                "old": "old", "new": "new",
+                "expected_hash": store.file_sha256(str(second)),
+            },
+        ],
+    }
+    planned = file_ops.create_file_plan(spec, str(plan_path))
+    assert planned["targets_changed"] == 2
+    assert planned["validation_scope"] == "content_and_target_versions"
+    assert first.read_text(encoding="utf-8") == "alpha\nbeta\n"
+    assert second.read_text(encoding="utf-8") == "- old\n"
+    assert store.list_versions(str(first)) == []
+    assert store.list_versions(str(second)) == []
+
+    applied = file_ops.apply_file_plan(
+        str(plan_path), expected_plan_hash=planned["plan_hash"],
+    )
+    assert applied["changed"] == 2
+    assert first.read_text(encoding="utf-8") == "alpha\nBETA\n"
+    assert second.read_text(encoding="utf-8") == "- new\n"
+    assert len(store.list_versions(str(first))) == 1
+    assert len(store.list_versions(str(second))) == 1
+    assert all(item["snapshot_transaction_id"] for item in applied["operations"])
+
+
+def test_file_plan_rolls_back_already_published_targets_on_failure(
+        tmp_path, monkeypatch):
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+    plan_path = tmp_path / "change.agw-plan"
+    planned = file_ops.create_file_plan({
+        "operations": [
+            {"op": "write", "path": str(first), "content": "ONE\n"},
+            {"op": "write", "path": str(second), "content": "TWO\n"},
+        ],
+    }, str(plan_path))
+    real_replace = file_ops.os.replace
+    failed = False
+
+    def fail_second_once(source, destination):
+        nonlocal failed
+        if os.path.normcase(str(destination)) == os.path.normcase(str(second)) \
+                and not failed:
+            failed = True
+            raise OSError("simulated second publication failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(file_ops.os, "replace", fail_second_once)
+    with pytest.raises(file_ops.FileTransactionError) as caught:
+        file_ops.apply_file_plan(
+            str(plan_path), expected_plan_hash=planned["plan_hash"],
+        )
+    assert caught.value.details["rolled_back"] is True
+    assert first.read_text(encoding="utf-8") == "one\n"
+    assert second.read_text(encoding="utf-8") == "two\n"
+    assert not list(tmp_path.glob(".agw-plan-*"))
+    assert not list(tmp_path.glob(".agw-rollback-*"))
+
+
+def test_file_plan_cli_is_compact_and_hash_bound(tmp_path):
+    target = tmp_path / "record.md"
+    target.write_text("draft\n", encoding="utf-8")
+    operations = tmp_path / "ops.json"
+    operations.write_text(json.dumps({
+        "version": 1,
+        "operations": [{
+            "op": "replace", "path": str(target),
+            "old": "draft", "new": "final",
+            "expected_hash": store.file_sha256(str(target)),
+        }],
+    }), encoding="utf-8")
+    plan_path = tmp_path / "change.agw-plan"
+    planned_process = run_agw(
+        "file", "plan", "--operations-file", str(operations),
+        "--plan-file", str(plan_path), "--json",
+    )
+    planned = json.loads(planned_process.stdout)
+    assert '"content":' not in planned_process.stdout
+    assert target.read_text(encoding="utf-8") == "draft\n"
+
+    applied_process = run_agw(
+        "file", "apply-plan", str(plan_path),
+        "--expected-plan-hash", planned["plan_hash"], "--json",
+    )
+    applied = json.loads(applied_process.stdout)
+    assert applied["changed"] == 1
+    assert target.read_text(encoding="utf-8") == "final\n"
+
+
+def test_apply_plan_rejects_target_drift_before_any_preimage(tmp_path):
+    target = tmp_path / "record.md"
+    target.write_text("draft\n", encoding="utf-8")
+    plan_path = tmp_path / "change.agw-plan"
+    planned = file_ops.create_file_plan({
+        "operations": [{
+            "op": "replace", "path": str(target),
+            "old": "draft", "new": "final",
+        }],
+    }, str(plan_path))
+    target.write_text("external update\n", encoding="utf-8")
+    with pytest.raises(file_ops.PreimageHashConflict):
+        file_ops.apply_file_plan(
+            str(plan_path), expected_plan_hash=planned["plan_hash"],
+        )
+    assert target.read_text(encoding="utf-8") == "external update\n"
+    assert store.list_versions(str(target)) == []
 
 
 def test_declared_run_reports_missing_new_output(tmp_path):

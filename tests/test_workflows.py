@@ -17,9 +17,9 @@ AGW_SOURCE = os.path.join(PLUGIN, "scripts", "agw", "agw.py")
 
 
 def _write_manifest(tmp_path, script, *, workflow_id="example.writer", outputs=None,
-                    roots=None, observed=None):
+                    roots=None, observed=None, schema="agw.workflow/v1", args=None):
     manifest = {
-        "schema": "agw.workflow/v1",
+        "schema": schema,
         "id": workflow_id,
         "description": "test writer",
         "command": {
@@ -33,6 +33,8 @@ def _write_manifest(tmp_path, script, *, workflow_id="example.writer", outputs=N
         ],
         "observed_roots": observed or [],
     }
+    if schema == "agw.workflow/v2":
+        manifest["command"]["args"] = list(args or [])
     path = tmp_path / "workflow.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     digest = store.file_sha256(str(path))
@@ -472,7 +474,98 @@ def test_engine_requires_confirmation_to_install_trust_but_allows_inspection(pol
     )
     assert trust.action == ASK
     assert trust.rule_id == "builtin:agw-workflow-trust"
+    assert trust.presentation_details["targets"] == ["contract.json"]
+    assert trust.presentation_details["target_kind"] == "file"
     assert listing.action == ALLOW
+
+
+def test_v2_binds_exact_arguments_and_can_build_its_own_command(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "import argparse\nfrom pathlib import Path\n"
+        "p=argparse.ArgumentParser(); p.add_argument('--output'); a=p.parse_args()\n"
+        "Path(a.output).write_text('bound', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.txt"
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v2",
+        args=["--output", "out.txt"],
+        outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+    )
+    _trust(manifest_path, digest)
+    resolved = workflows.resolve_run("example.writer", [], str(tmp_path))
+    assert resolved["command"][1:] == [
+        str(script), "--output", "out.txt",
+    ]
+    result = file_ops.run_declared(
+        resolved["command"], resolved["outputs"],
+        expected_hashes=resolved["expected_hashes"], cwd=resolved["cwd"],
+    )
+    assert result["ok"] is True
+    assert output.read_text(encoding="utf-8") == "bound"
+
+    with pytest.raises(workflows.WorkflowTrustError, match="arguments"):
+        workflows.resolve_run(
+            "example.writer",
+            [sys.executable, str(script), "--output", "other.txt"],
+            str(tmp_path),
+        )
+
+
+def test_workflow_init_validate_and_machine_local_status(tmp_path):
+    script = tmp_path / "index.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path = tmp_path / "client-workflow.json"
+    built = workflows.initialize_manifest(
+        str(script), str(manifest_path), workflow_id="example.index",
+        args=["--path", "3 👥 Clients", "--output", "3 👥 Clients/_index.md"],
+        outputs=["{cwd}/3 👥 Clients/_index.md"], expected=["any"],
+        allowed_roots=["{cwd}/3 👥 Clients"],
+    )
+    serialized = json.dumps(built["manifest"], ensure_ascii=True) + "\n"
+    manifest_path.write_text(serialized, encoding="utf-8")
+    assert "👥" not in serialized
+    assert "\\ud83d\\udc65" in serialized
+
+    validated = workflows.validate_manifest_file(str(manifest_path))
+    assert validated["valid"] is True
+    assert validated["arguments_bound"] is True
+    assert validated["argument_count"] == 4
+    assert workflows.manifest_status(str(manifest_path))["status"] == \
+        "not_trusted_on_this_machine"
+    _trust(manifest_path, validated["manifest_sha256"])
+    assert workflows.manifest_status(str(manifest_path))["status"] == "trusted_exact"
+
+
+def test_workflow_validation_reports_wildcard_positions(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, _digest, manifest = _write_manifest(
+        tmp_path, script, outputs=[{"path": "folder/??/out.txt", "expected": "any"}],
+    )
+    with pytest.raises(workflows.WorkflowError) as caught:
+        workflows.validate_manifest(manifest, str(manifest_path))
+    assert caught.value.details["field"] == "outputs[0].path"
+    assert caught.value.details["wildcard"] == "??"
+    assert caught.value.details["positions"] == [7, 8]
+    assert "position(s) 7, 8" in str(caught.value)
+
+
+def test_trust_result_reports_phases(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, digest, _ = _write_manifest(tmp_path, script)
+    seen = []
+    result = workflows.trust_manifest(
+        str(manifest_path), digest, phase_callback=seen.append,
+    )
+    names = [item["phase"] for item in result["phases"]]
+    assert names == [
+        "acquiring_lock", "reading_manifest",
+        "hashing_script_and_validating_contract", "writing_record", "complete",
+    ]
+    assert seen == result["phases"]
 
 
 def test_manifest_placeholders_are_data_not_code(tmp_path):
@@ -523,3 +616,57 @@ def test_real_cli_trust_and_run_workflow_end_to_end(tmp_path):
     assert run_data["workflow"] == "example.cli"
     assert run_data["outputs"][0]["snapshot_state"] == "ABSENT"
     assert output.read_text(encoding="utf-8") == "cli-ok"
+
+
+def test_real_cli_v2_init_validate_status_and_bound_run(tmp_path):
+    script = tmp_path / "bound_writer.py"
+    output = tmp_path / "👥 output.txt"
+    script.write_text(
+        "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('v2-ok')\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "bound-workflow.json"
+    cli = os.path.join(PLUGIN, "scripts", "agw", "agw.py")
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "v2-agw-home"))
+
+    initialized = subprocess.run(
+        [sys.executable, cli, "workflow", "init",
+         "--script", str(script), "--manifest", str(manifest),
+         "--id", "example.bound", "--arg", output.name,
+         "--output", "{cwd}/" + output.name, "--expected", "absent",
+         "--allowed-root", "{cwd}", "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    init_data = json.loads(initialized.stdout)
+    assert init_data["schema"] == "agw.workflow/v2"
+    assert "👥" not in manifest.read_text(encoding="utf-8")
+
+    validated = subprocess.run(
+        [sys.executable, cli, "workflow", "validate", str(manifest), "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert validated.returncode == 0, validated.stderr
+    assert json.loads(validated.stdout)["arguments_bound"] is True
+
+    trusted = subprocess.run(
+        [sys.executable, cli, "workflow", "trust", str(manifest),
+         "--expected-manifest-hash", init_data["manifest_sha256"],
+         "--approve-trust", "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert trusted.returncode == 0, trusted.stderr
+
+    status = subprocess.run(
+        [sys.executable, cli, "workflow", "status", str(manifest), "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert json.loads(status.stdout)["status"] == "trusted_exact"
+
+    executed = subprocess.run(
+        [sys.executable, cli, "run", "--workflow", "example.bound",
+         "--cwd", str(tmp_path), "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert executed.returncode == 0, executed.stderr
+    assert output.read_text(encoding="utf-8") == "v2-ok"

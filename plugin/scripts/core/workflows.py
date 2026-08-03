@@ -13,21 +13,28 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
+import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from . import store
 
 
-MANIFEST_SCHEMA = "agw.workflow/v1"
+MANIFEST_SCHEMA_V1 = "agw.workflow/v1"
+MANIFEST_SCHEMA = "agw.workflow/v2"
+MANIFEST_SCHEMAS = {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA}
 RECORD_SCHEMA = "agw.trusted-workflow/v1"
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_WORKFLOWS = 256
 MAX_OUTPUTS = 128
 MAX_ROOTS = 16
 MAX_PATTERNS = 64
+MAX_ARGS = 128
+MAX_ARG_BYTES = 16 * 1024
 
 _ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -136,8 +143,11 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
          "observed_roots"},
         "workflow manifest",
     )
-    if value.get("schema") != MANIFEST_SCHEMA:
-        raise WorkflowError(f"workflow schema must be {MANIFEST_SCHEMA!r}")
+    schema = value.get("schema")
+    if schema not in MANIFEST_SCHEMAS:
+        raise WorkflowError(
+            f"workflow schema must be {MANIFEST_SCHEMA_V1!r} or {MANIFEST_SCHEMA!r}"
+        )
     workflow_id = value.get("id")
     if not isinstance(workflow_id, str) or not _ID_RE.fullmatch(workflow_id):
         raise WorkflowError("workflow id must be 1-128 lowercase letters, digits, '.', '_' or '-'")
@@ -148,7 +158,10 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
     command = value.get("command")
     if not isinstance(command, dict):
         raise WorkflowError("workflow command must be an object")
-    _exact_keys(command, {"runtime", "script", "script_sha256"}, "workflow command")
+    command_keys = {"runtime", "script", "script_sha256"}
+    if schema == MANIFEST_SCHEMA:
+        command_keys.add("args")
+    _exact_keys(command, command_keys, "workflow command")
     runtime = command.get("runtime")
     if runtime not in {"python", "node", "powershell"}:
         raise WorkflowError("workflow runtime must be python, node, or powershell")
@@ -171,6 +184,15 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
             {"script": script_path, "expected": wanted_script_hash,
              "actual": actual_script_hash},
         )
+    bound_args = command.get("args", [])
+    if schema == MANIFEST_SCHEMA:
+        if not isinstance(bound_args, list) or len(bound_args) > MAX_ARGS:
+            raise WorkflowError(f"workflow command.args must contain at most {MAX_ARGS} strings")
+        if any(not isinstance(arg, str) or "\x00" in arg
+               or any(ord(char) < 32 for char in arg) for arg in bound_args):
+            raise WorkflowError("workflow command.args must contain literal strings without controls")
+        if sum(len(arg.encode("utf-8")) for arg in bound_args) > MAX_ARG_BYTES:
+            raise WorkflowError("workflow command.args exceeds the 16 KiB limit")
 
     roots = value.get("allowed_roots")
     if not isinstance(roots, list) or not roots or len(roots) > MAX_ROOTS:
@@ -191,8 +213,24 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
             raise WorkflowError(f"outputs[{index}] must be an object")
         _exact_keys(item, {"path", "expected"}, f"outputs[{index}]")
         path_template = _validate_template(item.get("path"), f"outputs[{index}].path")
-        if any(char in _PLACEHOLDER_RE.sub("", path_template) for char in "*?["):
-            raise WorkflowError(f"outputs[{index}].path must resolve to one exact file")
+        literal_path = _PLACEHOLDER_RE.sub("", path_template)
+        wildcard_positions = [
+            position for position, char in enumerate(literal_path)
+            if char in "*?["
+        ]
+        if wildcard_positions:
+            found = "".join(literal_path[position] for position in wildcard_positions)
+            raise WorkflowError(
+                f"outputs[{index}].path must resolve to one exact file; "
+                f"wildcard {found!r} found at position(s) "
+                + ", ".join(str(position) for position in wildcard_positions),
+                {
+                    "field": f"outputs[{index}].path",
+                    "path": path_template,
+                    "wildcard": found,
+                    "positions": wildcard_positions,
+                },
+            )
         expected = _validate_template(
             item.get("expected", "any"), f"outputs[{index}].expected"
         )
@@ -230,18 +268,133 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
         raise WorkflowError(f"workflow declares more than {MAX_PATTERNS} observed patterns")
 
     return {
-        "schema": MANIFEST_SCHEMA,
+        "schema": schema,
         "id": workflow_id,
         "description": description,
         "command": {
             "runtime": runtime,
             "script": script_path,
             "script_sha256": actual_script_hash,
+            **({"args": list(bound_args)} if schema == MANIFEST_SCHEMA else {}),
         },
         "allowed_roots": normalized_roots,
         "outputs": normalized_outputs,
         "observed_roots": normalized_observed,
     }
+
+
+def validate_manifest_file(path: str, expected_manifest_hash: str = "") -> dict:
+    """Validate an inert manifest and its script identity without granting trust."""
+    raw, actual = _load_json_file(path)
+    wanted = str(expected_manifest_hash or "").strip().lower()
+    if wanted:
+        if not _HASH_RE.fullmatch(wanted):
+            raise WorkflowError("--expected-manifest-hash must be a SHA-256")
+        if not hmac.compare_digest(wanted, actual):
+            raise WorkflowConflict(
+                "workflow manifest hash does not match the expected version",
+                {"expected": wanted, "actual": actual},
+            )
+    manifest = validate_manifest(raw, path)
+    return {
+        "ok": True,
+        "valid": True,
+        "workflow": manifest["id"],
+        "schema": manifest["schema"],
+        "manifest_sha256": actual,
+        "script_sha256": manifest["command"]["script_sha256"],
+        "arguments_bound": manifest["schema"] == MANIFEST_SCHEMA,
+        "argument_count": len(manifest["command"].get("args", [])),
+        "outputs": len(manifest["outputs"]),
+        "observed_roots": len(manifest.get("observed_roots", [])),
+        "manifest": manifest,
+    }
+
+
+def manifest_status(path: str) -> dict:
+    """Report whether this machine trusts this exact manifest and script."""
+    validated = validate_manifest_file(path)
+    record_path = _record_path(validated["workflow"])
+    if not os.path.lexists(record_path):
+        return {
+            **{key: validated[key] for key in (
+                "workflow", "schema", "manifest_sha256", "script_sha256",
+            )},
+            "trusted": False,
+            "status": "not_trusted_on_this_machine",
+        }
+    record = load_trusted(validated["workflow"])
+    exact = (
+        hmac.compare_digest(
+            record.get("manifest_sha256", ""), validated["manifest_sha256"]
+        )
+        and record.get("manifest") == validated["manifest"]
+    )
+    return {
+        **{key: validated[key] for key in (
+            "workflow", "schema", "manifest_sha256", "script_sha256",
+        )},
+        "trusted": exact,
+        "status": "trusted_exact" if exact else "trusted_record_differs",
+    }
+
+
+def initialize_manifest(
+    script: str,
+    manifest_path: str,
+    *,
+    workflow_id: str,
+    runtime: str = "",
+    args: Optional[list[str]] = None,
+    outputs: Optional[list[str]] = None,
+    expected: Optional[list[str]] = None,
+    allowed_roots: Optional[list[str]] = None,
+    description: str = "",
+) -> dict:
+    """Build and validate a v2 manifest; the caller owns guarded publication."""
+    script_path = _ordinary_script(script)
+    inferred = {".py": "python", ".js": "node", ".mjs": "node",
+                ".cjs": "node", ".ps1": "powershell"}.get(
+                    os.path.splitext(script_path)[1].lower(), ""
+                )
+    runtime = runtime or inferred
+    if runtime not in {"python", "node", "powershell"}:
+        raise WorkflowError("--runtime is required for an unrecognized script extension")
+    outputs = list(outputs or [])
+    roots = list(allowed_roots or [])
+    if not outputs:
+        raise WorkflowError("workflow init requires at least one --output")
+    if not roots:
+        raise WorkflowError("workflow init requires at least one --allowed-root")
+    expected = list(expected or [])
+    if expected and len(expected) != len(outputs):
+        raise WorkflowError("repeat --expected once per --output, in the same order")
+    if not expected:
+        expected = ["any"] * len(outputs)
+    manifest_dir = os.path.dirname(os.path.abspath(os.path.expanduser(manifest_path)))
+    try:
+        script_value = os.path.relpath(script_path, manifest_dir).replace("\\", "/")
+    except ValueError:
+        script_value = script_path
+    manifest = {
+        "schema": MANIFEST_SCHEMA,
+        "id": workflow_id,
+        "description": description,
+        "command": {
+            "runtime": runtime,
+            "script": script_value,
+            "script_sha256": store.file_sha256(script_path),
+            "args": list(args or []),
+        },
+        "allowed_roots": roots,
+        "outputs": [
+            {"path": path, "expected": expectation}
+            for path, expectation in zip(outputs, expected)
+        ],
+        "observed_roots": [],
+    }
+    normalized = validate_manifest(manifest, manifest_path)
+    return {"manifest": manifest, "normalized": normalized}
 
 
 def _trust_dir() -> str:
@@ -331,23 +484,43 @@ def _seal(record: dict, key: bytes) -> str:
     return hmac.new(key, _canonical_json(unsigned), hashlib.sha256).hexdigest()
 
 
-def trust_manifest(path: str, expected_manifest_hash: str, *, replace: bool = False) -> dict:
+def trust_manifest(path: str, expected_manifest_hash: str, *, replace: bool = False,
+                   phase_callback=None) -> dict:
     """Explicitly trust one hash-checked manifest and its current script."""
+    started = time.monotonic()
+    phases = []
+
+    def phase(name):
+        item = {"phase": name, "elapsed_seconds": round(time.monotonic() - started, 3)}
+        phases.append(item)
+        if phase_callback:
+            phase_callback(item)
+
+    phase("acquiring_lock")
     with store.Lock("workflow-trust", timeout=10.0):
-        return _trust_manifest_locked(path, expected_manifest_hash, replace=replace)
+        result = _trust_manifest_locked(
+            path, expected_manifest_hash, replace=replace, phase_callback=phase,
+        )
+    phase("complete")
+    result["phases"] = phases
+    return result
 
 
 def _trust_manifest_locked(path: str, expected_manifest_hash: str,
-                           *, replace: bool = False) -> dict:
+                           *, replace: bool = False, phase_callback=None) -> dict:
     wanted = str(expected_manifest_hash or "").strip().lower()
     if not _HASH_RE.fullmatch(wanted):
         raise WorkflowError("--expected-manifest-hash must be a SHA-256")
+    if phase_callback:
+        phase_callback("reading_manifest")
     raw, actual = _load_json_file(path)
     if not hmac.compare_digest(wanted, actual):
         raise WorkflowConflict(
             "workflow manifest hash does not match the expected version",
             {"expected": wanted, "actual": actual},
         )
+    if phase_callback:
+        phase_callback("hashing_script_and_validating_contract")
     manifest = validate_manifest(raw, path)
     trust_dir = _ensure_trust_dir(create=True)
     existing_records = [name for name in os.listdir(trust_dir) if name.endswith(".json")]
@@ -375,6 +548,8 @@ def _trust_manifest_locked(path: str, expected_manifest_hash: str,
         "manifest": manifest,
     }
     record["seal"] = _seal(record, key)
+    if phase_callback:
+        phase_callback("writing_record")
     _atomic_write(record_path, _canonical_json(record) + b"\n")
     return {
         "ok": True, "changed": True, "workflow": manifest["id"],
@@ -528,6 +703,27 @@ def normalize_command(command: list[str], cwd: str) -> dict:
     }
 
 
+def command_for_manifest(manifest: dict) -> list[str]:
+    """Build a shell-free launcher for a v2 manifest's exact command contract."""
+    command = manifest["command"]
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise WorkflowError("manifest v1 requires an explicit command after --")
+    runtime = command["runtime"]
+    script = command["script"]
+    args = list(command.get("args", []))
+    if runtime == "python":
+        return [sys.executable, script, *args]
+    if runtime == "node":
+        executable = shutil.which("node") or shutil.which("nodejs")
+        if not executable:
+            raise WorkflowError("the trusted Node runtime is not available")
+        return [executable, script, *args]
+    executable = shutil.which("pwsh") or shutil.which("powershell")
+    if not executable:
+        raise WorkflowError("the trusted PowerShell runtime is not available")
+    return [executable, "-NoProfile", "-File", script, *args]
+
+
 def _expand(template: str, context: dict, label: str) -> str:
     def replace(match):
         token = match.group(1)
@@ -590,6 +786,8 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
         raise WorkflowError("workflow working directory does not exist")
     record = load_trusted(workflow_id)
     manifest = record["manifest"]
+    if not command:
+        command = command_for_manifest(manifest)
     normalized = normalize_command(command, working)
     bound = manifest["command"]
     if normalized["runtime"] != bound["runtime"]:
@@ -601,6 +799,13 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
             "trusted script changed; review and trust a new manifest before running it",
             {"script": normalized["script"], "expected": bound["script_sha256"],
              "actual": normalized["script_sha256"]},
+        )
+    if manifest.get("schema") == MANIFEST_SCHEMA \
+            and normalized["args"] != bound.get("args", []):
+        raise WorkflowTrustError(
+            "command arguments do not match the trusted workflow",
+            {"expected_count": len(bound.get("args", [])),
+             "actual_count": len(normalized["args"])},
         )
     context = {
         "cwd": working,
@@ -678,6 +883,8 @@ def matching_workflow(command: list[str], cwd: str) -> str:
         bound = record["manifest"]["command"]
         if (bound["runtime"] == normalized["runtime"]
                 and os.path.normcase(bound["script"]) == os.path.normcase(normalized["script"])
-                and hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"])):
+                and hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"])
+                and (record["manifest"].get("schema") != MANIFEST_SCHEMA
+                     or bound.get("args", []) == normalized["args"])):
             return item["id"]
     return ""

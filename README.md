@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.19` is the Windows-first stable release.
+> **Release status:** `0.3.20` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -109,6 +109,7 @@ so the agent self-corrects instead of fighting the rails:
 | editing `report.docx` in place | `agw checkout` → edit markdown → `agw publish` |
 | editing a Drive-hosted macro workbook | `agw checkout workbook.xlsm` → edit the external working copy in Excel → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
+| several dependent text edits | `agw file plan` then `agw file apply-plan` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
 
@@ -157,17 +158,40 @@ for `.xlsm`. Word
 patches provide general block-level editing for top-level body paragraphs,
 headings, and list items.
 
+For dependent changes across several UTF-8 files, `agw file plan` accepts one
+version-1 operations JSON document containing `write`, `patch`, and `replace`
+items. It validates exact target versions and materializes the proposed results
+into a self-contained plan without changing the targets. `agw file apply-plan`
+requires the returned plan hash, rechecks every target, captures every pre-image,
+and publishes the set under one lock. A handled publication failure rolls back
+already-published members; durable per-file recovery receipts remain available
+if the host or machine stops between filesystem replacements. Use the leaf help
+for the compact schema and arguments; plan files contain proposed file content
+and should be protected like the target files.
+JSON failures distinguish `preimage_hash_conflict`, `patch_context_conflict`,
+`patch_hunk_count_mismatch`, and `replace_match_conflict`. Count mismatches also
+return the hunk/header, patch line, expected and observed counts, and a corrected
+header suggestion so an agent can repair the diff without parsing prose.
+
 Write-capable scripts remain fail-closed unless every output is declared before
 execution. One-off runs use exact `--output` arguments; reviewed repeated tools
 can install a data-only, script-hash-bound manifest with `agw workflow trust`
 and then use `agw run --workflow ID`. A repository cannot trust its own
 manifest merely by placing it beside a script. Exact existing outputs receive
 verified pre-images and exact absent outputs receive tombstones before launch.
+Manifest v2 also binds the exact script arguments, so `agw run --workflow ID`
+can reconstruct the reviewed command without agents restating Unicode paths or
+flags. Use `agw workflow init` to generate v2, `validate` before trust, and
+`status` to reconcile machine-local trust for a synced manifest. V1 remains
+readable for compatibility but does not bind arguments.
 Exact outputs are independent of optional observed roots, so a recoverable state
 file can be paired with a separate dynamic cache root. Observed roots only detect
 unclaimed after-the-fact changes; they do not prevent writes or recover an
 unknown file. See the
 [trusted-workflow reference](plugin/skills/agentic-guardrails/references/trusted-workflows.md).
+`agw run --dry-run` is deliberately contract-only: it does not execute the
+command or predict its writes. JSON identifies this explicitly as
+`"validation_scope":"contract_only"`.
 
 Folder scans are metadata-only and hard-bounded by a parent process. Use
 `agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,
@@ -278,8 +302,9 @@ that must always resolve to deny/ask, golden subprocess tests of the actual hook
 
 Cowork support (hooks don't fire there yet —
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md)),
-plan→apply transactions for bulk reorganization, the `hydrate` verb, a Cursor
-adapter on the same core engine, and an instruction compiler. Also planned is
+the `hydrate` verb, a Cursor adapter on the same core engine, and an instruction
+compiler, and killable worker isolation for hard-bounded workflow manifest/script
+validation on stalled virtual filesystems. Also planned is
 an on-demand, report-only connector policy auditor that inventories exposed
 connector tools, flags unclassified or ambiguous action verbs, and proposes
 reviewed Codex/Claude policy and test updates without executing connector

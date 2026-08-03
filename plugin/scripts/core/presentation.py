@@ -43,6 +43,11 @@ _COPY_BY_RULE = {
         "No safe, read-only operation could be identified.",
         "The effect cannot be determined from the structured request.",
     ),
+    "builtin:agw-workflow-trust": (
+        "The agent wants Guardrails to trust a versioned script workflow.",
+        "This stores a persistent, hash-bound output contract after review.",
+        "The matching script may later change its declared outputs without a new trust prompt.",
+    ),
     "builtin:patch-opaque": (
         "The agent wants to apply a file change whose targets are unclear.",
         "Guardrails could not identify every file in the proposed change.",

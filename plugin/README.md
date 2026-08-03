@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.19` is the Windows-first stable release.
+> **Release status:** `0.3.20` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -107,6 +107,7 @@ so the agent self-corrects instead of fighting the rails:
 | editing a Drive-hosted macro workbook | `agw checkout workbook.xlsm` → edit the external working copy in Excel → `agw publish` |
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | many tiny shell writes | `agw file write` / `patch` / `replace` with file or stdin input |
+| several dependent text edits | `agw file plan` then `agw file apply-plan` |
 | unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
@@ -174,10 +175,27 @@ output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders and need not be inside an observed root, so unrelated app
 or sync-client updates are ignored. A recoverable state file can therefore be
 paired with a separate, narrowly patterned cache root.
+For dependent changes across several UTF-8 files, `agw file plan` validates a
+version-1 JSON list of `write`, `patch`, and `replace` operations and writes a
+self-contained proposal without changing the targets. `agw file apply-plan`
+requires the returned plan hash, rechecks all target versions, captures every
+pre-image, and publishes the set under one lock. Handled publication failures
+roll back already-published members; the per-file recovery receipts cover an
+unexpected host or machine stop between filesystem replacements. Plan files
+contain proposed file content and should be protected like the targets.
+JSON failures distinguish `preimage_hash_conflict`, `patch_context_conflict`,
+`patch_hunk_count_mismatch`, and `replace_match_conflict`. Count mismatches also
+return the hunk/header, patch line, expected and observed counts, and a corrected
+header suggestion so an agent can repair the diff without parsing prose.
 Reviewed repeated tools can install a data-only, script-hash-bound manifest with
 `agw workflow trust`, then use `agw run --workflow ID`; a repository manifest is
-inert until that explicit user-confirmed trust step. Explicit, bounded
-`--output-root` manifests detect unclaimed observed changes, and relative
+inert until that explicit user-confirmed trust step. Manifest v2 binds exact
+arguments as well as runtime, script path, and script
+hash; `agw run --workflow ID` reconstructs that reviewed command without
+restating fragile Unicode paths. `agw workflow init` generates escaped v2 JSON,
+`validate` checks an inert manifest, and `status` compares it with this machine's
+sealed record. V1 remains readable for compatibility but does not bind arguments.
+Explicit, bounded `--output-root` manifests detect unclaimed observed changes, and relative
 patterns can identify intentional companion files. This is after-the-fact
 detection, not prevention or recovery for unknown files, and it cannot prove
 which process caused a change. Use only narrow, stable roots and declare
@@ -188,6 +206,8 @@ validates a staged hash and Office package, captures one target pre-image,
 retries only atomic replacement for a bounded interval, and preserves the stage
 when a sync client keeps the target busy. An `.xlsm` stage is compared with the
 live target automatically; creating a new target requires `--preserve-against`.
+`agw run --dry-run` validates only the declared contract and never executes the
+command; its JSON result reports `"validation_scope":"contract_only"`.
 
 Approval prompts for sensitive reads and credential searches show a sanitized
 filename or search scope, the detected risk category, and the specific reason
@@ -302,8 +322,9 @@ that must always resolve to deny/ask, golden subprocess tests of the actual hook
 
 Cowork support (hooks don't fire there yet —
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md)),
-plan→apply transactions for bulk reorganization, the `hydrate` verb, a Cursor
-adapter on the same core engine, and an instruction compiler. Also planned is
+the `hydrate` verb, a Cursor adapter on the same core engine, and an instruction
+compiler, and killable worker isolation for hard-bounded workflow manifest/script
+validation on stalled virtual filesystems. Also planned is
 an on-demand, report-only connector policy auditor that inventories exposed
 connector tools, flags unclassified or ambiguous action verbs, and proposes
 reviewed Codex/Claude policy and test updates without executing connector
