@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.17` is the Windows-first stable release.
+> **Release status:** `0.3.18` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -171,7 +171,9 @@ file write`, `patch`, and `replace`. These operations accept expected hashes, su
 dry runs, publish through same-directory stages, and record verified pre-images
 or ABSENT tombstones. `agw run` executes a command only after every declared
 output has been hash-checked and snapshotted. Exact outputs do not enumerate
-their parent folders, so unrelated app or sync-client updates are ignored.
+their parent folders and need not be inside an observed root, so unrelated app
+or sync-client updates are ignored. A recoverable state file can therefore be
+paired with a separate, narrowly patterned cache root.
 Reviewed repeated tools can install a data-only, script-hash-bound manifest with
 `agw workflow trust`, then use `agw run --workflow ID`; a repository manifest is
 inert until that explicit user-confirmed trust step. Explicit, bounded

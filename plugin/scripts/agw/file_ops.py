@@ -598,7 +598,7 @@ def run_declared(
     if not os.path.isdir(working):
         raise FileOperationError("run working directory does not exist")
     patterns = _validate_output_patterns(output_patterns)
-    roots = _output_roots(targets, output_roots or [])
+    roots = _output_roots(output_roots or [])
     if patterns and not roots:
         raise FileOperationError(
             "--output-pattern requires an explicit --output-root"
@@ -729,11 +729,12 @@ def run_declared(
         }
 
 
-def _output_roots(targets: list[str], supplied: list[str]) -> list[str]:
+def _output_roots(supplied: list[str]) -> list[str]:
     # Exact declarations are deliberately exact. Recursively observing their
     # parent directories is expensive in large/synced folders and conflates
     # unrelated application activity with command side effects. Root manifests
-    # are therefore an explicit opt-in.
+    # are therefore an explicit opt-in for dynamic sidecars, independent of
+    # exact output locations.
     raw = supplied
     roots = []
     for value in raw:
@@ -745,12 +746,6 @@ def _output_roots(targets: list[str], supplied: list[str]) -> list[str]:
         folded = os.path.normcase(root)
         if folded not in {os.path.normcase(item) for item in roots}:
             roots.append(root)
-    if roots:
-        for target in targets:
-            if not any(_path_is_within(target, root) for root in roots):
-                raise FileOperationError(
-                    f"declared output is outside every output root: {target}"
-                )
     return roots
 
 

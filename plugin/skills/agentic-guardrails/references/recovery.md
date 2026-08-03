@@ -17,9 +17,10 @@ recoverable archive artifact, and removes only the link object. Ordinary files
 and directories are refused. Supply `--expected-target` when the intended link
 destination is known.
 
-For write-capable scripts, declare exact outputs. Exact mode hashes and snapshots
-only those paths; it does not enumerate their parents, so large folders and
-unrelated application updates add no scan cost or false side-effect report.
+For write-capable scripts, declare exact outputs independently of observed roots.
+Exact mode hashes and snapshots only those paths; it does not enumerate their
+parents, so large folders and unrelated application updates add no scan cost or
+false side-effect report. A state output may sit outside a separate cache root.
 
 For repeated scripts, see [trusted-workflows.md](trusted-workflows.md).
 
