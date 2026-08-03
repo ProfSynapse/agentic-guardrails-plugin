@@ -24,6 +24,46 @@ from datetime import datetime
 from . import archive_transactions as archive_tx
 
 SCHEMA_VERSION = 1
+_WINDOWS_SHARING_WINERRORS = {32, 33}
+
+
+def _ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
+    """Create one directory, tolerating only bounded Windows creation races."""
+    deadline = time.monotonic() + max(0.0, retry_seconds)
+    while True:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except PermissionError:
+            # Concurrent makedirs calls can transiently report EACCES on
+            # Windows while another thread publishes the shared parent. Never
+            # treat an unverified path as success and never retry indefinitely.
+            if os.name != "nt":
+                raise
+            if os.path.isdir(path):
+                return path
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _lock_contention(exc: OSError, path: str) -> bool:
+    if exc.errno == errno.EEXIST:
+        return True
+    if os.name != "nt":
+        return False
+    sharing_error = (
+        getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS
+        or exc.errno in {errno.EACCES, errno.EAGAIN}
+    )
+    # Retry access/sharing errors only for an existing lock object. A missing
+    # lock path means this is a real directory/ACL failure and must fail fast.
+    if not sharing_error:
+        return False
+    try:
+        return os.path.lexists(path)
+    except OSError:
+        return False
 
 
 def agw_home_path() -> str:
@@ -33,8 +73,7 @@ def agw_home_path() -> str:
 
 def agw_home() -> str:
     home = agw_home_path()
-    os.makedirs(home, exist_ok=True)
-    return home
+    return _ensure_directory(home)
 
 
 def archive_store_writable() -> bool:
@@ -50,7 +89,7 @@ def archive_store_writable() -> bool:
         home = agw_home()
         for name in ("archive", "transactions", "locks"):
             directory = os.path.join(home, name)
-            os.makedirs(directory, exist_ok=True)
+            _ensure_directory(directory)
             probes.append(tempfile.mkdtemp(prefix=".agw-write-probe-", dir=directory))
         return True
     except OSError:
@@ -83,21 +122,21 @@ class Lock:
 
     def __init__(self, name: str, timeout: float = 10.0):
         self.path = os.path.join(agw_home(), "locks", name + ".lock")
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        _ensure_directory(os.path.dirname(self.path))
         self.timeout = timeout
         self.fd = None
 
     def __enter__(self):
-        deadline = time.time() + self.timeout
+        deadline = time.monotonic() + self.timeout
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(self.fd, str(os.getpid()).encode())
                 return self
             except OSError as exc:
-                if exc.errno != errno.EEXIST:
+                if not _lock_contention(exc, self.path):
                     raise
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     # stale-lock recovery: locks older than 60s are abandoned
                     try:
                         if time.time() - os.path.getmtime(self.path) > 60:
@@ -105,7 +144,7 @@ class Lock:
                             continue
                     except OSError:
                         pass
-                    raise TimeoutError(f"could not acquire lock {self.path}")
+                    raise TimeoutError(f"could not acquire lock {self.path}") from exc
                 time.sleep(0.05)
 
     def __exit__(self, *exc):
@@ -218,7 +257,7 @@ def _file_dir(src: str) -> str:
     name = os.path.basename(canonical)
     safe = "".join(c if c.isalnum() or c in "-_. " else "_" for c in name)[:80]
     d = os.path.join(agw_home(), "archive", _folder_key(folder), safe)
-    os.makedirs(d, exist_ok=True)
+    _ensure_directory(d)
     return d
 
 
@@ -240,11 +279,13 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     src = os.path.abspath(src)
     if not os.path.lexists(src):
         raise FileNotFoundError(src)
-    file_dir = _file_dir(src)
     link = archive_tx.link_metadata(src)
     digest = file_sha256(src) if link is None and os.path.isfile(src) else ""
 
     with Lock(_folder_key(os.path.dirname(src))):
+        # Directory publication shares parents with every archive from this
+        # source folder, so it belongs inside the same lock as versioning.
+        file_dir = _file_dir(src)
         if dedupe and digest:
             last = latest_version(src)
             if last and last.get("sha256") == digest \
