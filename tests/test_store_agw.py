@@ -1,5 +1,6 @@
 """Archive store + agw CLI behavior: round-trips, undo, concurrency, conflicts."""
 import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -97,7 +99,8 @@ def test_pre_image_dedupe(tmp_path):
     assert e2.get("deduped") is True
 
 
-def test_concurrent_archives_no_lost_versions(tmp_path):
+@pytest.mark.parametrize("_round", range(4))
+def test_concurrent_archives_no_lost_versions(tmp_path, _round):
     files = []
     for i in range(12):
         f = tmp_path / f"f{i}.txt"
@@ -108,17 +111,70 @@ def test_concurrent_archives_no_lost_versions(tmp_path):
     def worker(path):
         try:
             store.archive_file(path, mode="move")
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
+        except Exception:  # noqa: BLE001
+            errors.append(traceback.format_exc())
 
     threads = [threading.Thread(target=worker, args=(p,)) for p in files]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert not errors
+    assert not errors, "\n".join(errors)
     ops = [o for o in store.oplog_read() if o.get("op") == "archive"]
     assert len(ops) == 12
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing semantics")
+def test_lock_retries_windows_sharing_violation_for_existing_lock(
+        tmp_path, monkeypatch):
+    real_open = store.os.open
+    attempts = 0
+
+    def sharing_then_open(path, flags, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = PermissionError(errno.EACCES, "simulated sharing violation")
+            error.winerror = 32
+            raise error
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(store.os, "open", sharing_then_open)
+    monkeypatch.setattr(store.os.path, "lexists", lambda _path: attempts == 1)
+    with store.Lock("sharing-race", timeout=0.5):
+        pass
+    assert attempts == 2
+
+
+def test_lock_does_not_retry_permission_error_without_lock_object(monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "real ACL denial")
+
+    monkeypatch.setattr(store.os, "open", denied)
+    monkeypatch.setattr(store.os.path, "lexists", lambda _path: False)
+    with pytest.raises(PermissionError, match="real ACL denial"):
+        with store.Lock("acl-denial", timeout=0.5):
+            pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory creation semantics")
+def test_shared_directory_creation_retries_transient_windows_denial(
+        tmp_path, monkeypatch):
+    target = tmp_path / "shared"
+    real_makedirs = store.os.makedirs
+    attempts = 0
+
+    def denied_then_create(path, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(errno.EACCES, "simulated creation race")
+        return real_makedirs(path, *args, **kwargs)
+
+    monkeypatch.setattr(store.os, "makedirs", denied_then_create)
+    assert store._ensure_directory(str(target), retry_seconds=0.5) == str(target)
+    assert target.is_dir()
+    assert attempts == 2
 
 
 def test_path_with_spaces_and_unicode(tmp_path):
