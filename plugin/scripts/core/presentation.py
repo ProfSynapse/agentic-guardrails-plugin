@@ -95,6 +95,30 @@ _COPY_BY_RULE = {
     ),
 }
 
+_CONNECTOR_ACTION_VERBS = {
+    "add", "approve", "assign", "close", "convert", "copy", "create",
+    "disable", "edit", "enable", "forward", "grant", "invite", "lock",
+    "mark", "merge", "move", "publish", "react", "rename", "reopen",
+    "replace", "reply", "resolve", "revoke", "schedule", "send", "set",
+    "share", "submit", "unassign", "unlock", "unresolve", "update",
+    "upload", "write", "remove", "unlink", "discard", "detach",
+}
+_CONNECTOR_REMOVE_VERBS = {"remove", "unlink", "discard", "detach"}
+_CONNECTOR_NAME_FIELDS = (
+    "file_name", "filename", "document_name", "folder_name", "item_name",
+    "record_name", "event_name", "channel_name", "target_name", "name",
+    "title", "subject", "file_path", "path",
+)
+_CONNECTOR_ID_FIELDS = (
+    "file_id", "document_id", "folder_id", "item_id", "record_id",
+    "event_id", "channel_id", "thread_id", "message_id", "id",
+)
+_SERVICE_LABELS = {
+    "github": "GitHub", "gmail": "Gmail", "google_drive": "Google Drive",
+    "google_calendar": "Google Calendar", "onedrive": "OneDrive",
+    "sharepoint": "SharePoint", "slack": "Slack", "outlook": "Outlook",
+}
+
 
 _ARCHIVE_DENIALS = {
     "builtin:rm", "builtin:find-delete", "builtin:move-null",
@@ -227,6 +251,76 @@ def _safe_display(value, *, file_name: bool = False) -> str:
     return text if len(text) <= 96 else text[:93] + "..."
 
 
+def _identifier_words(value) -> list[str]:
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value or ""))
+    return [part.lower() for part in re.split(r"[^A-Za-z0-9]+", text) if part]
+
+
+def _human_identifier(value) -> str:
+    words = _identifier_words(value)
+    return " ".join(words).title() if words else "Connected Service"
+
+
+def _connector_labels(tool_input: dict) -> tuple[str, ...]:
+    """Select display-safe target identity fields, never payload content."""
+    if not isinstance(tool_input, dict):
+        return ()
+    normalized = {
+        "_".join(_identifier_words(key)): value
+        for key, value in tool_input.items()
+    }
+    for key in _CONNECTOR_NAME_FIELDS:
+        value = normalized.get(key)
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        label = _safe_display(
+            value,
+            file_name=key in {"file_name", "filename", "file_path", "path"},
+        )
+        if label != "unnamed target":
+            return (label,)
+    for key in _CONNECTOR_ID_FIELDS:
+        value = normalized.get(key)
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            continue
+        label = _safe_display(value)
+        if label == "unnamed target":
+            continue
+        kind = " ".join(key.split("_")[:-1]).title()
+        return ((f"{kind} ID: {label}" if kind else f"ID: {label}"),)
+    return ()
+
+
+def _connector_summary(evlist) -> dict:
+    event = next((ev for ev in evlist if ev.kind == events.MCP), None)
+    if event is None:
+        return {}
+    segments = [part for part in str(event.tool or "").split("__") if part]
+    service_key = segments[-2].lower() if len(segments) >= 3 else ""
+    service = _safe_display(
+        _SERVICE_LABELS.get(service_key, _human_identifier(service_key))
+    )
+    short = segments[-1] if segments else ""
+    words = _identifier_words(short)
+    action_index = next(
+        (index for index, word in enumerate(words) if word in _CONNECTOR_ACTION_VERBS),
+        None,
+    )
+    verb = words[action_index] if action_index is not None else "change"
+    object_words = words[action_index + 1:] if action_index is not None else []
+    object_words = [word for word in object_words if not re.fullmatch(r"v?\d+", word)]
+    object_name = _safe_display(" ".join(object_words) or "item")
+    article = "an" if object_name[:1] in "aeiou" else "a"
+    tool_input = event.extra.get("input") if isinstance(event.extra, dict) else {}
+    return {
+        "service": service,
+        "verb": verb,
+        "object": object_name,
+        "operation": f"{verb} {article} {object_name}",
+        "labels": _connector_labels(tool_input),
+    }
+
+
 def _detail_labels(decision: GuardrailDecision) -> tuple[str, ...]:
     details = decision.presentation_details or {}
     values = details.get("targets") or []
@@ -275,6 +369,12 @@ def _friendly_targets(decision: GuardrailDecision, evlist) -> tuple[str, ...]:
         return ((f"{count} selected working file" + ("" if count == 1 else "s"),)
                 if count else ("The exact files could not be identified",))
     if context == events.DecisionContext.CONNECTED_SERVICE:
+        summary = _connector_summary(evlist)
+        if summary:
+            base = f"{summary['service']} {summary['object']}"
+            if summary["labels"]:
+                return (base + ": " + _natural_list(summary["labels"]),)
+            return (base,)
         return ("An item in a connected service",)
     kinds = {ev.kind for ev in evlist}
     if kinds == {events.READ}:
@@ -310,6 +410,22 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
             "The file's contents could be included in the agent's work.",
             "Choose Cancel to keep the content out of the agent's work.",
         )
+    if decision.rule_id in {"builtin:mcp-mutation", "builtin:mcp-remove"}:
+        summary = _connector_summary(evlist)
+        if summary:
+            consequence = (
+                f"{summary['service']} may remove or unlink the specified "
+                f"{summary['object']}."
+                if summary["verb"] in _CONNECTOR_REMOVE_VERBS else
+                f"{summary['service']} may create or change the specified "
+                f"{summary['object']}."
+            )
+            return (
+                f"The agent wants to {summary['operation']} in {summary['service']}.",
+                f"This {summary['service']} operation needs your approval before it continues.",
+                consequence,
+                "Choose Cancel to leave the connected service unchanged.",
+            )
     mapped = _COPY_BY_RULE.get(decision.rule_id)
     if mapped:
         return (*mapped, "Choose Cancel to make no changes.")

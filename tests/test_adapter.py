@@ -510,13 +510,18 @@ def test_archive_failure_is_hard_deny(tmp_path):
 
 
 def test_external_mutation_asks_instead_of_requiring_local_recovery(tmp_path):
-    out = run_hook({"tool_name": "mcp__drive__update_file",
-                    "tool_input": {"id": "remote"}, "cwd": str(tmp_path),
+    out = run_hook({"tool_name": "mcp__google_drive__update_file",
+                    "tool_input": {
+                        "file_name": "Board Budget.xlsx",
+                        "content": "PRIVATE-CANARY-body",
+                    }, "cwd": str(tmp_path),
                     "session_id": "t-external", "hook_event_name": "PreToolUse"},
                    env_extra={"AGW_HOME": str(tmp_path / "home")})
     assert _decision(out) == "ask"
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "connected service" in reason.lower()
+    assert "update a file in Google Drive" in reason
+    assert "Google Drive file: Board Budget.xlsx" in reason
+    assert "PRIVATE-CANARY" not in reason
     assert "local recovery store" not in reason.lower()
 
 

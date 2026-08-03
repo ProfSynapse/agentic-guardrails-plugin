@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.18` is the Windows-first stable release.
+> **Release status:** `0.3.19` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -233,6 +233,8 @@ executed command, so it isn't blocked.
 
 Approval dialogs describe the action, affected category, reason, consequence,
 and safety measure without requiring the user to interpret raw shell syntax.
+Connected-service prompts name the sanitized service, action, and target name or
+identifier when available; message bodies, tokens, and raw payloads stay hidden.
 They offer **Allow once** and **Cancel (recommended)**; known reversible
 Guardrails restore/mutation operations instead recommend Allow. If an action is
 cancelled or blocked, the agent is instructed to explain why in plain language

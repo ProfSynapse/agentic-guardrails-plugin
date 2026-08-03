@@ -125,6 +125,25 @@ def test_common_office_help_paths_reduce_tokens_without_extra_round_trip():
         _estimated_tokens("x" * LEGACY_OFFICE_HELP_CHARS)
 
 
+def test_office_inspect_alias_and_unknown_operation_guidance_are_compact():
+    alias = subprocess.run(
+        [sys.executable, str(AGW), "office", "inspect", "--help"],
+        text=True, capture_output=True, check=True,
+    )
+    assert "Inspect Office structure and risks" in alias.stdout
+
+    unknown = subprocess.run(
+        [sys.executable, str(AGW), "office", "not-an-operation"],
+        text=True, capture_output=True, check=False,
+    )
+    assert unknown.returncode == 2
+    assert unknown.stdout == ""
+    assert "unknown Office operation" in unknown.stderr
+    assert "agw office --help" in unknown.stderr
+    assert "choose from" not in unknown.stderr
+    assert len(unknown.stderr) < 120
+
+
 def test_each_office_leaf_help_is_bounded_and_single_purpose():
     operations = (
         "info", "get-text", "replace-text", "set-cell", "append-rows",

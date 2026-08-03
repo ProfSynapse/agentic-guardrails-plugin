@@ -10,6 +10,7 @@ publish conflicts. Use uniqueness constraints for retry-safe appends.
 Reads are compact and paginated. Formula reads do not calculate formulas. Risks
 name exact parts; `normalize` removes only allowlisted metadata. On PowerShell,
 prefer stdin or JSON files and use one stdin payload per command.
+Use `office info` or its read-only `office inspect` alias for structure and risks.
 
 For `.xlsm`, keep the Drive file binary and available offline. `checkout`
 defaults to a non-synced Guardrails workspace. Open that copy in desktop Excel
