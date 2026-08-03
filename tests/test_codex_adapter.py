@@ -390,6 +390,43 @@ def test_codex_provider_receives_closed_human_prompt(monkeypatch, capsys, tmp_pa
     assert str(tmp_path) not in rendered
 
 
+def test_codex_provider_receives_specific_connected_service_prompt(
+        monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+    ptu = _load_codex_pretooluse_isolated()
+    payload = {
+        "tool_name": "mcp__google_drive__update_file",
+        "tool_input": {
+            "file_name": "Board Budget.xlsx",
+            "content": "PRIVATE-CANARY-body",
+            "access_token": "PRIVATE-CANARY-token",
+        },
+        "cwd": str(tmp_path), "session_id": "connected-prompt",
+        "hook_event_name": "PreToolUse",
+    }
+
+    class CapturingProvider(ApprovalProvider):
+        def __init__(self):
+            self.request_value = None
+
+        def request(self, request):
+            self.request_value = request
+            return ApprovalResponse(False, "denied")
+
+    provider = CapturingProvider()
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    capsys.readouterr()
+    request = provider.request_value
+    assert request is not None
+    rendered = request.action + "\n" + request.primary_text()
+    assert "update a file in Google Drive" in rendered
+    assert "Target: Google Drive file: Board Budget.xlsx" in rendered
+    assert "PRIVATE-CANARY" not in rendered
+
+
 def test_unknown_target_patch_denies_without_provider(monkeypatch, capsys, tmp_path):
     import io
     from core.approvals import ApprovalProvider, ApprovalResponse

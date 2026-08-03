@@ -12,6 +12,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import sys
 import time
 
@@ -41,6 +42,19 @@ import office_tx                            # noqa: E402
 import scan_worker                          # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
+
+
+class _CompactArgumentParser(argparse.ArgumentParser):
+    """Keep invalid nested-operation errors actionable and token efficient."""
+
+    def error(self, message):
+        if (self.prog == "agw office"
+                and "argument operation: invalid choice" in str(message)):
+            self.exit(
+                2,
+                "agw: unknown Office operation; use `agw office --help`.\n",
+            )
+        super().error(message)
 
 
 def _out(args, human: str, data: dict):
@@ -1030,7 +1044,7 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="machine-readable output")
-    parser = argparse.ArgumentParser(
+    parser = _CompactArgumentParser(
         prog="agw", parents=[common],
         description="agent workspace - CRUA file safety",
         epilog=("Use `agw <command> --help`; for Office use "
@@ -1269,16 +1283,17 @@ def main(argv=None):
         dest="op", required=True, metavar="operation",
     )
 
-    def add_office(name, summary, *specs, example=""):
+    def add_office(name, summary, *specs, example="", aliases=()):
         parser_for_op = office_sub.add_parser(
-            name, parents=[common], help=summary, description=summary,
+            name, aliases=list(aliases), parents=[common], help=summary,
+            description=summary,
             epilog=(f"example:\n  {example}" if example else None),
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         parser_for_op.add_argument("path", help="Office file path")
         for spec in specs:
             parser_for_op.add_argument(*spec[0], **spec[1])
-        parser_for_op.set_defaults(fn=cmd_office)
+        parser_for_op.set_defaults(fn=cmd_office, op=name)
         return parser_for_op
 
     dry_run = (["--dry-run"], {"action": "store_true",
@@ -1298,6 +1313,7 @@ def main(argv=None):
         (["--scope"], {"choices": ["tables", "names", "preservation"], "default": "",
                         "help": "limit Excel details"}),
         example="agw office info workbook.xlsx --scope tables --json",
+        aliases=("inspect",),
     )
     add_office(
         "validate-preservation", "Verify protected Excel content",

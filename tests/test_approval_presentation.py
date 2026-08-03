@@ -162,6 +162,54 @@ def test_credential_search_prompt_names_scope_and_trigger():
     assert "outside the verified project" in rendered
 
 
+def test_connected_service_prompt_names_service_action_and_safe_target():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:mcp-mutation",
+        presentation_context=events.DecisionContext.CONNECTED_SERVICE,
+    )
+    event = events.ToolEvent(
+        kind=events.MCP, tool="mcp__google_drive__update_file",
+        extra={"input": {
+            "file_name": "Board Budget.xlsx",
+            "content": "PRIVATE-CANARY-message-body",
+            "access_token": "PRIVATE-CANARY-token",
+        }},
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "connector-detail"}, [event],
+    )
+    rendered = request.action + "\n" + request.primary_text()
+
+    assert request.action == \
+        "The agent wants to update a file in Google Drive."
+    assert "Target: Google Drive file: Board Budget.xlsx" in rendered
+    assert "This Google Drive operation needs your approval" in rendered
+    assert "Google Drive may create or change the specified file" in rendered
+    assert "PRIVATE-CANARY" not in rendered
+    assert "access_token" not in rendered
+
+
+def test_connected_service_prompt_uses_safe_id_when_name_is_unavailable():
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:mcp-mutation",
+        presentation_context=events.DecisionContext.CONNECTED_SERVICE,
+    )
+    event = events.ToolEvent(
+        kind=events.MCP, tool="mcp__slack__send_message",
+        extra={"input": {
+            "channel_id": "C012345", "message": "PRIVATE-CANARY-body",
+        }},
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "connector-id"}, [event],
+    )
+    rendered = request.action + "\n" + request.primary_text()
+
+    assert request.action == "The agent wants to send a message in Slack."
+    assert "Target: Slack message: Channel ID: C012345" in rendered
+    assert "PRIVATE-CANARY" not in rendered
+
+
 def test_known_reversible_guardrails_change_recommends_allow():
     decision = GuardrailDecision(
         events.ASK, rule_id="builtin:agw-ask",

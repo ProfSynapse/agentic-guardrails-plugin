@@ -11,7 +11,7 @@
     {
       "name": "agentic-guardrails",
       "displayName": "Agentic Guardrails",
-      "version": "0.3.18",
+      "version": "0.3.19",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/ProfSynapse/agentic-guardrails-plugin",
