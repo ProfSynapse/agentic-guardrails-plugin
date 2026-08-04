@@ -595,6 +595,18 @@ def cmd_run(args):
     if command and command[0] == "--":
         command = command[1:]
     try:
+        parameter_values = {}
+        for item in args.param:
+            if "=" not in item:
+                raise workflows.WorkflowError(
+                    "--param must use NAME=VALUE; repeat it for each parameter"
+                )
+            name, value = item.split("=", 1)
+            if not name or name in parameter_values:
+                raise workflows.WorkflowError(
+                    f"workflow parameter {name!r} is empty or duplicated"
+                )
+            parameter_values[name] = value
         workflow = None
         if args.workflow:
             if args.output or args.expected_hash or args.output_root or args.output_pattern:
@@ -602,13 +614,17 @@ def cmd_run(args):
                     "--workflow resolves its own output contract; do not combine it "
                     "with --output, --expected-hash, --output-root, or --output-pattern"
                 )
-            workflow = workflows.resolve_run(args.workflow, command, args.cwd)
+            workflow = workflows.resolve_run(
+                args.workflow, command, args.cwd, parameters=parameter_values,
+            )
             command = workflow["command"]
             outputs = workflow["outputs"]
             expected_hashes = workflow["expected_hashes"]
             output_roots = workflow["output_roots"]
             output_patterns = workflow["output_patterns"]
         else:
+            if parameter_values:
+                raise workflows.WorkflowError("--param requires --workflow")
             outputs = args.output
             expected_hashes = args.expected_hash
             output_roots = args.output_root
@@ -618,12 +634,14 @@ def cmd_run(args):
             cwd=args.cwd, dry_run=args.dry_run,
             output_roots=output_roots,
             output_patterns=output_patterns,
+            optional_outputs=(workflow or {}).get("optional_outputs", []),
             allow_missing_output_parents=bool(workflow),
         )
         if workflow:
             data["workflow"] = workflow["workflow"]
             data["workflow_manifest_sha256"] = workflow["manifest_sha256"]
             data["script_sha256"] = workflow["script_sha256"]
+            data["workflow_parameters"] = workflow.get("parameters", {})
     except (OSError, file_ops.FileOperationError, workflows.WorkflowError) as exc:
         _file_err(args, exc)
     human_parts = []
@@ -681,6 +699,7 @@ def cmd_workflow(args):
                 "allowed_roots": manifest["allowed_roots"],
                 "outputs": manifest["outputs"],
                 "observed_roots": manifest.get("observed_roots", []),
+                "parameters": manifest.get("parameters", {}),
                 "manifest_sha256": record["manifest_sha256"],
                 "trusted_at": record["trusted_at"], "verified": True,
             }
@@ -693,7 +712,8 @@ def cmd_workflow(args):
             data = validated
             human = (
                 f"valid workflow {data['workflow']} ({data['schema']}); "
-                f"{data['outputs']} exact output(s)"
+                f"{data['outputs']} exact output(s), "
+                f"{data.get('parameter_count', 0)} parameter(s)"
             )
         elif args.workflow_op == "status":
             data = workflows.manifest_status(args.manifest)
@@ -1325,18 +1345,20 @@ def main(argv=None):
     add(
         "run", cmd_run,
         (["--workflow"], {"default": "", "metavar": "ID",
-                           "help": "trusted hash-bound output contract"}),
+                           "help": "workflow"}),
+        (["--param"], {"action": "append", "default": [], "metavar": "NAME=VALUE",
+                       "help": "typed value; repeat"}),
         (["--output"], {"action": "append", "default": [], "metavar": "FILE",
-                        "help": "root-independent output with recovery; repeat"}),
+                        "help": "root-independent output with recovery"}),
         (["--output-root"], {"action": "append", "default": [], "metavar": "DIR",
-                              "help": "observe sidecars; not an output boundary"}),
+                              "help": "not an output boundary"}),
         (["--output-pattern"], {"action": "append", "default": [], "metavar": "GLOB",
-                                 "help": "allowed observed sidecar; needs root"}),
+                                 "help": "sidecar glob; needs root"}),
         (["--expected-hash"], {"action": "append", "default": [], "metavar": "HASH",
-                               "help": "SHA-256/absent per output"}),
-        (["--cwd"], {"default": "", "metavar": "DIR", "help": "working folder"}),
+                               "help": "hash/absent per output"}),
+        (["--cwd"], {"default": "", "metavar": "DIR", "help": "working dir"}),
         (["--dry-run"], {"action": "store_true",
-                          "help": "contract-only; no execution"}),
+                          "help": "validate only; no execution"}),
         (["command"], {"nargs": argparse.REMAINDER, "metavar": "...",
                         "help": "command after --"}),
         help="run a command with declared, recoverable outputs",

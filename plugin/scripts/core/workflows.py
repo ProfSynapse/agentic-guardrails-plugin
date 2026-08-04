@@ -26,7 +26,8 @@ from . import store
 
 MANIFEST_SCHEMA_V1 = "agw.workflow/v1"
 MANIFEST_SCHEMA = "agw.workflow/v2"
-MANIFEST_SCHEMAS = {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA}
+PARAMETERIZED_SCHEMA = "agw.workflow/v3"
+MANIFEST_SCHEMAS = {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}
 RECORD_SCHEMA = "agw.trusted-workflow/v1"
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_WORKFLOWS = 256
@@ -35,11 +36,17 @@ MAX_ROOTS = 16
 MAX_PATTERNS = 64
 MAX_ARGS = 128
 MAX_ARG_BYTES = 16 * 1024
+MAX_PARAMETERS = 32
+MAX_ENUM_VALUES = 512
+MAX_PARAMETER_BYTES = 4096
 
 _ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
+_PARAMETER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _PLACEHOLDER_RE = re.compile(
-    r"\{(cwd|script_dir|script_name|script_stem|arg:(?:0|[1-9][0-9]{0,2})(?::(?:basename|sha256))?)\}"
+    r"\{(cwd|script_dir|script_name|script_stem|temp|"
+    r"arg:(?:0|[1-9][0-9]{0,2})(?::(?:basename|sha256))?|"
+    r"param:[a-z][a-z0-9_-]{0,63}(?::(?:basename|sha256))?)\}"
 )
 _PYTHON_RE = re.compile(r"^(?:py|python|python3(?:\.\d+)?)$")
 _PY_SELECTOR_RE = re.compile(r"^-\d(?:\.\d+)?(?:-\d+)?$")
@@ -103,7 +110,8 @@ def _exact_keys(value: dict, allowed: set[str], label: str) -> None:
         raise WorkflowError(f"{label} contains unknown field(s): {', '.join(unknown)}")
 
 
-def _validate_template(value, label: str, *, allow_args: bool = True) -> str:
+def _validate_template(value, label: str, *, allow_args: bool = True,
+                       allow_parameters: bool = True) -> str:
     if not isinstance(value, str) or not value or len(value) > 4096:
         raise WorkflowError(f"{label} must be a non-empty string of at most 4096 characters")
     if "\x00" in value or any(ord(char) < 32 for char in value):
@@ -115,6 +123,8 @@ def _validate_template(value, label: str, *, allow_args: bool = True) -> str:
             raise WorkflowError(f"{label} contains an unresolved or unsupported placeholder: {token}")
         if not allow_args and token.startswith("{arg:"):
             raise WorkflowError(f"{label} may not depend on command arguments")
+        if not allow_parameters and token.startswith("{param:"):
+            raise WorkflowError(f"{label} may not depend on workflow parameters")
         cursor = match.end()
     if "{" in value[cursor:] or "}" in value[cursor:]:
         raise WorkflowError(f"{label} contains an unresolved or ambiguous placeholder")
@@ -122,6 +132,154 @@ def _validate_template(value, label: str, *, allow_args: bool = True) -> str:
     if "{" in without or "}" in without:
         raise WorkflowError(f"{label} contains an unresolved or ambiguous placeholder")
     return value
+
+
+def _compile_machine_template(value: str) -> str:
+    """Bind machine-local roots at validation/trust time, not from run-time env."""
+    if "{temp}" not in value:
+        return value
+    trusted_temp = os.path.realpath(os.path.abspath(tempfile.gettempdir()))
+    return value.replace("{temp}", trusted_temp)
+
+
+def _ordinary_data_file(path: str, label: str) -> tuple[str, bytes, str]:
+    absolute = os.path.abspath(os.path.expanduser(path))
+    try:
+        st = os.stat(absolute, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise WorkflowError(f"{label} must be an ordinary local file, not a link")
+        if st.st_size > MAX_MANIFEST_BYTES:
+            raise WorkflowError(f"{label} exceeds 256 KiB")
+        with open(absolute, "rb") as handle:
+            raw = handle.read(MAX_MANIFEST_BYTES + 1)
+    except OSError as exc:
+        raise WorkflowError(f"{label} could not be read: {exc}") from exc
+    return os.path.realpath(absolute), raw, hashlib.sha256(raw).hexdigest()
+
+
+def _enum_values(values, label: str) -> list[str]:
+    if not isinstance(values, list) or not values or len(values) > MAX_ENUM_VALUES:
+        raise WorkflowError(f"{label} must contain 1-{MAX_ENUM_VALUES} strings")
+    normalized = []
+    for index, value in enumerate(values):
+        if (not isinstance(value, str) or not value
+                or len(value.encode("utf-8")) > MAX_PARAMETER_BYTES
+                or any(ord(char) < 32 for char in value)):
+            raise WorkflowError(f"{label}[{index}] must be a non-empty bounded string")
+        normalized.append(value)
+    if len(normalized) != len(set(normalized)):
+        raise WorkflowError(f"{label} must contain unique values")
+    return normalized
+
+
+def _safe_regex(pattern, label: str) -> str:
+    if (not isinstance(pattern, str) or not pattern or len(pattern) > 256
+            or any(ord(char) < 32 for char in pattern)):
+        raise WorkflowError(f"{label} must be a non-empty regex of at most 256 characters")
+    # Runtime values are bounded, but reject constructs that can introduce
+    # backtracking surprises or executable-style regex extensions. Character
+    # classes, alternation, anchors, and ordinary quantifiers remain available.
+    if any(char in pattern for char in "()") or re.search(r"\\[1-9gk]", pattern):
+        raise WorkflowError(f"{label} uses unsupported grouping or backreferences")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise WorkflowError(f"{label} is invalid: {exc}") from exc
+    return pattern
+
+
+def _validate_parameters(value, manifest_path: str) -> dict:
+    if not isinstance(value, dict) or not value or len(value) > MAX_PARAMETERS:
+        raise WorkflowError(f"parameters must contain 1-{MAX_PARAMETERS} named definitions")
+    normalized = {}
+    manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
+    for name, spec in value.items():
+        label = f"parameters.{name}"
+        if not isinstance(name, str) or not _PARAMETER_RE.fullmatch(name):
+            raise WorkflowError(
+                "parameter names must start with a lowercase letter and contain "
+                "only lowercase letters, digits, '_' or '-'"
+            )
+        if not isinstance(spec, dict):
+            raise WorkflowError(f"{label} must be an object")
+        kind = spec.get("type")
+        if kind == "enum":
+            _exact_keys(spec, {"type", "values"}, label)
+            normalized[name] = {
+                "type": "enum", "values": _enum_values(spec.get("values"), f"{label}.values")
+            }
+        elif kind == "enum-file":
+            _exact_keys(spec, {"type", "source", "source_sha256", "format"}, label)
+            source = spec.get("source")
+            if (not isinstance(source, str) or not source
+                    or any(char in source for char in "*?[]{}")):
+                raise WorkflowError(f"{label}.source must be one literal file path")
+            source_path = source if os.path.isabs(source) else os.path.join(manifest_dir, source)
+            resolved, raw, actual = _ordinary_data_file(source_path, f"{label}.source")
+            wanted = str(spec.get("source_sha256") or "").lower()
+            if not _HASH_RE.fullmatch(wanted):
+                raise WorkflowError(f"{label}.source_sha256 must be a SHA-256")
+            if not hmac.compare_digest(wanted, actual):
+                raise WorkflowConflict(
+                    f"{label} source hash does not match the manifest",
+                    {"source": resolved, "expected": wanted, "actual": actual},
+                )
+            file_format = spec.get("format", "lines")
+            if file_format == "lines":
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeError as exc:
+                    raise WorkflowError(f"{label}.source must be UTF-8") from exc
+                values = [line.strip() for line in text.splitlines()
+                          if line.strip() and not line.lstrip().startswith("#")]
+            elif file_format == "json-array":
+                try:
+                    values = json.loads(raw.decode("utf-8-sig"))
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise WorkflowError(f"{label}.source must be a UTF-8 JSON array") from exc
+            else:
+                raise WorkflowError(f"{label}.format must be lines or json-array")
+            normalized[name] = {
+                "type": "enum", "values": _enum_values(values, f"{label}.source"),
+                "source": resolved, "source_sha256": actual, "format": file_format,
+            }
+        elif kind == "regex":
+            _exact_keys(spec, {"type", "pattern"}, label)
+            normalized[name] = {
+                "type": "regex", "pattern": _safe_regex(spec.get("pattern"), f"{label}.pattern")
+            }
+        elif kind == "integer":
+            _exact_keys(spec, {"type", "minimum", "maximum"}, label)
+            minimum, maximum = spec.get("minimum"), spec.get("maximum")
+            if (not isinstance(minimum, int) or isinstance(minimum, bool)
+                    or not isinstance(maximum, int) or isinstance(maximum, bool)
+                    or minimum > maximum):
+                raise WorkflowError(f"{label} requires integer minimum <= maximum")
+            normalized[name] = {
+                "type": "integer", "minimum": minimum, "maximum": maximum,
+            }
+        elif kind == "path":
+            _exact_keys(spec, {"type", "root", "must_exist", "kind"}, label)
+            root = _validate_template(
+                spec.get("root"), f"{label}.root", allow_args=False,
+                allow_parameters=False,
+            )
+            root = _compile_machine_template(root)
+            must_exist = spec.get("must_exist", True)
+            path_kind = spec.get("kind", "any")
+            if not isinstance(must_exist, bool):
+                raise WorkflowError(f"{label}.must_exist must be true or false")
+            if path_kind not in {"any", "file", "directory"}:
+                raise WorkflowError(f"{label}.kind must be any, file, or directory")
+            normalized[name] = {
+                "type": "path", "root": root, "must_exist": must_exist,
+                "kind": path_kind,
+            }
+        else:
+            raise WorkflowError(
+                f"{label}.type must be enum, enum-file, regex, integer, or path"
+            )
+    return normalized
 
 
 def _ordinary_script(path: str) -> str:
@@ -137,17 +295,20 @@ def _ordinary_script(path: str) -> str:
 
 def validate_manifest(value: dict, manifest_path: str) -> dict:
     """Validate and normalize a source manifest without granting it trust."""
-    _exact_keys(
-        value,
-        {"schema", "id", "description", "command", "allowed_roots", "outputs",
-         "observed_roots"},
-        "workflow manifest",
-    )
     schema = value.get("schema")
     if schema not in MANIFEST_SCHEMAS:
         raise WorkflowError(
-            f"workflow schema must be {MANIFEST_SCHEMA_V1!r} or {MANIFEST_SCHEMA!r}"
+            f"workflow schema must be one of {', '.join(sorted(MANIFEST_SCHEMAS))}"
         )
+    manifest_keys = {
+        "schema", "id", "description", "command", "allowed_roots", "outputs",
+        "observed_roots",
+    }
+    if schema == PARAMETERIZED_SCHEMA:
+        manifest_keys.add("parameters")
+    _exact_keys(
+        value, manifest_keys, "workflow manifest",
+    )
     workflow_id = value.get("id")
     if not isinstance(workflow_id, str) or not _ID_RE.fullmatch(workflow_id):
         raise WorkflowError("workflow id must be 1-128 lowercase letters, digits, '.', '_' or '-'")
@@ -159,7 +320,7 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
     if not isinstance(command, dict):
         raise WorkflowError("workflow command must be an object")
     command_keys = {"runtime", "script", "script_sha256"}
-    if schema == MANIFEST_SCHEMA:
+    if schema in {MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}:
         command_keys.add("args")
     _exact_keys(command, command_keys, "workflow command")
     runtime = command.get("runtime")
@@ -184,21 +345,59 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
             {"script": script_path, "expected": wanted_script_hash,
              "actual": actual_script_hash},
         )
+    parameters = _validate_parameters(value.get("parameters"), manifest_path) \
+        if schema == PARAMETERIZED_SCHEMA else {}
     bound_args = command.get("args", [])
-    if schema == MANIFEST_SCHEMA:
+    if schema in {MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}:
         if not isinstance(bound_args, list) or len(bound_args) > MAX_ARGS:
-            raise WorkflowError(f"workflow command.args must contain at most {MAX_ARGS} strings")
-        if any(not isinstance(arg, str) or "\x00" in arg
-               or any(ord(char) < 32 for char in arg) for arg in bound_args):
-            raise WorkflowError("workflow command.args must contain literal strings without controls")
-        if sum(len(arg.encode("utf-8")) for arg in bound_args) > MAX_ARG_BYTES:
+            raise WorkflowError(f"workflow command.args must contain at most {MAX_ARGS} entries")
+        normalized_args = []
+        referenced_parameters = set()
+        for index, arg in enumerate(bound_args):
+            if isinstance(arg, str):
+                if "\x00" in arg or any(ord(char) < 32 for char in arg):
+                    raise WorkflowError(
+                        f"workflow command.args[{index}] contains control characters"
+                    )
+                normalized_args.append(arg)
+                continue
+            if schema != PARAMETERIZED_SCHEMA or not isinstance(arg, dict):
+                raise WorkflowError(
+                    f"workflow command.args[{index}] must be a literal string"
+                )
+            _exact_keys(arg, {"parameter"}, f"workflow command.args[{index}]")
+            name = arg.get("parameter")
+            if name not in parameters:
+                raise WorkflowError(
+                    f"workflow command.args[{index}] references unknown parameter {name!r}"
+                )
+            normalized_args.append({"parameter": name})
+            referenced_parameters.add(name)
+        if schema == PARAMETERIZED_SCHEMA:
+            unused = sorted(set(parameters) - referenced_parameters)
+            if unused:
+                raise WorkflowError(
+                    "workflow parameters are not used by command.args: " + ", ".join(unused)
+                )
+        encoded_size = sum(
+            len(arg.encode("utf-8")) if isinstance(arg, str)
+            else len(arg["parameter"].encode("utf-8"))
+            for arg in normalized_args
+        )
+        if encoded_size > MAX_ARG_BYTES:
             raise WorkflowError("workflow command.args exceeds the 16 KiB limit")
+        bound_args = normalized_args
 
     roots = value.get("allowed_roots")
     if not isinstance(roots, list) or not roots or len(roots) > MAX_ROOTS:
         raise WorkflowError(f"allowed_roots must contain 1-{MAX_ROOTS} path templates")
     normalized_roots = [
-        _validate_template(item, f"allowed_roots[{index}]", allow_args=False)
+        _compile_machine_template(
+            _validate_template(
+                item, f"allowed_roots[{index}]", allow_args=False,
+                allow_parameters=False,
+            )
+        )
         for index, item in enumerate(roots)
     ]
     if len(normalized_roots) != len(set(normalized_roots)):
@@ -211,8 +410,13 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
     for index, item in enumerate(outputs):
         if not isinstance(item, dict):
             raise WorkflowError(f"outputs[{index}] must be an object")
-        _exact_keys(item, {"path", "expected"}, f"outputs[{index}]")
-        path_template = _validate_template(item.get("path"), f"outputs[{index}].path")
+        output_keys = {"path", "expected"}
+        if schema == PARAMETERIZED_SCHEMA:
+            output_keys.add("optional")
+        _exact_keys(item, output_keys, f"outputs[{index}]")
+        path_template = _compile_machine_template(
+            _validate_template(item.get("path"), f"outputs[{index}].path")
+        )
         literal_path = _PLACEHOLDER_RE.sub("", path_template)
         wildcard_positions = [
             position for position, char in enumerate(literal_path)
@@ -234,7 +438,13 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
         expected = _validate_template(
             item.get("expected", "any"), f"outputs[{index}].expected"
         )
-        normalized_outputs.append({"path": path_template, "expected": expected})
+        optional = item.get("optional", False)
+        if not isinstance(optional, bool):
+            raise WorkflowError(f"outputs[{index}].optional must be true or false")
+        normalized_outputs.append({
+            "path": path_template, "expected": expected,
+            **({"optional": optional} if schema == PARAMETERIZED_SCHEMA else {}),
+        })
 
     observed = value.get("observed_roots", [])
     if not isinstance(observed, list) or len(observed) > MAX_ROOTS:
@@ -246,8 +456,10 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
             raise WorkflowError(f"observed_roots[{index}] must be an object")
         _exact_keys(item, {"path", "patterns"}, f"observed_roots[{index}]")
         root = _validate_template(
-            item.get("path"), f"observed_roots[{index}].path", allow_args=False
+            item.get("path"), f"observed_roots[{index}].path", allow_args=False,
+            allow_parameters=False,
         )
+        root = _compile_machine_template(root)
         patterns = item.get("patterns", [])
         if not isinstance(patterns, list):
             raise WorkflowError(f"observed_roots[{index}].patterns must be an array")
@@ -275,8 +487,10 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
             "runtime": runtime,
             "script": script_path,
             "script_sha256": actual_script_hash,
-            **({"args": list(bound_args)} if schema == MANIFEST_SCHEMA else {}),
+            **({"args": list(bound_args)}
+               if schema in {MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA} else {}),
         },
+        **({"parameters": parameters} if schema == PARAMETERIZED_SCHEMA else {}),
         "allowed_roots": normalized_roots,
         "outputs": normalized_outputs,
         "observed_roots": normalized_observed,
@@ -303,8 +517,9 @@ def validate_manifest_file(path: str, expected_manifest_hash: str = "") -> dict:
         "schema": manifest["schema"],
         "manifest_sha256": actual,
         "script_sha256": manifest["command"]["script_sha256"],
-        "arguments_bound": manifest["schema"] == MANIFEST_SCHEMA,
+        "arguments_bound": manifest["schema"] in {MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA},
         "argument_count": len(manifest["command"].get("args", [])),
+        "parameter_count": len(manifest.get("parameters", {})),
         "outputs": len(manifest["outputs"]),
         "observed_roots": len(manifest.get("observed_roots", [])),
         "manifest": manifest,
@@ -703,14 +918,19 @@ def normalize_command(command: list[str], cwd: str) -> dict:
     }
 
 
-def command_for_manifest(manifest: dict) -> list[str]:
-    """Build a shell-free launcher for a v2 manifest's exact command contract."""
+def command_for_manifest(manifest: dict, resolved_args: Optional[list[str]] = None) -> list[str]:
+    """Build a shell-free launcher from one already-validated command contract."""
     command = manifest["command"]
-    if manifest.get("schema") != MANIFEST_SCHEMA:
+    if manifest.get("schema") == MANIFEST_SCHEMA_V1:
         raise WorkflowError("manifest v1 requires an explicit command after --")
     runtime = command["runtime"]
     script = command["script"]
-    args = list(command.get("args", []))
+    if manifest.get("schema") == PARAMETERIZED_SCHEMA:
+        if resolved_args is None:
+            raise WorkflowError("parameterized workflow requires resolved parameters")
+        args = list(resolved_args)
+    else:
+        args = list(command.get("args", []))
     if runtime == "python":
         return [sys.executable, script, *args]
     if runtime == "node":
@@ -727,14 +947,20 @@ def command_for_manifest(manifest: dict) -> list[str]:
 def _expand(template: str, context: dict, label: str) -> str:
     def replace(match):
         token = match.group(1)
-        if token in {"cwd", "script_dir", "script_name", "script_stem"}:
+        if token in {"cwd", "script_dir", "script_name", "script_stem", "temp"}:
             return context[token]
         parts = token.split(":")
-        index = int(parts[1])
-        args = context["args"]
-        if index >= len(args):
-            raise WorkflowError(f"{label} references missing command argument {index}")
-        value = args[index]
+        if parts[0] == "arg":
+            index = int(parts[1])
+            args = context["args"]
+            if index >= len(args):
+                raise WorkflowError(f"{label} references missing command argument {index}")
+            value = args[index]
+        else:
+            name = parts[1]
+            if name not in context.get("parameters", {}):
+                raise WorkflowError(f"{label} references missing workflow parameter {name!r}")
+            value = context["parameters"][name]
         if len(parts) == 3 and parts[2] == "basename":
             value = os.path.basename(value.rstrip("/\\"))
         elif len(parts) == 3 and parts[2] == "sha256":
@@ -762,6 +988,105 @@ def _resolved_path(template: str, context: dict, label: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(value)))
 
 
+def _validate_runtime_parameter(name: str, value, spec: dict, context: dict) -> str:
+    label = f"parameter {name!r}"
+    if (not isinstance(value, str) or not value
+            or len(value.encode("utf-8")) > MAX_PARAMETER_BYTES
+            or any(ord(char) < 32 for char in value)):
+        raise WorkflowError(f"{label} must be a non-empty bounded string")
+    kind = spec["type"]
+    if kind == "enum":
+        if value not in spec["values"]:
+            raise WorkflowTrustError(
+                f"{label} is not an approved enum value",
+                {"parameter": name, "allowed_count": len(spec["values"])},
+            )
+    elif kind == "regex":
+        if re.fullmatch(spec["pattern"], value) is None:
+            raise WorkflowTrustError(
+                f"{label} does not match its reviewed pattern",
+                {"parameter": name, "pattern": spec["pattern"]},
+            )
+    elif kind == "integer":
+        if re.fullmatch(r"-?(?:0|[1-9][0-9]*)", value) is None:
+            raise WorkflowTrustError(f"{label} must be a canonical integer")
+        number = int(value)
+        if number < spec["minimum"] or number > spec["maximum"]:
+            raise WorkflowTrustError(
+                f"{label} is outside its reviewed range",
+                {"parameter": name, "minimum": spec["minimum"],
+                 "maximum": spec["maximum"]},
+            )
+    elif kind == "path":
+        if any(char in value for char in "*?["):
+            raise WorkflowTrustError(f"{label} must be one literal path")
+        root = _resolved_path(spec["root"], context, f"parameters.{name}.root")
+        candidate = value if os.path.isabs(value) else os.path.join(context["cwd"], value)
+        candidate = os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+        if not _path_within(candidate, root):
+            raise WorkflowTrustError(
+                f"{label} resolves outside its reviewed root",
+                {"parameter": name, "path": candidate, "root": root},
+            )
+        if spec["must_exist"] and not os.path.lexists(candidate):
+            raise WorkflowTrustError(
+                f"{label} does not exist", {"parameter": name, "path": candidate},
+            )
+        if os.path.lexists(candidate):
+            if os.path.islink(candidate):
+                raise WorkflowTrustError(f"{label} must not resolve to a link")
+            if spec["kind"] == "file" and not os.path.isfile(candidate):
+                raise WorkflowTrustError(f"{label} must resolve to a file")
+            if spec["kind"] == "directory" and not os.path.isdir(candidate):
+                raise WorkflowTrustError(f"{label} must resolve to a directory")
+    else:  # authenticated records should never reach this branch
+        raise WorkflowTrustError(f"{label} has an unsupported trusted type")
+    return value
+
+
+def _resolve_parameter_args(manifest: dict, supplied: dict, context: dict,
+                            actual_args: Optional[list[str]] = None) -> tuple[list[str], dict]:
+    definitions = manifest.get("parameters", {})
+    if not isinstance(supplied, dict):
+        raise WorkflowError("workflow parameters must be a name-to-string object")
+    unknown = sorted(set(supplied) - set(definitions))
+    if unknown:
+        raise WorkflowTrustError("unknown workflow parameter(s): " + ", ".join(unknown))
+    contract = manifest["command"].get("args", [])
+    if actual_args is not None and len(actual_args) != len(contract):
+        raise WorkflowTrustError(
+            "command argument count does not match the parameterized workflow",
+            {"expected_count": len(contract), "actual_count": len(actual_args)},
+        )
+    captured = dict(supplied)
+    rendered = []
+    for index, item in enumerate(contract):
+        actual = actual_args[index] if actual_args is not None else None
+        if isinstance(item, str):
+            if actual_args is not None and actual != item:
+                raise WorkflowTrustError(
+                    f"command argument {index} does not match its reviewed literal"
+                )
+            rendered.append(item)
+            continue
+        name = item["parameter"]
+        if actual_args is not None:
+            if name in captured and captured[name] != actual:
+                raise WorkflowTrustError(
+                    f"command argument {index} conflicts with parameter {name!r}"
+                )
+            captured[name] = actual
+        if name not in captured:
+            raise WorkflowTrustError(f"missing required workflow parameter {name!r}")
+        value = _validate_runtime_parameter(name, captured[name], definitions[name], context)
+        captured[name] = value
+        rendered.append(value)
+    missing = sorted(set(definitions) - set(captured))
+    if missing:
+        raise WorkflowTrustError("missing workflow parameter(s): " + ", ".join(missing))
+    return rendered, captured
+
+
 def _expected_value(template: str, context: dict, path: str, label: str) -> str:
     value = _expand(template, context, label).strip().lower()
     if value in {"", "any"}:
@@ -779,17 +1104,36 @@ def _expected_value(template: str, context: dict, path: str, label: str) -> str:
     return value
 
 
-def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
+def resolve_run(workflow_id: str, command: list[str], cwd: str,
+                parameters: Optional[dict[str, str]] = None) -> dict:
     """Authenticate a trusted record and resolve exact run declarations."""
     working = os.path.realpath(os.path.abspath(os.path.expanduser(cwd or os.getcwd())))
     if not os.path.isdir(working):
         raise WorkflowError("workflow working directory does not exist")
     record = load_trusted(workflow_id)
     manifest = record["manifest"]
+    bound = manifest["command"]
+    supplied_parameters = dict(parameters or {})
+    provided_command = bool(command)
+    parameter_values = {}
+    parameter_context = {
+        "cwd": working,
+        "script_dir": os.path.dirname(bound["script"]),
+        "script_name": os.path.basename(bound["script"]),
+        "script_stem": os.path.splitext(os.path.basename(bound["script"]))[0],
+        "temp": os.path.realpath(os.path.abspath(tempfile.gettempdir())),
+        "args": [], "parameters": {},
+    }
+    if manifest.get("schema") == PARAMETERIZED_SCHEMA and not command:
+        rendered, parameter_values = _resolve_parameter_args(
+            manifest, supplied_parameters, parameter_context,
+        )
+        command = command_for_manifest(manifest, rendered)
+    elif supplied_parameters and manifest.get("schema") != PARAMETERIZED_SCHEMA:
+        raise WorkflowTrustError("this trusted workflow does not accept parameters")
     if not command:
         command = command_for_manifest(manifest)
     normalized = normalize_command(command, working)
-    bound = manifest["command"]
     if normalized["runtime"] != bound["runtime"]:
         raise WorkflowTrustError("command runtime does not match the trusted workflow")
     if os.path.normcase(normalized["script"]) != os.path.normcase(bound["script"]):
@@ -800,7 +1144,15 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
             {"script": normalized["script"], "expected": bound["script_sha256"],
              "actual": normalized["script_sha256"]},
         )
-    if manifest.get("schema") == MANIFEST_SCHEMA \
+    if manifest.get("schema") == PARAMETERIZED_SCHEMA and provided_command:
+        parameter_context["args"] = normalized["args"]
+        rendered, parameter_values = _resolve_parameter_args(
+            manifest, supplied_parameters, parameter_context,
+            actual_args=normalized["args"],
+        )
+        if rendered != normalized["args"]:  # defensive; binding already compares every slot
+            raise WorkflowTrustError("command arguments do not match the parameterized workflow")
+    elif manifest.get("schema") == MANIFEST_SCHEMA \
             and normalized["args"] != bound.get("args", []):
         raise WorkflowTrustError(
             "command arguments do not match the trusted workflow",
@@ -812,7 +1164,9 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
         "script_dir": os.path.dirname(normalized["script"]),
         "script_name": os.path.basename(normalized["script"]),
         "script_stem": os.path.splitext(os.path.basename(normalized["script"]))[0],
+        "temp": os.path.realpath(os.path.abspath(tempfile.gettempdir())),
         "args": normalized["args"],
+        "parameters": parameter_values,
     }
     roots = [
         _resolved_path(template, context, f"allowed_roots[{index}]")
@@ -824,7 +1178,7 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
     for root in roots:
         if os.path.lexists(root) and not os.path.isdir(root):
             raise WorkflowTrustError("permitted output root is not a directory", {"path": root})
-    outputs, expected = [], []
+    outputs, expected, optional_outputs = [], [], []
     for index, item in enumerate(manifest["outputs"]):
         path = _resolved_path(item["path"], context, f"outputs[{index}].path")
         if os.path.isdir(path):
@@ -837,6 +1191,7 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
                 "workflow output resolves outside its permitted roots", {"path": path}
             )
         outputs.append(path)
+        optional_outputs.append(bool(item.get("optional", False)))
         expected.append(_expected_value(
             item["expected"], context, path, f"outputs[{index}].expected"
         ))
@@ -861,9 +1216,11 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str) -> dict:
     return {
         "workflow": workflow_id, "command": command, "cwd": working,
         "outputs": outputs, "expected_hashes": expected,
+        "optional_outputs": optional_outputs,
         "output_roots": observed_roots, "output_patterns": patterns,
         "manifest_sha256": record["manifest_sha256"],
         "script_sha256": normalized["script_sha256"],
+        "parameters": parameter_values,
     }
 
 
@@ -880,11 +1237,29 @@ def matching_workflow(command: list[str], cwd: str) -> str:
             record = load_trusted(item["id"])
         except WorkflowError:
             continue
-        bound = record["manifest"]["command"]
-        if (bound["runtime"] == normalized["runtime"]
+        manifest = record["manifest"]
+        bound = manifest["command"]
+        if not (bound["runtime"] == normalized["runtime"]
                 and os.path.normcase(bound["script"]) == os.path.normcase(normalized["script"])
-                and hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"])
-                and (record["manifest"].get("schema") != MANIFEST_SCHEMA
-                     or bound.get("args", []) == normalized["args"])):
-            return item["id"]
+                and hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"])):
+            continue
+        if manifest.get("schema") == MANIFEST_SCHEMA \
+                and bound.get("args", []) != normalized["args"]:
+            continue
+        if manifest.get("schema") == PARAMETERIZED_SCHEMA:
+            context = {
+                "cwd": os.path.realpath(os.path.abspath(cwd or os.getcwd())),
+                "script_dir": os.path.dirname(normalized["script"]),
+                "script_name": os.path.basename(normalized["script"]),
+                "script_stem": os.path.splitext(os.path.basename(normalized["script"]))[0],
+                "temp": os.path.realpath(os.path.abspath(tempfile.gettempdir())),
+                "args": normalized["args"], "parameters": {},
+            }
+            try:
+                _resolve_parameter_args(
+                    manifest, {}, context, actual_args=normalized["args"],
+                )
+            except WorkflowError:
+                continue
+        return item["id"]
     return ""

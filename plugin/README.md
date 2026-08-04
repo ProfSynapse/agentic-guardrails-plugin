@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.21` is the Windows-first stable release.
+> **Release status:** `0.3.22` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -195,6 +195,12 @@ hash; `agw run --workflow ID` reconstructs that reviewed command without
 restating fragile Unicode paths. `agw workflow init` generates escaped v2 JSON,
 `validate` checks an inert manifest, and `status` compares it with this machine's
 sealed record. V1 remains readable for compatibility but does not bind arguments.
+Manifest v3 binds named typed parameters to reviewed argument positions. Run it
+with `agw run --workflow ID --param NAME=VALUE`; enum, hash-bound enum-file,
+conservative regex, integer-range, and bounded-path constraints are available.
+Unknown, missing, invalid, repositioned, or extra arguments are rejected before
+the script starts. Exact v3 outputs can be optional only when previously absent;
+removal of a pre-existing output still fails and remains recoverable.
 Explicit, bounded `--output-root` manifests detect unclaimed observed changes, and relative
 patterns can identify intentional companion files. This is after-the-fact
 detection, not prevention or recovery for unknown files, and it cannot prove
