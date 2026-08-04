@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -17,7 +18,8 @@ AGW_SOURCE = os.path.join(PLUGIN, "scripts", "agw", "agw.py")
 
 
 def _write_manifest(tmp_path, script, *, workflow_id="example.writer", outputs=None,
-                    roots=None, observed=None, schema="agw.workflow/v1", args=None):
+                    roots=None, observed=None, schema="agw.workflow/v1", args=None,
+                    parameters=None):
     manifest = {
         "schema": schema,
         "id": workflow_id,
@@ -33,8 +35,10 @@ def _write_manifest(tmp_path, script, *, workflow_id="example.writer", outputs=N
         ],
         "observed_roots": observed or [],
     }
-    if schema == "agw.workflow/v2":
+    if schema in {"agw.workflow/v2", "agw.workflow/v3"}:
         manifest["command"]["args"] = list(args or [])
+    if schema == "agw.workflow/v3":
+        manifest["parameters"] = dict(parameters or {})
     path = tmp_path / "workflow.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     digest = store.file_sha256(str(path))
@@ -670,3 +674,294 @@ def test_real_cli_v2_init_validate_status_and_bound_run(tmp_path):
     )
     assert executed.returncode == 0, executed.stderr
     assert output.read_text(encoding="utf-8") == "v2-ok"
+
+
+def test_v3_enum_parameter_binds_one_reviewed_argument_slot(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    script = tmp_path / "summon.py"
+    script.write_text(
+        "from pathlib import Path\nimport sys\n"
+        "assert sys.argv[1] == '--agent' and sys.argv[3] == '--read-only'\n"
+        "Path('state', sys.argv[2] + '.txt').write_text('loaded')\n",
+        encoding="utf-8",
+    )
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"agent": {"type": "enum", "values": ["alpha", "beta"]}},
+        args=["--agent", {"parameter": "agent"}, "--read-only"],
+        roots=["{cwd}/state"],
+        outputs=[{"path": "{cwd}/state/{param:agent}.txt", "expected": "absent"}],
+    )
+    _trust(manifest_path, digest)
+
+    resolved = workflows.resolve_run(
+        "example.writer", [], str(tmp_path), parameters={"agent": "beta"},
+    )
+    assert resolved["command"][-3:] == ["--agent", "beta", "--read-only"]
+    assert resolved["outputs"] == [str(state / "beta.txt")]
+    result = file_ops.run_declared(
+        resolved["command"], resolved["outputs"],
+        expected_hashes=resolved["expected_hashes"], cwd=resolved["cwd"],
+        optional_outputs=resolved["optional_outputs"],
+        allow_missing_output_parents=True,
+    )
+    assert result["ok"] is True
+    assert (state / "beta.txt").read_text(encoding="utf-8") == "loaded"
+
+    with pytest.raises(workflows.WorkflowTrustError, match="approved enum"):
+        workflows.resolve_run(
+            "example.writer", [], str(tmp_path), parameters={"agent": "query text"},
+        )
+    with pytest.raises(workflows.WorkflowTrustError, match="missing"):
+        workflows.resolve_run("example.writer", [], str(tmp_path), parameters={})
+    with pytest.raises(workflows.WorkflowTrustError, match="unknown"):
+        workflows.resolve_run(
+            "example.writer", [], str(tmp_path),
+            parameters={"agent": "alpha", "query": "anything"},
+        )
+
+
+def test_v3_rejects_extra_or_repositioned_explicit_arguments(tmp_path):
+    script = tmp_path / "summon.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"agent": {"type": "enum", "values": ["alpha"]}},
+        args=["--agent", {"parameter": "agent"}, "--read-only"],
+        outputs=[{"path": "{cwd}/marker.json", "expected": "any", "optional": True}],
+    )
+    _trust(manifest_path, digest)
+    with pytest.raises(workflows.WorkflowTrustError, match="count"):
+        workflows.resolve_run(
+            "example.writer",
+            [sys.executable, str(script), "--agent", "alpha", "--read-only", "query"],
+            str(tmp_path),
+        )
+    with pytest.raises(workflows.WorkflowTrustError, match="reviewed literal"):
+        workflows.resolve_run(
+            "example.writer",
+            [sys.executable, str(script), "alpha", "--agent", "--read-only"],
+            str(tmp_path),
+        )
+    assert workflows.matching_workflow(
+        [sys.executable, str(script), "--agent", "alpha", "--read-only"],
+        str(tmp_path),
+    ) == "example.writer"
+    assert workflows.matching_workflow(
+        [sys.executable, str(script), "--agent", "query", "--read-only"],
+        str(tmp_path),
+    ) == ""
+
+
+def test_v3_hash_bound_enum_file_is_compiled_into_trusted_record(tmp_path):
+    registry = tmp_path / "agents.txt"
+    registry.write_text("# reviewed slugs\nalpha\nbeta\n", encoding="utf-8")
+    script = tmp_path / "summon.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    parameter = {
+        "type": "enum-file", "source": registry.name,
+        "source_sha256": store.file_sha256(str(registry)), "format": "lines",
+    }
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"agent": parameter}, args=[{"parameter": "agent"}],
+        outputs=[{"path": "{cwd}/marker.json", "expected": "any", "optional": True}],
+    )
+    _trust(manifest_path, digest)
+    record = workflows.load_trusted("example.writer")
+    compiled = record["manifest"]["parameters"]["agent"]
+    assert compiled["type"] == "enum"
+    assert compiled["values"] == ["alpha", "beta"]
+
+    registry.write_text("alpha\ngamma\n", encoding="utf-8")
+    with pytest.raises(workflows.WorkflowConflict, match="source hash"):
+        workflows.validate_manifest_file(str(manifest_path))
+    resolved = workflows.resolve_run(
+        "example.writer", [], str(tmp_path), parameters={"agent": "beta"},
+    )
+    assert resolved["command"][-1] == "beta"
+
+
+def test_v3_regex_integer_and_bounded_path_parameters(tmp_path):
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    agent_file = agents / "alpha.txt"
+    agent_file.write_text("x", encoding="utf-8")
+    script = tmp_path / "typed.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={
+            "slug": {"type": "regex", "pattern": "[a-z][a-z0-9-]{0,31}"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 10},
+            "agent-file": {
+                "type": "path", "root": "{cwd}/agents",
+                "must_exist": True, "kind": "file",
+            },
+        },
+        args=[
+            "--slug", {"parameter": "slug"}, "--count", {"parameter": "count"},
+            "--file", {"parameter": "agent-file"},
+        ],
+        outputs=[{"path": "{cwd}/marker.json", "expected": "any", "optional": True}],
+    )
+    _trust(manifest_path, digest)
+    resolved = workflows.resolve_run(
+        "example.writer", [], str(tmp_path), parameters={
+            "slug": "agent-7", "count": "3", "agent-file": "agents/alpha.txt",
+        },
+    )
+    assert resolved["command"][-6:] == [
+        "--slug", "agent-7", "--count", "3", "--file", "agents/alpha.txt",
+    ]
+    with pytest.raises(workflows.WorkflowTrustError, match="outside"):
+        workflows.resolve_run(
+            "example.writer", [], str(tmp_path), parameters={
+                "slug": "agent-7", "count": "3", "agent-file": "../outside.txt",
+            },
+        )
+    with pytest.raises(workflows.WorkflowTrustError, match="range"):
+        workflows.resolve_run(
+            "example.writer", [], str(tmp_path), parameters={
+                "slug": "agent-7", "count": "99", "agent-file": "agents/alpha.txt",
+            },
+        )
+
+
+def test_optional_output_may_remain_absent_but_existing_output_may_not_disappear(tmp_path):
+    output = tmp_path / "optional.txt"
+    script = tmp_path / "optional.py"
+    script.write_text("pass\n", encoding="utf-8")
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"mode": {"type": "enum", "values": ["skip"]}},
+        args=[{"parameter": "mode"}],
+        outputs=[{"path": output.name, "expected": "any", "optional": True}],
+    )
+    _trust(manifest_path, digest)
+    resolved = workflows.resolve_run(
+        "example.writer", [], str(tmp_path), parameters={"mode": "skip"},
+    )
+    result = file_ops.run_declared(
+        resolved["command"], resolved["outputs"],
+        expected_hashes=resolved["expected_hashes"], cwd=resolved["cwd"],
+        optional_outputs=resolved["optional_outputs"],
+        allow_missing_output_parents=True,
+    )
+    assert result["ok"] is True
+    assert result["declared_outputs_missing"] == []
+
+    output.write_text("preserve", encoding="utf-8")
+    remover = tmp_path / "remover.py"
+    remover.write_text("from pathlib import Path\nPath('optional.txt').unlink()\n", encoding="utf-8")
+    second_path, second_digest, _ = _write_manifest(
+        tmp_path, remover, workflow_id="example.remover", schema="agw.workflow/v3",
+        parameters={"mode": {"type": "enum", "values": ["remove"]}},
+        args=[{"parameter": "mode"}],
+        outputs=[{"path": output.name, "expected": "present", "optional": True}],
+    )
+    _trust(second_path, second_digest)
+    resolved = workflows.resolve_run(
+        "example.remover", [], str(tmp_path), parameters={"mode": "remove"},
+    )
+    result = file_ops.run_declared(
+        resolved["command"], resolved["outputs"],
+        expected_hashes=resolved["expected_hashes"], cwd=resolved["cwd"],
+        optional_outputs=resolved["optional_outputs"],
+        allow_missing_output_parents=True,
+    )
+    assert result["ok"] is False
+    assert result["declared_outputs_missing"] == [str(output)]
+    assert store.list_versions(str(output))
+
+
+def test_real_cli_v3_compact_parameter_invocation(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    script = tmp_path / "summon.py"
+    script.write_text(
+        "from pathlib import Path\nimport sys\n"
+        "Path('state', sys.argv[1] + '.json').write_text('ok')\n",
+        encoding="utf-8",
+    )
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3", workflow_id="example.parameterized",
+        parameters={"agent": {"type": "enum", "values": ["alpha", "beta"]}},
+        args=[{"parameter": "agent"}], roots=["{cwd}/state"],
+        outputs=[{"path": "{cwd}/state/{param:agent}.json", "expected": "absent"}],
+    )
+    cli = os.path.join(PLUGIN, "scripts", "agw", "agw.py")
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "v3-agw-home"))
+    trusted = subprocess.run(
+        [sys.executable, cli, "workflow", "trust", str(manifest_path),
+         "--expected-manifest-hash", digest, "--approve-trust", "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert trusted.returncode == 0, trusted.stderr
+    executed = subprocess.run(
+        [sys.executable, cli, "run", "--workflow", "example.parameterized",
+         "--param", "agent=beta", "--cwd", str(tmp_path), "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert executed.returncode == 0, executed.stderr
+    data = json.loads(executed.stdout)
+    assert data["workflow_parameters"] == {"agent": "beta"}
+    assert (state / "beta.json").read_text(encoding="utf-8") == "ok"
+
+    duplicate = subprocess.run(
+        [sys.executable, cli, "run", "--workflow", "example.parameterized",
+         "--param", "agent=alpha", "--param", "agent=beta",
+         "--cwd", str(tmp_path), "--json"],
+        cwd=str(tmp_path), env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert duplicate.returncode != 0
+    assert json.loads(duplicate.stderr)["error"]["code"] == "workflow_error"
+    assert not (state / "alpha.json").exists()
+
+
+def test_v3_rejects_parameter_dependent_roots_and_unsafe_regex(tmp_path):
+    script = tmp_path / "typed.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, _digest, manifest = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"slug": {"type": "regex", "pattern": "(a+)+"}},
+        args=[{"parameter": "slug"}], roots=["{cwd}"],
+        outputs=[{"path": "{cwd}/out.txt", "expected": "any"}],
+    )
+    with pytest.raises(workflows.WorkflowError, match="grouping"):
+        workflows.validate_manifest(manifest, str(manifest_path))
+
+    manifest["parameters"]["slug"] = {"type": "enum", "values": ["alpha"]}
+    manifest["allowed_roots"] = ["{cwd}/{param:slug}"]
+    with pytest.raises(workflows.WorkflowError, match="may not depend"):
+        workflows.validate_manifest(manifest, str(manifest_path))
+
+
+def test_v3_temp_placeholder_is_compiled_into_machine_local_trust(tmp_path):
+    script = tmp_path / "typed.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, schema="agw.workflow/v3",
+        parameters={"slug": {"type": "enum", "values": ["alpha"]}},
+        args=[{"parameter": "slug"}], roots=["{temp}/agw-v3-cache"],
+        outputs=[{
+            "path": "{temp}/agw-v3-cache/{param:slug}.txt",
+            "expected": "any", "optional": True,
+        }],
+    )
+    _trust(manifest_path, digest)
+    record = workflows.load_trusted("example.writer")
+    serialized = json.dumps(record["manifest"])
+    assert "{temp}" not in serialized
+    assert os.path.realpath(tempfile.gettempdir()) in record["manifest"]["allowed_roots"][0]
+
+
+def test_source_run_help_discloses_only_compact_parameter_option():
+    completed = subprocess.run(
+        [sys.executable, AGW_SOURCE, "run", "--help"],
+        text=True, capture_output=True, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--param NAME=VALUE" in completed.stdout
+    assert "typed value; repeat" in completed.stdout

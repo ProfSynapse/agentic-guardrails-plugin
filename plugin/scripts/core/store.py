@@ -28,23 +28,8 @@ _WINDOWS_SHARING_WINERRORS = {32, 33}
 
 
 def _ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
-    """Create one directory, tolerating only bounded Windows creation races."""
-    deadline = time.monotonic() + max(0.0, retry_seconds)
-    while True:
-        try:
-            os.makedirs(path, exist_ok=True)
-            return path
-        except PermissionError:
-            # Concurrent makedirs calls can transiently report EACCES on
-            # Windows while another thread publishes the shared parent. Never
-            # treat an unverified path as success and never retry indefinitely.
-            if os.name != "nt":
-                raise
-            if os.path.isdir(path):
-                return path
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.01)
+    """Compatibility wrapper around the transaction layer's shared helper."""
+    return archive_tx.ensure_directory(path, retry_seconds=retry_seconds)
 
 
 def _lock_contention(exc: OSError, path: str) -> bool:

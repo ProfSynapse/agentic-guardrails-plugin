@@ -30,7 +30,7 @@ continuations; never guess a larger budget.
 | Read or change a text file | Exact `file <operation> --help` | None |
 | Change dependent text files together | `file plan --help`, then `file apply-plan --help` | None |
 | Run a one-off write-capable script | `run --help`; declare exact outputs | [recovery.md](references/recovery.md) |
-| Run a versioned workflow | `run --workflow ID -- ...` | [trusted-workflows.md](references/trusted-workflows.md) |
+| Run a versioned workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` values | [trusted-workflows.md](references/trusted-workflows.md) |
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
 | Publish a validated staged artifact | `publish-file --help` | [synced-folders.md](references/synced-folders.md) |
@@ -40,6 +40,8 @@ continuations; never guess a larger budget.
 
 Exact run outputs do not enumerate siblings. Repeated scripts need an approved,
 hash-bound workflow; observed roots detect sidecars but are not pre-images.
+Parameterized workflows accept values only in typed, reviewed argument slots;
+never append unbound flags or query text after the trusted command.
 `run --dry-run` is contract-only. For multi-file work, retain and apply the exact
 plan hash instead of issuing independent mutations.
 

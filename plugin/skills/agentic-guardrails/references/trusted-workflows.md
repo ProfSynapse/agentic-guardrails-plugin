@@ -1,38 +1,32 @@
 # Trusted write workflows
 
-Use v2 for reviewed Python, Node, or PowerShell scripts with deterministic
-arguments and outputs. Repository manifests stay inert until user-confirmed trust.
-
-1. Generate: `agw workflow init --help` (hashes the script and escapes Unicode).
-2. Check: `agw workflow validate MANIFEST --json`.
-3. Review and trust with the exact manifest hash: `agw workflow trust --help`.
-4. Run without restating the command: `agw run --workflow ID`.
-5. On another machine, use `agw workflow status MANIFEST` before running.
+Trust seals script/manifest hashes, arguments, and outputs locally; repository
+manifests remain inert until approved. V2 is exact; v3 adds typed slots:
 
 ```json
-{
-  "schema":"agw.workflow/v2",
-  "id":"org.example.index",
-  "description":"Rebuild one index",
-  "command":{"runtime":"python","script":"scripts/index.py",
-    "script_sha256":"SHA256","args":["--output","state/index.md"]},
-  "allowed_roots":["{cwd}/state"],
-  "outputs":[{"path":"{cwd}/state/index.md","expected":"present"}],
-  "observed_roots":[]
-}
+{"schema":"agw.workflow/v3","id":"org.example.load",
+ "command":{"runtime":"python","script":"load.py","script_sha256":"SHA256",
+ "args":["--profile",{"parameter":"profile"},"--read-only"]},
+ "parameters":{"profile":{"type":"enum","values":["alpha","beta"]}},
+ "allowed_roots":["{cwd}/state"],
+ "outputs":[{"path":"{cwd}/state/marker.json","expected":"any"}]}
 ```
 
-Arguments are exact and hash-bound with the manifest. Supplying different or
-extra arguments fails closed. V1 remains readable for compatibility but does not
-bind arguments; migrate reusable workflows with `workflow init`.
+Run `agw run --workflow org.example.load --param profile=alpha`. Repeat
+`--param`; missing, unknown, duplicate, invalid, moved, or extra values fail
+before execution. Explicit commands must match every trusted slot.
 
-Placeholders: `{cwd}`, `{script_dir}`, `{script_name}`, `{script_stem}`,
-`{arg:N}`, `{arg:N:basename}`, `{arg:N:sha256}`. Roots cannot use arguments.
-`expected` is `any`, `absent`, `present`, or a SHA-256. No code is evaluated.
+Types: reviewed `enum`; hash-bound UTF-8 `enum-file` (`lines`/`json-array`);
+bounded `regex`; ranged canonical `integer`; and literal `path` under `root`.
 
-Exact outputs get pre-images/tombstones. Observed roots only detect later
-changes; patterns are not pre-imaged. Tampering, script drift, wildcards,
-ambiguity, traversal, and out-of-root paths fail closed. Keep machine-local
-`AGW_HOME` private and outside synced folders; its seal is not an OS sandbox.
-`--progress` reports trust phases; lock wait is 10s. Reads on a stalled virtual
-filesystem are not yet hard-bounded.
+Templates support `{param:NAME}` plus `:basename`/`:sha256`; existing path and
+`{arg:N}` forms remain. Parameters cannot widen roots. `{temp}` is compiled into
+machine-local trust, not re-read from the execution environment.
+
+`"optional":true` lets an absent output stay absent; existing files remain
+protected. Observed roots cover ephemeral sidecars without unknown pre-images.
+
+`expected`: `any`, `absent`, `present`, or SHA-256. No code is evaluated.
+Tampering, drift, wildcards, duplicates, traversal, and ambiguity fail closed.
+V1 remains readable but unbound; v2 remains exact. Keep `AGW_HOME` private and
+outside synced folders. Its seal is not an OS sandbox.

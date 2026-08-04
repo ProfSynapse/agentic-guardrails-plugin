@@ -26,6 +26,23 @@ class SimulatedCrash(RuntimeError):
     """Test-only fault used to exercise durable transition recovery."""
 
 
+def ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
+    """Create one directory with a bounded retry for Windows publication races."""
+    deadline = time.monotonic() + max(0.0, retry_seconds)
+    while True:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            if os.path.isdir(path):
+                return path
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def canonical_path(path: str) -> str:
     absolute = os.path.abspath(str(path))
     # realpath follows Windows junctions and can block on an unavailable
@@ -126,8 +143,7 @@ def _validate_junction_command_paths(path: str, target: str):
 
 def _root(home: str) -> str:
     path = os.path.join(home, "transactions")
-    os.makedirs(path, exist_ok=True)
-    return path
+    return ensure_directory(path)
 
 
 def _manifest_path(home: str, transaction_id: str) -> str:
@@ -479,7 +495,7 @@ def _quarantine(home: str, record: dict) -> str:
     if not temp or not os.path.lexists(temp):
         return record.get("quarantine", "")
     directory = os.path.join(home, "quarantine")
-    os.makedirs(directory, exist_ok=True)
+    ensure_directory(directory)
     destination = os.path.join(
         directory, f"{record['transaction_id']}__{os.path.basename(temp)}"
     )
@@ -596,7 +612,7 @@ def publish_restore(home: str, entry: dict, target: str):
     _kind, digest, size = _artifact_fingerprint(source, artifact_kind)
     source_kind = record.get("source_kind", artifact_kind)
     parent = os.path.dirname(os.path.abspath(target))
-    os.makedirs(parent, exist_ok=True)
+    ensure_directory(parent)
     temp = os.path.join(parent, f".{os.path.basename(target)}.{uuid.uuid4().hex}.restore")
     if artifact_kind == "link-metadata":
         with open(source, encoding="utf-8") as handle:

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import traceback
 
 import pytest
 
@@ -298,7 +299,8 @@ def test_agw_home_inside_snapshot_source_is_explicitly_excluded(tmp_path, monkey
     assert not (artifact / ".agw").exists()
 
 
-def test_concurrent_archives_have_unique_transaction_ids(tmp_path):
+@pytest.mark.parametrize("_round", range(4))
+def test_concurrent_archives_have_unique_transaction_ids(tmp_path, _round):
     sources = []
     for index in range(16):
         source = tmp_path / f"concurrent-{index}.txt"
@@ -312,16 +314,36 @@ def test_concurrent_archives_have_unique_transaction_ids(tmp_path):
             transaction_ids.append(
                 store.archive_file(str(source), mode="copy")["transaction_id"]
             )
-        except Exception as exc:
-            errors.append(exc)
+        except Exception:
+            errors.append(traceback.format_exc())
 
     threads = [threading.Thread(target=archive, args=(source,)) for source in sources]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    assert not errors
+    assert not errors, "\n".join(errors)
     assert len(transaction_ids) == len(set(transaction_ids)) == len(sources)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory publication semantics")
+def test_transaction_root_retries_transient_windows_directory_denial(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    real_makedirs = archive_tx.os.makedirs
+    attempts = 0
+
+    def denied_then_create(path, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(13, "simulated transaction-directory race")
+        return real_makedirs(path, *args, **kwargs)
+
+    monkeypatch.setattr(archive_tx.os, "makedirs", denied_then_create)
+    assert archive_tx._root(str(home)) == str(home / "transactions")
+    assert (home / "transactions").is_dir()
+    assert attempts == 2
 
 
 def test_nonregular_source_is_rejected(tmp_path, monkeypatch):

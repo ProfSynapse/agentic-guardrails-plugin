@@ -971,6 +971,7 @@ def run_declared(
     dry_run: bool = False,
     output_roots: Optional[list[str]] = None,
     output_patterns: Optional[list[str]] = None,
+    optional_outputs: Optional[list[bool]] = None,
     max_observed_files: int = 20_000,
     max_observed_depth: int = 8,
     allow_missing_output_parents: bool = False,
@@ -995,6 +996,15 @@ def run_declared(
         )
     if not expected_hashes:
         expected_hashes = [""] * len(targets)
+    optional_outputs = list(optional_outputs or [])
+    if optional_outputs and len(optional_outputs) != len(targets):
+        raise FileOperationError(
+            "optional-output declarations must align with exact outputs"
+        )
+    if not optional_outputs:
+        optional_outputs = [False] * len(targets)
+    if any(not isinstance(value, bool) for value in optional_outputs):
+        raise FileOperationError("optional-output declarations must be booleans")
     working = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     if not os.path.isdir(working):
         raise FileOperationError("run working directory does not exist")
@@ -1013,8 +1023,8 @@ def run_declared(
             for path, expected in zip(targets, expected_hashes)
         ]
         preview = [
-            {"path": path, "before_hash": digest or "absent"}
-            for path, digest in zip(targets, before)
+            {"path": path, "before_hash": digest or "absent", "optional": optional}
+            for path, digest, optional in zip(targets, before, optional_outputs)
         ]
         if dry_run:
             observation = _observe_requested_roots(
@@ -1078,8 +1088,11 @@ def run_declared(
             undeclared.append(change)
         output_results = []
         missing_outputs = []
-        for path, old, new, receipt in zip(targets, before, after, receipts):
-            if old is None and new is None:
+        for path, old, new, receipt, optional in zip(
+                targets, before, after, receipts, optional_outputs):
+            # Optional means an output that was absent may remain absent. It
+            # never makes deletion of a pre-existing output successful.
+            if new is None and (old is not None or not optional):
                 missing_outputs.append(path)
             output_results.append({
                 "path": path,
@@ -1088,6 +1101,7 @@ def run_declared(
                 "changed": old != new,
                 "snapshot_transaction_id": receipt.transaction_id,
                 "snapshot_state": receipt.state,
+                "optional": optional,
             })
         store.oplog_append({
             "op": "declared-run", "command": command[0], "cwd": working,
