@@ -1,6 +1,7 @@
 """Release-blocking parity contracts for maintained and planned hosts."""
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -138,6 +139,39 @@ def test_short_launcher_expansion_is_exact_and_boundary_aware():
         assert launcher.rewrite_shortcut(
             command, str(PLUGIN), platform="posix", shell="posix"
         ) is None
+
+
+def test_trusted_workflow_rewrite_encodes_exact_original_argv():
+    original = 'python "writer script.py" --profile alpha'
+    posix = launcher.rewrite_trusted_workflow(
+        original, "example.writer", str(PLUGIN), platform="posix", shell="posix",
+    )
+    argv = shlex.split(posix)
+    assert argv[1] == "--agw-argv-b64"
+    assert launcher.decode_internal_argv(argv[1:]) == [
+        "run", "--workflow", "example.writer", "--",
+        "python", "writer script.py", "--profile", "alpha",
+    ]
+
+    windows = launcher.rewrite_trusted_workflow(
+        original, "example.writer", str(PLUGIN), platform="nt", shell="powershell",
+    )
+    payload = windows.rsplit("'", 2)[1]
+    assert launcher.decode_internal_argv(["--agw-argv-b64", payload]) == [
+        "run", "--workflow", "example.writer", "--",
+        "python", "writer script.py", "--profile", "alpha",
+    ]
+
+
+def test_trusted_workflow_rewrite_refuses_compound_or_invalid_input():
+    assert launcher.rewrite_trusted_workflow(
+        "python writer.py; rm output.txt", "example.writer", str(PLUGIN),
+        platform="posix", shell="posix",
+    ) is None
+    assert launcher.rewrite_trusted_workflow(
+        "python writer.py", "INVALID WORKFLOW", str(PLUGIN),
+        platform="posix", shell="posix",
+    ) is None
 
 
 def test_windows_short_launcher_rewrites_literal_pipeline_receiver():

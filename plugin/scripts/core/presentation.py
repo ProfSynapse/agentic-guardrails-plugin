@@ -48,6 +48,11 @@ _COPY_BY_RULE = {
         "This stores a persistent, hash-bound output contract after review.",
         "The matching script may later change its declared outputs without a new trust prompt.",
     ),
+    "builtin:script-write-ambiguous": (
+        "The agent wants to run a script with ambiguous write-like source evidence.",
+        "Guardrails found a possible write call but could not confirm this invocation writes files.",
+        "The script could change files that have no verified recovery copy.",
+    ),
     "builtin:patch-opaque": (
         "The agent wants to apply a file change whose targets are unclear.",
         "Guardrails could not identify every file in the proposed change.",

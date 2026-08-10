@@ -10,7 +10,7 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [../docs/plans/0001-cowork-hook-enablement.md](../docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.3.22` is the Windows-first stable release.
+> **Release status:** `0.3.23` is the Windows-first stable release.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -110,6 +110,7 @@ so the agent self-corrects instead of fighting the rails:
 | several dependent text edits | `agw file plan` then `agw file apply-plan` |
 | unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
+| discover an existing script contract | `agw workflow match -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 
@@ -175,6 +176,12 @@ output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders and need not be inside an observed root, so unrelated app
 or sync-client updates are ignored. A recoverable state file can therefore be
 paired with a separate, narrowly patterned cache root.
+Before direct script execution, `agw workflow match -- <command>` checks verified
+machine-local records for the exact runtime, script path, script hash, and bound
+arguments. A single exact match can be routed automatically by supported hooks;
+multiple matches remain explicit. Ambiguous source-only write evidence reports
+the triggering line and primitive, requires one-run review in standard mode,
+stays blocked in strict mode, and is shadowed in observe mode.
 For dependent changes across several UTF-8 files, `agw file plan` validates a
 version-1 JSON list of `write`, `patch`, and `replace` operations and writes a
 self-contained proposal without changing the targets. `agw file apply-plan`

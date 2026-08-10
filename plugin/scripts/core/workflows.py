@@ -1224,12 +1224,13 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str,
     }
 
 
-def matching_workflow(command: list[str], cwd: str) -> str:
-    """Return a valid trusted integration id for remediation, or an empty string."""
+def matching_workflows(command: list[str], cwd: str) -> list[str]:
+    """Return every authenticated workflow matching one exact command."""
     try:
         normalized = normalize_command(command, cwd)
     except WorkflowError:
-        return ""
+        return []
+    matches = []
     for item in list_trusted():
         if not item.get("verified"):
             continue
@@ -1261,5 +1262,11 @@ def matching_workflow(command: list[str], cwd: str) -> str:
                 )
             except WorkflowError:
                 continue
-        return item["id"]
-    return ""
+        matches.append(item["id"])
+    return matches
+
+
+def matching_workflow(command: list[str], cwd: str) -> str:
+    """Return one unambiguous authenticated workflow, or an empty string."""
+    matches = matching_workflows(command, cwd)
+    return matches[0] if len(matches) == 1 else ""

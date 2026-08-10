@@ -120,6 +120,184 @@ def test_versioned_ruby_read_only_script_is_not_misclassified(tmp_path):
     assert plan.complete is True
 
 
+def test_python_comments_docstrings_and_strings_do_not_trigger_output_gate(tmp_path):
+    script = tmp_path / "reader.py"
+    script.write_text(
+        '"""Example only: Path("out.txt").write_text("x")"""\n'
+        "# open('out.txt', 'w').write('x')\n"
+        "print('.save( is documentation, not a call')\n",
+        encoding="utf-8",
+    )
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell",
+        command=f'python "{script}"', cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete is True
+    assert plan.mutating is False
+    assert plan.evidence == {}
+
+
+@pytest.mark.parametrize("launcher,name,source", [
+    ("node", "reader.js",
+     "// writeFileSync('out.txt', 'x')\n"
+     "/* writeFileSync('out.txt', 'x') */\n"
+     "console.log(\"writeFileSync('out.txt', 'x')\")\n"),
+    ("ruby", "reader.rb",
+     "# File.write('out.txt', 'x')\n"
+     "=begin\nFile.write('out.txt', 'x')\n=end\n"
+     "puts \"File.write('out.txt', 'x')\"\n"),
+    ("php", "reader.php",
+     "<?php // file_put_contents('out.txt', 'x')\n"
+     "/* file_put_contents('out.txt', 'x') */\n"
+     "echo \"file_put_contents('out.txt', 'x')\"; ?>\n"),
+    ("powershell -File", "reader.ps1",
+     "# Set-Content -LiteralPath out.txt -Value x\n"
+     "<# Set-Content -LiteralPath out.txt -Value x #>\n"
+     "Write-Output \"Set-Content -LiteralPath out.txt -Value x\"\n"),
+    ("bash", "reader.sh",
+     "# touch out.txt\n"
+     "cat <<'EOF'\ntouch heredoc-is-data.txt\nEOF\n"
+     "cat <<'EOF'\n$(touch literal-substitution.txt)\nEOF\n"
+     "cat <<EOF\ntouch expanded-heredoc-is-still-data.txt\nEOF\n"
+     "printf '%s\\n' '; touch out.txt'\n"),
+])
+def test_non_python_comments_and_strings_do_not_trigger_output_gate(
+        tmp_path, launcher, name, source):
+    script = tmp_path / name
+    script.write_text(source, encoding="utf-8")
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell" if name.endswith(".ps1") else "Bash",
+        command=f'{launcher} "{script}"', cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete is True
+    assert plan.mutating is False
+    assert plan.evidence == {}
+
+
+@pytest.mark.parametrize("launcher,name,source", [
+    ("node", "dynamic.js", "eval(\"writeFileSync('out.txt', 'x')\")\n"),
+    ("ruby", "dynamic.rb", "eval \"File.write('out.txt', 'x')\"\n"),
+    ("php", "dynamic.php", "<?php eval(\"file_put_contents('out.txt', 'x')\"); ?>\n"),
+    ("powershell -File", "dynamic.ps1",
+     "Invoke-Expression \"Set-Content -LiteralPath out.txt -Value x\"\n"),
+    ("bash", "dynamic.sh", "eval '; touch out.txt'\n"),
+])
+def test_non_python_dynamic_evaluation_keeps_write_evidence(
+        tmp_path, launcher, name, source):
+    script = tmp_path / name
+    script.write_text(source, encoding="utf-8")
+    plan = mutations.plan([
+        ToolEvent(
+            kind=EXEC, tool="PowerShell" if name.endswith(".ps1") else "Bash",
+            command=f'{launcher} "{script}"', cwd=str(tmp_path),
+        )
+    ], engine.clobber_targets)
+    assert plan.complete is False
+    assert plan.review_required is False
+    assert plan.evidence["confidence"] == "high"
+
+
+@pytest.mark.parametrize("launcher,name,source", [
+    ("node", "interpolated.js",
+     "console.log(`${writeFileSync('out.txt', 'x')}`)\n"),
+    ("ruby", "interpolated.rb", "puts \"#{File.write('out.txt', 'x')}\"\n"),
+    ("powershell -File", "interpolated.ps1",
+     "Write-Output \"$(Set-Content -LiteralPath out.txt -Value x)\"\n"),
+    ("bash", "interpolated.sh", "printf '%s\\n' \"$(touch out.txt)\"\n"),
+])
+def test_interpolated_expressions_keep_write_evidence(
+        tmp_path, launcher, name, source):
+    script = tmp_path / name
+    script.write_text(source, encoding="utf-8")
+    plan = mutations.plan([
+        ToolEvent(
+            kind=EXEC, tool="PowerShell" if name.endswith(".ps1") else "Bash",
+            command=f'{launcher} "{script}"', cwd=str(tmp_path),
+        )
+    ], engine.clobber_targets)
+    assert plan.complete is False
+    assert plan.review_required is False
+    assert plan.evidence["confidence"] == "high"
+
+
+def test_unquoted_shell_heredoc_command_substitution_keeps_write_evidence(tmp_path):
+    script = tmp_path / "dynamic-heredoc.sh"
+    script.write_text(
+        "cat <<EOF\n$(touch out.txt)\nEOF\n",
+        encoding="utf-8",
+    )
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="Bash", command=f'bash "{script}"',
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.complete is False
+    assert plan.review_required is False
+    assert plan.evidence["confidence"] == "high"
+
+
+def test_generic_python_save_is_reviewable_and_reports_exact_evidence(tmp_path):
+    script = tmp_path / "model.py"
+    script.write_text(
+        "class Model:\n"
+        "    def save(self):\n"
+        "        return True\n"
+        "Model().save()\n",
+        encoding="utf-8",
+    )
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell",
+        command=f'python "{script}"', cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating is True
+    assert plan.complete is False
+    assert plan.review_required is True
+    assert plan.evidence["confidence"] == "low"
+    assert plan.evidence["primitive"] == "save"
+    assert plan.evidence["line"] == 4
+    assert plan.evidence["sha256"] in plan.reason
+
+
+def test_confirmed_python_write_reports_line_and_primitive(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    event = ToolEvent(
+        kind=EXEC, tool="PowerShell",
+        command=f'python "{script}"', cwd=str(tmp_path),
+    )
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.mutating is True
+    assert plan.complete is False
+    assert plan.review_required is False
+    assert plan.evidence["confidence"] == "high"
+    assert plan.evidence["primitive"] == "write_text"
+    assert plan.evidence["line"] == 2
+    assert "write_text" in plan.reason
+
+
+@pytest.mark.parametrize("source,primitive", [
+    ("from pathlib import Path\nPath('out.txt').open('w')\n", "open"),
+    ("exec(\"open('out.txt', 'w').write('x')\")\n", "exec"),
+])
+def test_python_indirect_write_forms_remain_confirmed(tmp_path, source, primitive):
+    script = tmp_path / "writer.py"
+    script.write_text(source, encoding="utf-8")
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="PowerShell",
+                  command=f'python "{script}"', cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.complete is False
+    assert plan.review_required is False
+    assert plan.evidence["confidence"] == "high"
+    assert primitive in plan.evidence["primitive"]
+
+
 @pytest.mark.parametrize("args", [
     ["--help"],
     ["checkout", "--help"],
@@ -463,6 +641,35 @@ def test_direct_script_with_trusted_contract_is_still_blocked_with_wrapper_hint(
     assert "agw run --workflow example.writer" in plan.reason
 
 
+def test_matching_workflow_is_ambiguity_safe(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    for workflow_id in ("example.alpha", "example.beta"):
+        manifest_path, digest, _ = _write_manifest(
+            tmp_path, script, workflow_id=workflow_id,
+            schema="agw.workflow/v2", args=["out.txt"],
+            outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+        )
+        _trust(manifest_path, digest)
+    command = [sys.executable, str(script), "out.txt"]
+    assert set(workflows.matching_workflows(command, str(tmp_path))) == {
+        "example.alpha", "example.beta",
+    }
+    assert workflows.matching_workflow(command, str(tmp_path)) == ""
+    shell_command = subprocess.list2cmdline(command) if os.name == "nt" \
+        else shlex.join(command)
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="PowerShell" if os.name == "nt" else "Bash",
+                  command=shell_command, cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.complete is False
+    assert "multiple trusted output contracts" in plan.reason
+    assert "example.alpha" in plan.reason and "example.beta" in plan.reason
+
+
 def test_engine_requires_confirmation_to_install_trust_but_allows_inspection(policy):
     launcher = os.path.join(PLUGIN, "bin", "agw.cmd" if os.name == "nt" else "agw")
     trust = engine.evaluate(
@@ -476,11 +683,160 @@ def test_engine_requires_confirmation_to_install_trust_but_allows_inspection(pol
                   cwd=os.getcwd()),
         policy, PLUGIN,
     )
+    matching = engine.evaluate(
+        ToolEvent(kind=EXEC, tool="Bash",
+                  command=f'"{launcher}" workflow match -- python writer.py',
+                  cwd=os.getcwd()),
+        policy, PLUGIN,
+    )
     assert trust.action == ASK
     assert trust.rule_id == "builtin:agw-workflow-trust"
     assert trust.presentation_details["targets"] == ["contract.json"]
     assert trust.presentation_details["target_kind"] == "file"
     assert listing.action == ALLOW
+    assert matching.action == ALLOW
+
+
+def test_workflow_match_cli_returns_description_and_suggested_argv(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, workflow_id="example.cli-match",
+        schema="agw.workflow/v2", args=["out.txt"],
+        outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+    )
+    _trust(manifest_path, digest)
+    command = [sys.executable, str(script), "out.txt"]
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "match", "--json",
+         "--cwd", str(tmp_path), "--", *command],
+        text=True, encoding="utf-8", capture_output=True, check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["matches"][0]["id"] == "example.cli-match"
+    assert payload["matches"][0]["description"] == "test writer"
+    assert payload["suggested_argv"] == [
+        "agw", "run", "--workflow", "example.cli-match", "--", *command,
+    ]
+
+    listing = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "list"],
+        text=True, capture_output=True, check=True,
+    )
+    assert "example.cli-match - test writer" in listing.stdout
+
+
+def test_workflow_match_cli_reports_zero_matches(tmp_path):
+    script = tmp_path / "reader.py"
+    script.write_text("print('read only')\n", encoding="utf-8")
+    command = [sys.executable, str(script), "🗺 no-match"]
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "match", "--json",
+         "--cwd", str(tmp_path), "--", *command],
+        text=True, encoding="utf-8", capture_output=True, check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["matches"] == []
+    assert payload["count"] == 0
+    assert payload["suggested_argv"] == []
+    assert payload["command"] == command
+
+
+def test_workflow_match_cli_preserves_unicode_arguments(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    unicode_arg = "🗺 clients/日本語"
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, workflow_id="example.unicode-match",
+        schema="agw.workflow/v2", args=[unicode_arg],
+        outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+    )
+    _trust(manifest_path, digest)
+    command = [sys.executable, str(script), unicode_arg]
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "match", "--json",
+         "--cwd", str(tmp_path), "--", *command],
+        text=True, encoding="utf-8", capture_output=True, check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["command"] == command
+    assert payload["suggested_argv"][-len(command):] == command
+
+
+def test_workflow_match_cli_keeps_multiple_matches_explicit(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    for workflow_id in ("example.cli-alpha", "example.cli-beta"):
+        manifest_path, digest, _ = _write_manifest(
+            tmp_path, script, workflow_id=workflow_id,
+            schema="agw.workflow/v2", args=["out.txt"],
+            outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+        )
+        _trust(manifest_path, digest)
+    command = [sys.executable, str(script), "out.txt"]
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "match", "--json",
+         "--cwd", str(tmp_path), "--", *command],
+        text=True, capture_output=True, check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert {item["id"] for item in payload["matches"]} == {
+        "example.cli-alpha", "example.cli-beta",
+    }
+    assert payload["count"] == 2
+    assert payload["suggested_argv"] == []
+
+
+def test_workflow_match_cli_rejects_missing_command(tmp_path):
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "workflow", "match", "--json",
+         "--cwd", str(tmp_path), "--"],
+        text=True, encoding="utf-8", capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "requires a literal script command" in result.stderr
+
+
+def test_auto_route_rechecks_script_hash_before_execution(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('trusted')\n",
+        encoding="utf-8",
+    )
+    manifest_path, digest, _ = _write_manifest(
+        tmp_path, script, workflow_id="example.hash-race",
+        schema="agw.workflow/v2", args=["out.txt"],
+        outputs=[{"path": "{cwd}/out.txt", "expected": "absent"}],
+    )
+    _trust(manifest_path, digest)
+    command = [sys.executable, str(script), "out.txt"]
+    assert workflows.matching_workflows(command, str(tmp_path)) == [
+        "example.hash-race"
+    ]
+
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('changed')\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, AGW_SOURCE, "run", "--json", "--workflow",
+         "example.hash-race", "--", *command],
+        cwd=str(tmp_path), text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "trusted script changed" in result.stderr
+    assert not (tmp_path / "out.txt").exists()
 
 
 def test_v2_binds_exact_arguments_and_can_build_its_own_command(tmp_path):

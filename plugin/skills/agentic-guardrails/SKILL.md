@@ -29,8 +29,8 @@ continuations; never guess a larger budget.
 | Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
 | Read or change a text file | Exact `file <operation> --help` | None |
 | Change dependent text files together | `file plan --help`, then `file apply-plan --help` | None |
-| Run a one-off write-capable script | `run --help`; declare exact outputs | [recovery.md](references/recovery.md) |
-| Run a versioned workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` values | [trusted-workflows.md](references/trusted-workflows.md) |
+| Run a local script | `workflow match -- <command>`; otherwise `run --help` | [recovery.md](references/recovery.md) |
+| Run a matched workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` | [trusted-workflows.md](references/trusted-workflows.md) |
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
 | Publish a validated staged artifact | `publish-file --help` | [synced-folders.md](references/synced-folders.md) |

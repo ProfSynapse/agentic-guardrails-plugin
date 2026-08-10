@@ -687,9 +687,41 @@ def cmd_workflow(args):
             items = workflows.list_trusted()
             data = {"workflows": items, "count": len(items)}
             human = "\n".join(
-                item.get("id") or f"unverified record: {item.get('record', 'unknown')}"
+                ((item.get("id", "") + (
+                    f" - {item.get('description', '')}" if item.get("description") else ""
+                )) or f"unverified record: {item.get('record', 'unknown')}")
                 for item in items
             ) or "no trusted workflows"
+        elif args.workflow_op == "match":
+            command = list(args.command)
+            if command and command[0] == "--":
+                command = command[1:]
+            if not command:
+                raise workflows.WorkflowError(
+                    "workflow match requires a literal script command after --"
+                )
+            workflow_ids = workflows.matching_workflows(
+                command, args.cwd or os.getcwd(),
+            )
+            available = {
+                item.get("id"): item for item in workflows.list_trusted()
+                if item.get("verified") and item.get("id")
+            }
+            matches = [available[item] for item in workflow_ids if item in available]
+            data = {
+                "matches": matches, "count": len(matches), "command": command,
+                "cwd": os.path.realpath(os.path.abspath(args.cwd or os.getcwd())),
+                "suggested_argv": (
+                    ["agw", "run", "--workflow", workflow_ids[0], "--", *command]
+                    if len(workflow_ids) == 1 else []
+                ),
+            }
+            human = (
+                f"exact trusted workflow match: {workflow_ids[0]}"
+                if len(workflow_ids) == 1 else
+                ("multiple exact workflow matches: " + ", ".join(workflow_ids)
+                 if workflow_ids else "no exact trusted workflow match")
+            )
         elif args.workflow_op == "info":
             record = workflows.load_trusted(args.workflow_id)
             manifest = record["manifest"]
@@ -1373,7 +1405,7 @@ def main(argv=None):
     )
     workflow_trust = workflow_sub.add_parser(
         "trust", parents=[common],
-        help="user-approved installation of one hash-checked manifest",
+        help="install one reviewed hash-checked manifest",
         description=("Validate and copy a workflow manifest into the protected "
                      "Guardrails trust store. Repository manifests are inert until "
                      "this explicit operation is approved."),
@@ -1397,9 +1429,17 @@ def main(argv=None):
     )
     workflow_trust.set_defaults(fn=cmd_workflow)
     workflow_list = workflow_sub.add_parser(
-        "list", parents=[common], help="list trusted workflow ids",
+        "list", parents=[common], help="list trusted workflows and purposes",
     )
     workflow_list.set_defaults(fn=cmd_workflow)
+    workflow_match = workflow_sub.add_parser(
+        "match", parents=[common], help="match an exact script command",
+    )
+    workflow_match.add_argument("--cwd", default="", help="command working directory")
+    workflow_match.add_argument(
+        "command", nargs=argparse.REMAINDER, metavar="...", help="command after --",
+    )
+    workflow_match.set_defaults(fn=cmd_workflow)
     workflow_info = workflow_sub.add_parser(
         "info", parents=[common], help="verify and inspect one trusted workflow",
     )
@@ -1407,7 +1447,7 @@ def main(argv=None):
     workflow_info.set_defaults(fn=cmd_workflow)
     workflow_validate = workflow_sub.add_parser(
         "validate", parents=[common],
-        help="validate an inert manifest and script hash without trusting it",
+        help="validate an inert manifest and script hash",
     )
     workflow_validate.add_argument("manifest", help="literal manifest JSON file")
     workflow_validate.add_argument(
@@ -1423,7 +1463,7 @@ def main(argv=None):
     workflow_status.set_defaults(fn=cmd_workflow)
     workflow_init = workflow_sub.add_parser(
         "init", parents=[common],
-        help="generate a validated v2 manifest with escaped Unicode",
+        help="generate an escaped validated v2 manifest",
     )
     workflow_init.add_argument("--script", required=True, help="versioned script path")
     workflow_init.add_argument("--manifest", required=True, help="manifest output path")

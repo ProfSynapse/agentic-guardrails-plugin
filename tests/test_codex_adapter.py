@@ -5,6 +5,7 @@ import base64
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -130,6 +131,152 @@ def test_short_agw_is_rewritten_to_active_package(tool):
     expected = "agw.cmd" if os.name == "nt" else os.path.join("bin", "agw")
     assert expected in updated["command"]
     assert updated["command"].endswith(" status --json")
+
+
+def test_exact_trusted_workflow_is_automatically_routed(tmp_path):
+    from core import launcher, store, workflows
+
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema": "agw.workflow/v2",
+        "id": "example.auto-route",
+        "description": "automatic routing test",
+        "command": {
+            "runtime": "python", "script": str(script),
+            "script_sha256": store.file_sha256(str(script)),
+            "args": ["out.txt"],
+        },
+        "allowed_roots": ["{cwd}"],
+        "outputs": [{"path": "{cwd}/out.txt", "expected": "absent"}],
+        "observed_roots": [],
+    }
+    manifest_path = tmp_path / "workflow.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    workflows.trust_manifest(
+        str(manifest_path), store.file_sha256(str(manifest_path)),
+    )
+    original_argv = [sys.executable, str(script), "out.txt"]
+    command = subprocess.list2cmdline(original_argv) if os.name == "nt" \
+        else shlex.join(original_argv)
+    out = run_hook({
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": command, "description": "build output"},
+        "cwd": str(tmp_path), "session_id": "trusted-auto-route",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    assert "example.auto-route" in specific["permissionDecisionReason"]
+    updated = specific["updatedInput"]
+    assert updated["description"] == "build output"
+    if os.name == "nt":
+        encoded = updated["command"].rsplit("'", 2)[1]
+    else:
+        encoded = shlex.split(updated["command"])[-1]
+    assert launcher.decode_internal_argv(["--agw-argv-b64", encoded]) == [
+        "run", "--workflow", "example.auto-route", "--", *original_argv,
+    ]
+
+
+def test_multiple_trusted_workflows_are_not_automatically_routed(tmp_path):
+    from core import store, workflows
+
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    for workflow_id in ("example.route-alpha", "example.route-beta"):
+        manifest = {
+            "schema": "agw.workflow/v2", "id": workflow_id,
+            "description": "ambiguous routing test",
+            "command": {
+                "runtime": "python", "script": str(script),
+                "script_sha256": store.file_sha256(str(script)),
+                "args": ["out.txt"],
+            },
+            "allowed_roots": ["{cwd}"],
+            "outputs": [{"path": "{cwd}/out.txt", "expected": "absent"}],
+            "observed_roots": [],
+        }
+        manifest_path = tmp_path / f"{workflow_id}.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        workflows.trust_manifest(
+            str(manifest_path), store.file_sha256(str(manifest_path)),
+        )
+    argv = [sys.executable, str(script), "out.txt"]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    out = run_hook({
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": command}, "cwd": str(tmp_path),
+        "session_id": "ambiguous-auto-route",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+    assert "multiple trusted output contracts" in specific["permissionDecisionReason"]
+
+
+def test_stale_trusted_workflow_is_not_automatically_routed(tmp_path):
+    from core import store, workflows
+
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('trusted')\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema": "agw.workflow/v2", "id": "example.stale-route",
+        "description": "stale routing test",
+        "command": {
+            "runtime": "python", "script": str(script),
+            "script_sha256": store.file_sha256(str(script)), "args": ["out.txt"],
+        },
+        "allowed_roots": ["{cwd}"],
+        "outputs": [{"path": "{cwd}/out.txt", "expected": "absent"}],
+        "observed_roots": [],
+    }
+    manifest_path = tmp_path / "stale-workflow.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    workflows.trust_manifest(
+        str(manifest_path), store.file_sha256(str(manifest_path)),
+    )
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('changed')\n",
+        encoding="utf-8",
+    )
+    argv = [sys.executable, str(script), "out.txt"]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    out = run_hook({
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": command}, "cwd": str(tmp_path),
+        "session_id": "stale-auto-route",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "updatedInput" not in specific
+    assert "pre-execution output contract" in specific["permissionDecisionReason"]
+
+
+def test_ambiguous_script_evidence_is_shadowed_in_observe_mode(tmp_path):
+    script = tmp_path / "model.py"
+    script.write_text(
+        "class Model:\n    def save(self): return True\nModel().save()\n",
+        encoding="utf-8",
+    )
+    argv = [sys.executable, str(script)]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    out = run_hook({
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": command}, "cwd": str(tmp_path),
+        "session_id": "ambiguous-observe",
+    }, env_extra={"AGW_LEVEL": "observe"})
+    assert "hookSpecificOutput" not in out
+    assert "would have ASK" in out["systemMessage"]
+    assert "ambiguous" in out["systemMessage"].lower()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")
@@ -350,6 +497,53 @@ def test_codex_ask_resolves_via_injected_provider(monkeypatch, capsys, tmp_path)
     reason = data["hookSpecificOutput"]["permissionDecisionReason"]
     assert "Do not retry the same operation" in reason
     assert "recommend the safest way to continue" in reason
+
+
+def test_ambiguous_script_evidence_uses_one_run_approval(monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+
+    ptu = _load_codex_pretooluse_isolated()
+    script = tmp_path / "model.py"
+    script.write_text(
+        "class Model:\n"
+        "    def save(self): return True\n"
+        "Model().save()\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": subprocess.list2cmdline([
+            sys.executable, str(script),
+        ]) if os.name == "nt" else shlex.join([sys.executable, str(script)])},
+        "cwd": str(tmp_path), "session_id": "ambiguous-script",
+        "hook_event_name": "PreToolUse",
+    }
+
+    class CapturingApproval(ApprovalProvider):
+        def __init__(self):
+            self.requests = []
+
+        def request(self, request):
+            self.requests.append(request)
+            return ApprovalResponse(True, "approved")
+
+    provider = CapturingApproval()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    output = capsys.readouterr().out
+    result = json.loads(output) if output.strip() else {}
+    assert provider.requests
+    assert result.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+    rendered = provider.requests[0].action + "\n" + provider.requests[0].primary_text()
+    assert "ambiguous" in rendered.lower()
+
+    monkeypatch.setenv("AGW_LEVEL", "strict")
+    payload["session_id"] = "ambiguous-script-strict"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(provider)
+    strict_result = json.loads(capsys.readouterr().out)
+    assert strict_result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_codex_provider_receives_closed_human_prompt(monkeypatch, capsys, tmp_path):
