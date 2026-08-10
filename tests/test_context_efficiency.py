@@ -60,6 +60,24 @@ def test_always_on_context_is_small_and_has_no_operation_catalog():
         assert "trusted PreToolUse hook" in context
         assert "exact host-supplied `SKILL.md` location" in context
         assert "plugin-cache path" in context
+        assert "agw workflow match -- <command>" in context
+
+
+def test_session_workflow_discovery_is_bounded_and_workspace_relevant(tmp_path):
+    items = [
+        {
+            "id": f"example.workflow-{index}", "verified": True,
+            "script": str(tmp_path / f"script-{index}.py"),
+        }
+        for index in range(6)
+    ]
+    for module in (claude_start, codex_start):
+        note = module._workflow_note(items, str(tmp_path))
+        assert "6 verified" in note
+        assert "workflow match" in note
+        assert "example.workflow-0" in note
+        assert "example.workflow-2" in note
+        assert "example.workflow-3" not in note
 
 
 def test_short_launcher_removes_repeated_package_path_tokens():
@@ -204,7 +222,7 @@ def test_workflow_help_discloses_trust_details_only_at_the_leaf():
     family = _help("workflow")
     trust = _help("workflow", "trust")
     info = _help("workflow", "info")
-    assert "trust" in family and "list" in family and "info" in family
+    assert "trust" in family and "list" in family and "match" in family and "info" in family
     assert "--expected-manifest-hash" not in family
     assert "--approve-trust" not in family
     assert "--expected-manifest-hash" in trust

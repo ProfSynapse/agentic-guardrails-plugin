@@ -1346,7 +1346,7 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                         "trigger": "The agent requested a new or replacement trusted workflow record.",
                     },
                 )
-            if workflow_op not in {"list", "info", "validate", "status", "init"}:
+            if workflow_op not in {"list", "match", "info", "validate", "status", "init"}:
                 return Decision(
                     ASK, "This workflow operation is not recognized.",
                     "builtin:agw-workflow-unknown",

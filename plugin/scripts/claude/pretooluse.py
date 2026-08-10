@@ -39,12 +39,24 @@ def main():
 
     evaluation_payload = payload
     rewritten_command = None
+    routed_workflow = ""
     if payload.get("tool_name") in {"Bash", "PowerShell"}:
         tool_input = payload.get("tool_input") or {}
         shell = "powershell" if payload.get("tool_name") == "PowerShell" else "posix"
+        command = tool_input.get("command", "")
         rewritten_command = launcher.rewrite_shortcut(
-            tool_input.get("command", ""), PLUGIN_ROOT, shell=shell
+            command, PLUGIN_ROOT, shell=shell
         )
+        if not rewritten_command:
+            dialect = "powershell" if shell == "powershell" else None
+            matches = mutations.routable_trusted_workflows(
+                command, payload.get("cwd", ""), dialect=dialect,
+            )
+            if len(matches) == 1:
+                rewritten_command = launcher.rewrite_trusted_workflow(
+                    command, matches[0], PLUGIN_ROOT, shell=shell,
+                )
+                routed_workflow = matches[0] if rewritten_command else ""
         if rewritten_command:
             evaluation_payload = dict(payload)
             evaluation_payload["tool_input"] = launcher.updated_tool_input(
@@ -67,11 +79,34 @@ def main():
     invariant_failure = ""
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
-            invariant_failure = (
-                "Guardrails blocked this change because it could not determine every file "
-                f"that would be modified: {mutation_plan.reason}. Nothing was changed by "
-                "this operation. Use a file-specific editing operation and try again."
-            )
+            if mutation_plan.review_required:
+                ambiguous_action = (
+                    events.DENY if cfg.get("level") == "strict" else events.ASK
+                )
+                decision = decision.merge(engine.Decision(
+                    ambiguous_action,
+                    "Guardrails found ambiguous write-like source evidence but could "
+                    "not confirm that this invocation writes files. Review this exact, "
+                    f"hash-bound run before continuing: {mutation_plan.reason}",
+                    "builtin:script-write-ambiguous",
+                    policy_revision=policy.revision, policy_health=policy.health,
+                    enforcement_class=events.POLICY_ENFORCEMENT,
+                    presentation_context=events.DecisionContext.FILE_CHANGE,
+                    presentation_details={
+                        "operation": "run script with ambiguous write evidence",
+                        "targets": [mutation_plan.evidence.get("path", "")],
+                        "target_kind": "file",
+                        "signal": mutation_plan.evidence.get("primitive", "write-like source"),
+                        "trigger": "Static source analysis found ambiguous write evidence.",
+                    },
+                ))
+                effective = enforcement.resolve(decision, observe)
+            else:
+                invariant_failure = (
+                    "Guardrails blocked this change because it could not determine every file "
+                    f"that would be modified: {mutation_plan.reason}. Nothing was changed by "
+                    "this operation. Use a file-specific editing operation and try again."
+                )
         else:
             archive_budget = int(os.environ.get(
                 "AGW_ARCHIVE_MAX_BYTES", policy.settings.get("archive_max_bytes", 0)
@@ -176,6 +211,11 @@ def main():
     out = launcher.attach_rewrite(
         out, payload, rewritten_command, may_run=effective.action != events.DENY
     )
+    if routed_workflow and out.get("hookSpecificOutput"):
+        out["hookSpecificOutput"]["permissionDecisionReason"] = (
+            f"Routed this exact script and argument set through trusted workflow "
+            f"{routed_workflow}."
+        )
 
     # Opportunistic retention: keep the store under a configured budget.
     try:

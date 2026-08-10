@@ -2,6 +2,7 @@
 import base64
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -77,6 +78,53 @@ def test_short_agw_is_rewritten_to_active_package(tool):
     expected = "agw.cmd" if os.name == "nt" else os.path.join("bin", "agw")
     assert expected in updated["command"]
     assert updated["command"].endswith(" status --json")
+
+
+def test_claude_exact_trusted_workflow_is_automatically_routed(tmp_path):
+    from core import launcher, store, workflows
+
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "from pathlib import Path\nPath('out.txt').write_text('x')\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema": "agw.workflow/v2", "id": "example.claude-auto-route",
+        "description": "Claude automatic routing test",
+        "command": {
+            "runtime": "python", "script": str(script),
+            "script_sha256": store.file_sha256(str(script)), "args": ["out.txt"],
+        },
+        "allowed_roots": ["{cwd}"],
+        "outputs": [{"path": "{cwd}/out.txt", "expected": "absent"}],
+        "observed_roots": [],
+    }
+    manifest_path = tmp_path / "workflow.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    workflows.trust_manifest(
+        str(manifest_path), store.file_sha256(str(manifest_path)),
+    )
+    original_argv = [sys.executable, str(script), "out.txt"]
+    command = subprocess.list2cmdline(original_argv) if os.name == "nt" \
+        else shlex.join(original_argv)
+    out = run_hook({
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": command, "description": "build output"},
+        "cwd": str(tmp_path), "session_id": "claude-trusted-auto-route",
+        "hook_event_name": "PreToolUse",
+    })
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "allow"
+    assert "example.claude-auto-route" in specific["permissionDecisionReason"]
+    updated = specific["updatedInput"]
+    assert updated["description"] == "build output"
+    if os.name == "nt":
+        encoded = updated["command"].rsplit("'", 2)[1]
+    else:
+        encoded = shlex.split(updated["command"])[-1]
+    assert launcher.decode_internal_argv(["--agw-argv-b64", encoded]) == [
+        "run", "--workflow", "example.claude-auto-route", "--", *original_argv,
+    ]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher rewrite is Windows-only")

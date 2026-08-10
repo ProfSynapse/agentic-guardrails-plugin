@@ -34,8 +34,8 @@ splatting, dynamic path joins, or mixed shell scripts that obscure mutations.
 - Separate discovery/read, validation/dry-run, mutation, and verification. Do not \
 bundle unrelated writes. Prefer the smallest reversible \
 operation plus compact JSON, pagination, or file/stdin input over clever quoting.
-For write scripts, declare every output; exact mode scans no siblings. Use reviewed \
-workflows for repeats; observed roots only detect sidecars.
+For write scripts, run `agw workflow match -- <command>` first; otherwise declare \
+every output. Exact mode scans no siblings; observed roots only detect sidecars.
 - Never delete: `archive` ordinary targets; `unlink-link` link objects; \
 `restore`/`undo` recover. Use targeted `office`, style-preserving \
 `checkout`/`publish`, or `publish-file` for staged output; no ad hoc Python/Node mutation.
@@ -64,14 +64,37 @@ _LEVEL_NOTE = {
 }
 
 
+def _workflow_note(items, cwd: str) -> str:
+    verified = [item for item in items if item.get("verified") and item.get("id")]
+    if not verified:
+        return "\nTrusted workflows: none installed; use exact outputs for write scripts."
+    working = os.path.normcase(os.path.realpath(os.path.abspath(cwd or os.getcwd())))
+    relevant = []
+    for item in verified:
+        script = os.path.normcase(os.path.realpath(item.get("script", "")))
+        try:
+            if script and os.path.commonpath([working, script]) == working:
+                relevant.append(item["id"])
+        except ValueError:
+            continue
+    note = (
+        f"\nTrusted workflows: {len(verified)} verified. Before running a local "
+        "script, use `agw workflow match -- <command>`."
+    )
+    if relevant:
+        note += " Workspace candidates: " + ", ".join(relevant[:3]) + "."
+    return note
+
+
 def main():
     note = ""
     try:
-        from core import engine, store
+        from core import engine, store, workflows
         store.agw_home()  # ensures ~/.agw exists
         policy = engine.load_policy(PLUGIN_ROOT)  # warms cache; validates packs
         cfg = engine.resolve_settings(policy)
         note = _LEVEL_NOTE.get(cfg.get("level"), "")
+        note += _workflow_note(workflows.list_trusted(), os.getcwd())
     except Exception:
         pass
     json.dump({"hookSpecificOutput": {

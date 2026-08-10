@@ -25,6 +25,7 @@ _LATER_SHORTCUT = re.compile(r"agw(?:\.cmd)?(?=$|\s)", re.IGNORECASE)
 _INTERNAL_ARGV_FLAG = "--agw-argv-b64"
 _MAX_INTERNAL_ARGV_BYTES = 64 * 1024
 _MAX_INTERNAL_ARGC = 256
+_WORKFLOW_ID = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 
 
 def encode_internal_argv(argv: list[str]) -> str:
@@ -375,6 +376,43 @@ def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] 
         replacement = shlex.quote(target)
 
     return match.group("indent") + replacement + command[match.end():]
+
+
+def rewrite_trusted_workflow(command: str, workflow_id: str, plugin_root: str, *,
+                             platform: Optional[str] = None,
+                             shell: str = "posix") -> str | None:
+    """Wrap one literal command in an exact authenticated workflow invocation.
+
+    The original argv is placed in the launcher's ASCII envelope, so no shell
+    quoting or Unicode reconstruction is delegated to the model. Compound or
+    dynamically parsed commands are never eligible for automatic routing.
+    """
+    if not isinstance(command, str) or not _WORKFLOW_ID.fullmatch(workflow_id or ""):
+        return None
+    dialect = DIALECT_POWERSHELL if shell == "powershell" else None
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return None
+    if len(parsed.commands) != 1 or parsed.flags:
+        return None
+    original_argv = parsed.commands[0].argv
+    if not original_argv:
+        return None
+    payload = encode_internal_argv(
+        ["run", "--workflow", workflow_id, "--", *original_argv]
+    )
+    platform = os.name if platform is None else platform
+    if platform == "nt":
+        target = ntpath.join(plugin_root, "bin", "agw.cmd")
+        if shell == "powershell":
+            return ("& '" + target.replace("'", "''") + "' "
+                    + _INTERNAL_ARGV_FLAG + " '" + payload + "'")
+        target = target.replace("\\", "/")
+    else:
+        target = os.path.join(plugin_root, "bin", "agw")
+    return (shlex.quote(target) + " " + _INTERNAL_ARGV_FLAG + " "
+            + shlex.quote(payload))
 
 
 def updated_tool_input(payload: dict, rewritten_command: str) -> dict:
