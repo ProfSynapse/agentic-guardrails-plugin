@@ -21,8 +21,10 @@ class OfficeError(Exception):
 
 class MissingLibrary(OfficeError):
     def __init__(self, lib: str, pip_name: str, ext: str):
-        super().__init__(f"{ext} support needs the '{pip_name}' package "
-                         f"(pip install {pip_name})")
+        super().__init__(
+            f"{ext} support needs the optional '{pip_name}' package in the "
+            "Python runtime selected by agw; Office libraries are not bundled"
+        )
         self.lib, self.pip_name = lib, pip_name
 
 

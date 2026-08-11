@@ -66,6 +66,13 @@ Excel data export. Style-preserving `.xlsx` checkout does not convert the
 workbook. Fleet rollout: see
 [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md).
 
+Third-party Office libraries are not bundled with the plugin. `agw office`
+content reads and mutations require the corresponding package in the same
+Python runtime selected by the launcher: `python-docx` for `.docx`, `openpyxl`
+for `.xlsx`, and `python-pptx` for `.pptx`. Package-level inspection and some
+checkout paths use standard-library fallbacks, so a capability check may succeed
+even when a content reader still needs its format-specific library.
+
 ## Updating
 
 New versions ship as a `version` bump on the default branch. Clients cache by
@@ -176,6 +183,14 @@ output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders and need not be inside an observed root, so unrelated app
 or sync-client updates are ignored. A recoverable state file can therefore be
 paired with a separate, narrowly patterned cache root.
+
+Use `file write --expected-hash absent` to create a file after its literal parent
+directory exists. `file patch` and `file replace` modify existing files. Patch
+input must be a standard unified diff: every hunk header includes old and new
+line ranges, for example `@@ -12,2 +12,3 @@`. The bare `@@` shorthand accepted by
+some `apply_patch` tools is intentionally rejected because it does not anchor the
+change to explicit source and destination ranges.
+
 Before direct script execution, `agw workflow match -- <command>` checks verified
 machine-local records for the exact runtime, script path, script hash, and bound
 arguments. A single exact match can be routed automatically by supported hooks;

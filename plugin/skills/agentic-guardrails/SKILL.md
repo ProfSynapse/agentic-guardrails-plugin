@@ -27,7 +27,7 @@ continuations; never guess a larger budget.
 | Intent | Route | Read only if needed |
 |---|---|---|
 | Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
-| Read or change a text file | Exact `file <operation> --help` | None |
+| Read, create, or change text | Exact `file <operation> --help` | [text-files.md](references/text-files.md) |
 | Change dependent text files together | `file plan --help`, then `file apply-plan --help` | None |
 | Run a local script | `workflow match -- <command>`; otherwise `run --help` | [recovery.md](references/recovery.md) |
 | Run a matched workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` | [trusted-workflows.md](references/trusted-workflows.md) |

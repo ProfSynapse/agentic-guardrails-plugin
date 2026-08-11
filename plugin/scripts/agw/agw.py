@@ -1293,6 +1293,9 @@ def main(argv=None):
     file_expected = (["--expected-hash", "--expected-file-hash"], {
         "default": "", "help": "expected SHA-256, or 'absent' for creation",
     })
+    file_existing_expected = (["--expected-hash", "--expected-file-hash"], {
+        "default": "", "help": "expected SHA-256 of the existing target file",
+    })
     file_dry_run = (["--dry-run"], {
         "action": "store_true", "help": "validate and hash without writing or archiving",
     })
@@ -1317,9 +1320,12 @@ def main(argv=None):
         example="agw file write app.js --content-file app.js.new --expected-hash SHA256",
     )
     add_file(
-        "patch", "Apply one exact-context unified diff atomically",
-        (["--patch"], {"required": True, "help": "unified diff file or -"}),
-        file_expected, file_dry_run,
+        "patch", "Apply a numbered unified diff atomically",
+        (["--patch"], {
+            "required": True,
+            "help": "standard unified diff file or -; bare '@@' is invalid",
+        }),
+        file_existing_expected, file_dry_run,
         example="agw file patch app.js --patch change.diff --expected-hash SHA256",
     )
     add_file(
@@ -1329,7 +1335,7 @@ def main(argv=None):
         (["--old-file"], {"default": "", "help": "UTF-8 old-text file"}),
         (["--new-file"], {"default": "", "help": "UTF-8 new-text file"}),
         (["--all"], {"action": "store_true", "help": "replace every exact match"}),
-        file_expected, file_dry_run,
+        file_existing_expected, file_dry_run,
         example="agw file replace app.js --old-file old.txt --new-file new.txt --expected-hash SHA256",
     )
     plan_parser = file_sub.add_parser(

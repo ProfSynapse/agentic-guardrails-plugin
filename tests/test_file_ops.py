@@ -220,6 +220,46 @@ def test_patch_count_mismatch_reports_correctable_hunk_details():
     }
 
 
+def test_bare_patch_hunk_reports_actionable_format_error():
+    patch = "--- a/app.txt\n+++ b/app.txt\n@@\n-alpha\n+BETA\n"
+    with pytest.raises(file_ops.MalformedPatchHunk) as caught:
+        file_ops.apply_unified_patch("alpha\n", patch)
+    assert caught.value.error_code == "malformed_patch_hunk"
+    assert "bare '@@' apply_patch shorthand is not supported" in str(caught.value)
+    assert caught.value.details == {
+        "patch_line": 3,
+        "header": "@@",
+        "expected_header": "@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@",
+        "hint": (
+            "bare '@@' apply_patch shorthand is not supported; include "
+            "standard unified-diff line ranges"
+        ),
+    }
+
+
+def test_bare_patch_hunk_has_specific_cli_json_error(tmp_path):
+    target = tmp_path / "app.txt"
+    target.write_text("alpha\n", encoding="utf-8")
+    patch_file = tmp_path / "change.diff"
+    patch_file.write_text("@@\n-alpha\n+BETA\n", encoding="utf-8")
+    result = run_agw(
+        "file", "patch", str(target), "--patch", str(patch_file), "--json",
+        check=False,
+    )
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "malformed_patch_hunk"
+    assert error["details"]["patch_line"] == 1
+    assert error["details"]["header"] == "@@"
+
+
+def test_patch_help_distinguishes_unified_diff_from_apply_patch_shorthand():
+    result = run_agw("file", "patch", "--help")
+    assert "numbered unified diff" in result.stdout
+    assert "bare '@@' is invalid" in result.stdout
+    assert "expected SHA-256 of the existing target file" in result.stdout
+
+
 def test_file_conflicts_have_operation_specific_json_codes(tmp_path):
     target = tmp_path / "app.txt"
     target.write_text("actual\n", encoding="utf-8")

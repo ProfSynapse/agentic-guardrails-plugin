@@ -23,7 +23,10 @@ def _docx():
         import docx
         return docx
     except ImportError as exc:
-        raise WordError(".docx support needs the 'python-docx' package") from exc
+        raise WordError(
+            ".docx support needs the optional 'python-docx' package in the "
+            "Python runtime selected by agw; Office libraries are not bundled"
+        ) from exc
 
 
 def _document_preflight(path: str) -> None:
