@@ -1,4 +1,5 @@
 """agw office: controlled in-place Office edits, snapshot-first contract."""
+import builtins
 import json
 import os
 import subprocess
@@ -14,6 +15,20 @@ AGW = os.path.join(REPO, "scripts", "agw", "agw.py")
 openpyxl = pytest.importorskip("openpyxl")
 sys.path.insert(0, os.path.join(REPO, "scripts", "agw"))
 import office  # noqa: E402
+import office_ooxml  # noqa: E402
+import office_surgical  # noqa: E402
+
+
+def block_office_imports(monkeypatch, *packages):
+    original = builtins.__import__
+    blocked = set(packages)
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".", 1)[0] in blocked:
+            raise ImportError(f"blocked optional dependency: {name}")
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
 
 
 def run_agw(*args, env=None, check=True):
@@ -59,6 +74,16 @@ def test_set_cell_bad_sheet_no_snapshot(workbook):
     with pytest.raises(office.OfficeError, match="no sheet named"):
         office.set_cell(workbook, "Nope", "A1", "x")
     assert store.list_versions(workbook) == []  # refused before snapshotting
+
+
+def test_set_cell_uses_dependency_free_surgical_backend(workbook, monkeypatch):
+    block_office_imports(monkeypatch, "openpyxl")
+    capabilities = office.capabilities()
+    assert capabilities["xlsx"] is True
+    assert capabilities["xlsx_advanced"] is False
+    result = office.set_cell(workbook, "Q3", "B2", "77")
+    assert result["adapter"] == "ooxml-surgical"
+    assert office_surgical.inspect_cell(workbook, "Q3", "B2")["value"] == 77
 
 
 def test_append_rows(workbook):
@@ -189,3 +214,31 @@ def test_replace_text_no_match_no_resave(document):
 def test_docx_info(document):
     data = office.info(document)
     assert data["headings"] == ["Q3 Memo"]
+
+
+def test_docx_reads_and_replace_need_no_python_docx(document, monkeypatch):
+    block_office_imports(monkeypatch, "docx")
+    assert office.capabilities()["docx"] is True
+    assert office.info(document)["headings"] == ["Q3 Memo"]
+    assert "October 1" in office.get_text(document)
+    result = office.replace_text(document, "October 1", "November 15")
+    assert result["replacements"] == 1
+    assert "November 15" in office_ooxml.word_get_text(document)
+
+
+def test_pptx_reads_and_replace_need_no_python_pptx(tmp_path, monkeypatch):
+    pptx = pytest.importorskip("pptx", reason="python-pptx not installed")
+    path = tmp_path / "briefing.pptx"
+    presentation = pptx.Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = "Quarterly Briefing"
+    slide.placeholders[1].text = "Original plan"
+    presentation.save(path)
+
+    block_office_imports(monkeypatch, "pptx")
+    assert office.capabilities()["pptx"] is True
+    assert office.info(str(path))["titles"] == ["Quarterly Briefing"]
+    assert "Original plan" in office.get_text(str(path))
+    result = office.replace_text(str(path), "Original plan", "Revised plan")
+    assert result["replacements"] == 1
+    assert "Revised plan" in office_ooxml.presentation_get_text(str(path))

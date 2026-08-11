@@ -66,12 +66,18 @@ Excel data export. Style-preserving `.xlsx` checkout does not convert the
 workbook. Fleet rollout: see
 [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md).
 
-Third-party Office libraries are not bundled with the plugin. `agw office`
-content reads and mutations require the corresponding package in the same
-Python runtime selected by the launcher: `python-docx` for `.docx`, `openpyxl`
-for `.xlsx`, and `python-pptx` for `.pptx`. Package-level inspection and some
-checkout paths use standard-library fallbacks, so a capability check may succeed
-even when a content reader still needs its format-specific library.
+Third-party Office libraries are not bundled with the plugin. The built-in
+OOXML backend uses only the Python standard library for `.docx`/`.pptx` text
+reads and localized text mutations, plus `.xlsx`/`.xlsm` single-cell edits.
+Advanced workbook reads and table/row mutations still require `openpyxl` in
+the same Python runtime selected by the launcher. Package-preservation checks
+reject edits that unexpectedly rewrite unrelated parts of an Office file.
+
+| Format | Standard-library operations | Optional dependency tier |
+|---|---|---|
+| `.docx` | `info`, `get-text`, `replace-text`, `outline`, `read-blocks`, `patch` | None for these operations |
+| `.pptx` | `info`, `get-text`, `replace-text` | None for these operations |
+| `.xlsx` / `.xlsm` | guarded `set-cell` | `openpyxl` for workbook/table reads, formulas, appended rows, and table mutations |
 
 ## Updating
 
@@ -337,7 +343,7 @@ changes an allow, ask, or deny decision.
 ## Testing
 
 ```
-python3 -m pytest tests/   # Office tests run when openpyxl/python-docx are installed
+python3 -m pytest tests/   # optional-library integration tests skip when unavailable
 ```
 
 Includes a bypass corpus (nested `bash -c`, command substitution, xargs, wrapper

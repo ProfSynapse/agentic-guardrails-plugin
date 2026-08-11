@@ -1,4 +1,5 @@
 """Structured Office reads and guarded mutation contracts."""
+import builtins
 import datetime as dt
 import json
 import os
@@ -673,3 +674,32 @@ def test_word_outline_and_patch_if_dependency_present(tmp_path, agw_home):
     assert json.loads(cli.stdout)["patched"] == 1
     assert docx.Document(path).paragraphs[1].text == \
         "PowerShell-safe revision with spaces."
+
+
+def test_word_outline_and_patch_without_python_docx(tmp_path, agw_home, monkeypatch):
+    docx = pytest.importorskip("docx")
+    path = tmp_path / "dependency-free-memo.docx"
+    document = docx.Document()
+    document.add_heading("Overview", level=1)
+    document.add_paragraph("Original text.")
+    document.save(path)
+
+    original_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".", 1)[0] == "docx":
+            raise ImportError(f"blocked optional dependency: {name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    view = office_word.outline(str(path))
+    paragraph_id = view["blocks"][1][0]
+    result = office_word.patch(
+        str(path),
+        [{"op": "replace_block", "id": paragraph_id, "text": "Revised text."}],
+        expected_sha256=view["hash"],
+    )
+    assert result["patched"] == 1
+    assert office_word.read_blocks(
+        str(path), [office_word.outline(str(path))["blocks"][1][0]]
+    )["blocks"][0]["text"] == "Revised text."

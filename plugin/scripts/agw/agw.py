@@ -922,6 +922,7 @@ def cmd_doctor(args):
     except OSError:
         size = 0
     budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES", 0) or 0)
+    office_caps = office.capabilities()
     checks = {
         "agw_home": home, "agw_home_writable": writable,
         "python": sys.version.split()[0], "cwd_profile": profile.name,
@@ -931,13 +932,18 @@ def cmd_doctor(args):
         "archive_bytes": size,
         "archive_budget": budget or "unlimited",
         **{f"converter_{k}": v for k, v in caps.items()},
-        **{f"office_{k}": v for k, v in office.capabilities().items()},
+        **{f"office_{k}": v for k, v in office_caps.items()},
     }
     lines = [f"{'OK ' if v is not False and v is not None else 'MISSING '} {k}: {v}"
              for k, v in checks.items()]
     if not caps["pandoc"]:
         lines.append("note: pandoc not found - Office checkouts degrade to copy-only "
                      "(archive safety unaffected). Install: https://pandoc.org")
+    if not office_caps["xlsx_advanced"]:
+        lines.append(
+            "note: dependency-free Excel set-cell is available; install openpyxl "
+            "only for advanced workbook reads and table/row mutations"
+        )
     if budget and size > budget:
         lines.append(f"note: archive ({size} B) exceeds budget ({budget} B); "
                      "oldest pre-image snapshots will be evicted on next write.")

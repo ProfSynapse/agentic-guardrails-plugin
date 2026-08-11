@@ -8,13 +8,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.3.24"
+VERSION = "0.3.25"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -84,6 +85,84 @@ def _packed_core(artifact, source, env_extra=None):
     return result.stdout.strip()
 
 
+def _run_packed_agw_without_site_packages(artifact, tmp_path, *args):
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.update({
+        "AGW_HOME": str(tmp_path / "no-site-home"),
+        "PYTHONNOUSERSITE": "1",
+    })
+    result = subprocess.run(
+        [sys.executable, "-S", str(artifact / "scripts" / "agw" / "agw.py"),
+         *map(str, args)],
+        capture_output=True, text=True, env=env, cwd=str(artifact.parent), timeout=45,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def _write_minimal_docx(path):
+    document = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Summary</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Original plan</w:t></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+    styles = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+</w:styles>'''
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr("word/document.xml", document)
+        package.writestr("word/styles.xml", styles)
+
+
+def _write_minimal_pptx(path):
+    presentation = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+</p:presentation>'''
+    relationships = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>'''
+    slide = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree><p:sp>
+    <p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+    <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Original briefing</a:t></a:r></a:p></p:txBody>
+  </p:sp></p:spTree></p:cSld>
+</p:sld>'''
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr("ppt/presentation.xml", presentation)
+        package.writestr("ppt/_rels/presentation.xml.rels", relationships)
+        package.writestr("ppt/slides/slide1.xml", slide)
+
+
+def _write_minimal_xlsx(path):
+    workbook = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    relationships = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>'''
+    worksheet = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="2"><c r="B2"><v>40</v></c></row></sheetData>
+</worksheet>'''
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr("xl/workbook.xml", workbook)
+        package.writestr("xl/_rels/workbook.xml.rels", relationships)
+        package.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
 def _make_private_legacy(artifact, home, data):
     path = home / "audit.jsonl"
     path.write_bytes(data)
@@ -132,6 +211,7 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
         packed_plugin / "scripts" / "core" / "enforcement.py",
         packed_plugin / "scripts" / "core" / "powershell_bind.py",
         packed_plugin / "scripts" / "core" / "common-controls-v6.manifest",
+        packed_plugin / "scripts" / "agw" / "office_ooxml.py",
         packed_plugin / "bin" / "agw",
         packed_plugin / "bin" / "agw.cmd",
     ]
@@ -148,6 +228,65 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
     assert "host-history" in audit_shim
     if os.name != "nt":
         assert (packed_plugin / "bin" / "agw").stat().st_mode & stat.S_IXUSR
+
+
+def test_packed_docx_read_and_mutation_work_without_site_packages(
+        packed_plugin, tmp_path):
+    document = tmp_path / "minimal.docx"
+    _write_minimal_docx(document)
+
+    info = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "info", document, "--json"
+    ))
+    assert info["headings"] == ["Summary"]
+
+    text = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "get-text", document, "--json"
+    ))
+    assert "Original plan" in text["text"]
+
+    result = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "replace-text", document,
+        "--find", "Original plan", "--replace", "Revised plan", "--json"
+    ))
+    assert result["replacements"] == 1
+    with zipfile.ZipFile(document) as package:
+        assert b"Revised plan" in package.read("word/document.xml")
+
+
+def test_packed_pptx_read_and_mutation_work_without_site_packages(
+        packed_plugin, tmp_path):
+    presentation = tmp_path / "minimal.pptx"
+    _write_minimal_pptx(presentation)
+
+    info = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "info", presentation, "--json"
+    ))
+    assert info["titles"] == ["Original briefing"]
+
+    result = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "replace-text", presentation,
+        "--find", "Original briefing", "--replace", "Revised briefing", "--json"
+    ))
+    assert result["replacements"] == 1
+    with zipfile.ZipFile(presentation) as package:
+        assert b"Revised briefing" in package.read("ppt/slides/slide1.xml")
+
+
+def test_packed_xlsx_cell_mutation_works_without_site_packages(
+        packed_plugin, tmp_path):
+    workbook = tmp_path / "minimal.xlsx"
+    _write_minimal_xlsx(workbook)
+
+    result = json.loads(_run_packed_agw_without_site_packages(
+        packed_plugin, tmp_path, "office", "set-cell", workbook,
+        "--sheet", "Data", "--cell", "B2", "--value", "55", "--json"
+    ))
+    assert result["adapter"] == "ooxml-surgical"
+    with zipfile.ZipFile(workbook) as package:
+        assert b'<c r="B2"><v>55</v></c>' in package.read(
+            "xl/worksheets/sheet1.xml"
+        )
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])
