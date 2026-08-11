@@ -25,6 +25,7 @@ from . import archive_transactions as archive_tx
 
 SCHEMA_VERSION = 1
 _WINDOWS_SHARING_WINERRORS = {32, 33}
+_WINDOWS_MISSING_LOCK_RETRIES = 3
 
 
 def _ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
@@ -37,12 +38,12 @@ def _lock_contention(exc: OSError, path: str) -> bool:
         return True
     if os.name != "nt":
         return False
-    sharing_error = (
-        getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS
-        or exc.errno in {errno.EACCES, errno.EAGAIN}
-    )
-    # Retry access/sharing errors only for an existing lock object. A missing
-    # lock path means this is a real directory/ACL failure and must fail fast.
+    if getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS:
+        return True
+    sharing_error = exc.errno in {errno.EACCES, errno.EAGAIN}
+    # Treat an observable lock as contention. The caller separately gives a
+    # vanished-lock TOCTOU race a few bounded retries before surfacing an ACL
+    # failure.
     if not sharing_error:
         return False
     try:
@@ -113,6 +114,7 @@ class Lock:
 
     def __enter__(self):
         deadline = time.monotonic() + self.timeout
+        missing_lock_retries = _WINDOWS_MISSING_LOCK_RETRIES
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -120,6 +122,19 @@ class Lock:
                 return self
             except OSError as exc:
                 if not _lock_contention(exc, self.path):
+                    # Windows may report EACCES for O_EXCL contention, then the
+                    # winner can remove the lock before lexists() observes it.
+                    # Retry that narrow TOCTOU window a few times, but keep a
+                    # genuine directory/ACL denial fast and bounded.
+                    transient_access = (
+                        os.name == "nt"
+                        and exc.errno in {errno.EACCES, errno.EAGAIN}
+                        and missing_lock_retries > 0
+                    )
+                    if transient_access:
+                        missing_lock_retries -= 1
+                        time.sleep(0.01)
+                        continue
                     raise
                 if time.monotonic() > deadline:
                     # stale-lock recovery: locks older than 60s are abandoned

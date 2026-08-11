@@ -146,8 +146,12 @@ def test_lock_retries_windows_sharing_violation_for_existing_lock(
     assert attempts == 2
 
 
-def test_lock_does_not_retry_permission_error_without_lock_object(monkeypatch):
+def test_lock_permission_error_without_lock_object_is_bounded(monkeypatch):
+    attempts = 0
+
     def denied(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
         raise PermissionError(errno.EACCES, "real ACL denial")
 
     monkeypatch.setattr(store.os, "open", denied)
@@ -155,6 +159,29 @@ def test_lock_does_not_retry_permission_error_without_lock_object(monkeypatch):
     with pytest.raises(PermissionError, match="real ACL denial"):
         with store.Lock("acl-denial", timeout=0.5):
             pass
+    assert attempts == (
+        store._WINDOWS_MISSING_LOCK_RETRIES + 1 if os.name == "nt" else 1
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows O_EXCL access-race semantics")
+def test_lock_retries_when_competing_lock_disappears_before_probe(
+        monkeypatch):
+    real_open = store.os.open
+    attempts = 0
+
+    def access_race_then_open(path, flags, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise PermissionError(errno.EACCES, "simulated vanished lock race")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(store.os, "open", access_race_then_open)
+    monkeypatch.setattr(store.os.path, "lexists", lambda _path: False)
+    with store.Lock("vanished-sharing-race", timeout=0.5):
+        pass
+    assert attempts == 3
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory creation semantics")
