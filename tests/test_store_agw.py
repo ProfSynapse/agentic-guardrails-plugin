@@ -287,6 +287,204 @@ def test_cli_scan_reports_stubs(tmp_path, agw_home):
     assert data["complete"] is True
 
 
+def test_cli_scan_defaults_to_bounded_profile_and_deep_is_explicit(
+        tmp_path, agw_home):
+    nested = tmp_path
+    for index in range(6):
+        nested = nested / f"level-{index}"
+        nested.mkdir()
+    (nested / "deep.txt").write_text("deep", encoding="utf-8")
+
+    bounded = json.loads(run_agw("scan", str(tmp_path), "--json").stdout)
+    assert bounded["bounds"] == {
+        "max_seconds": scan_worker.BOUNDED_MAX_SECONDS,
+        "max_files": scan_worker.BOUNDED_MAX_FILES,
+        "max_entries": scan_worker.BOUNDED_MAX_ENTRIES,
+        "max_depth": scan_worker.BOUNDED_MAX_DEPTH,
+        "no_size": True,
+    }
+    assert bounded["complete"] is False
+    assert bounded["stop_reason"] == "max_depth"
+    assert bounded["files_inspected"] == 0
+
+    deep = json.loads(
+        run_agw("scan", str(tmp_path), "--deep", "--json").stdout
+    )
+    assert deep["complete"] is True
+    assert deep["files_inspected"] == 1
+    assert deep["bounds"]["max_depth"] == scan_worker.DEEP_MAX_DEPTH
+    assert deep["bytes"] == 4
+
+
+def test_cli_scan_custom_limit_can_extend_one_bound_without_deep(
+        tmp_path, agw_home):
+    nested = tmp_path / "one" / "two" / "three" / "four" / "five"
+    nested.mkdir(parents=True)
+    (nested / "found.txt").write_text("found", encoding="utf-8")
+    data = json.loads(run_agw(
+        "scan", str(tmp_path), "--max-depth", "5", "--json"
+    ).stdout)
+    assert data["complete"] is True
+    assert data["files_inspected"] == 1
+    assert data["bounds"]["max_depth"] == 5
+    assert data["bounds"]["max_seconds"] == scan_worker.BOUNDED_MAX_SECONDS
+    assert data["bytes"] is None
+
+
+def test_cli_scan_max_entries_bounds_directory_only_trees(tmp_path, agw_home):
+    for index in range(8):
+        (tmp_path / f"directory-{index}").mkdir()
+    data = json.loads(run_agw(
+        "scan", str(tmp_path), "--max-entries", "3", "--json"
+    ).stdout)
+    assert data["complete"] is False
+    assert data["stop_reason"] == "max_entries"
+    assert data["entries_seen"] == 3
+
+
+def test_cli_scan_skips_dependency_and_cache_directories(tmp_path, agw_home):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+    for name in ("node_modules", ".venv", "build", "target"):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "ignored.txt").write_text("ignored", encoding="utf-8")
+    data = json.loads(run_agw("scan", str(tmp_path), "--json").stdout)
+    assert data["files_inspected"] == 1
+    assert data["complete"] is True
+
+
+def test_cli_search_is_bounded_and_skips_dependency_trees(tmp_path, agw_home):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "first needle\nsecond Needle\n", encoding="utf-8"
+    )
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "package.js").write_text(
+        "needle", encoding="utf-8"
+    )
+
+    data = json.loads(run_agw(
+        "search", "needle", str(tmp_path), "--ignore-case", "--json"
+    ).stdout)
+    assert data["complete"] is True
+    assert data["matches_found"] == 2
+    assert data["files_searched"] == 1
+    assert {item["path"] for item in data["matches"]} == {
+        os.path.join("src", "app.py")
+    }
+    assert data["bounds"]["max_seconds"] == scan_worker.BOUNDED_MAX_SECONDS
+    assert data["bounds"]["max_entries"] == scan_worker.BOUNDED_MAX_ENTRIES
+
+
+def test_cli_search_regex_and_match_limit_return_partial_result(tmp_path, agw_home):
+    (tmp_path / "items.txt").write_text(
+        "item-1\nitem-2\nitem-3\n", encoding="utf-8"
+    )
+    data = json.loads(run_agw(
+        "search", r"item-\d", str(tmp_path), "--regex",
+        "--max-matches", "2", "--json",
+    ).stdout)
+    assert data["complete"] is False
+    assert data["stop_reason"] == "max_matches"
+    assert data["matches_found"] == 2
+    assert [item["line"] for item in data["matches"]] == [1, 2]
+
+
+def test_cli_search_include_exclude_and_filename_mode(tmp_path, agw_home):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "keep.py").write_text("needle", encoding="utf-8")
+    (tmp_path / "src" / "skip.py").write_text("needle", encoding="utf-8")
+    (tmp_path / "src" / "notes.txt").write_text("needle", encoding="utf-8")
+
+    content = json.loads(run_agw(
+        "search", "needle", str(tmp_path), "--include", "*.py",
+        "--exclude", "*skip.py", "--json",
+    ).stdout)
+    assert content["matches_found"] == 1
+    assert content["matches"][0]["path"] == os.path.join("src", "keep.py")
+    assert content["include_globs"] == ["*.py"]
+    assert content["exclude_globs"] == ["*skip.py"]
+
+    filenames = json.loads(run_agw(
+        "search", "keep", str(tmp_path), "--files", "--json",
+    ).stdout)
+    assert filenames["filename_only"] is True
+    assert filenames["files_searched"] == 0
+    assert filenames["matches"] == [{
+        "path": os.path.join("src", "keep.py"), "kind": "file",
+    }]
+
+
+def test_cli_search_skips_sensitive_content_but_can_list_filename(
+        tmp_path, agw_home):
+    (tmp_path / ".env").write_text("TODO=private-value", encoding="utf-8")
+    content = json.loads(run_agw(
+        "search", "TODO", str(tmp_path), "--json",
+    ).stdout)
+    assert content["matches"] == []
+    assert content["files_skipped_sensitive"] == 1
+    names = json.loads(run_agw(
+        "search", ".env", str(tmp_path), "--files", "--json",
+    ).stdout)
+    assert names["matches"] == [{"path": ".env", "kind": "file"}]
+
+
+def test_cli_list_is_bounded_filterable_and_skips_heavy_trees(tmp_path, agw_home):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("app", encoding="utf-8")
+    (tmp_path / "src" / "notes.txt").write_text("notes", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "package.js").write_text("pkg", encoding="utf-8")
+
+    data = json.loads(run_agw(
+        "list", str(tmp_path), "--name", "*.py", "--kind", "file", "--json",
+    ).stdout)
+    assert data["operation"] == "list"
+    assert data["returned"] == 1
+    assert data["entries"] == [{
+        "path": os.path.join("src", "app.py"), "kind": "file",
+    }]
+    assert data["bounds"]["max_results"] == scan_worker.DEFAULT_MAX_RESULTS
+    assert "node_modules" in data["ignored_directories"]
+
+    directories = json.loads(run_agw(
+        "list", str(tmp_path), "--kind", "directory", "--exclude", "*ignored*",
+        "--json",
+    ).stdout)
+    assert directories["entries"] == [{"path": "src", "kind": "directory"}]
+
+
+def test_cli_list_result_cap_returns_partial_progress(tmp_path, agw_home):
+    for index in range(5):
+        (tmp_path / f"item-{index}.txt").write_text(str(index), encoding="utf-8")
+    data = json.loads(run_agw(
+        "list", str(tmp_path), "--kind", "file", "--max-results", "2", "--json",
+    ).stdout)
+    assert data["returned"] == 2
+    assert data["complete"] is False
+    assert data["stop_reason"] == "max_results"
+
+
+def test_cli_search_rejects_invalid_regex_and_hard_ceiling(tmp_path, agw_home):
+    invalid = run_agw(
+        "search", "[", str(tmp_path), "--regex", check=False
+    )
+    assert invalid.returncode == 2
+    assert "invalid search pattern" in invalid.stderr
+    oversized = run_agw(
+        "search", "x", str(tmp_path), "--max-seconds",
+        str(scan_worker.HARD_MAX_SECONDS + 1), check=False,
+    )
+    assert oversized.returncode == 1
+    assert "hard ceiling" in oversized.stderr
+    non_finite = run_agw(
+        "search", "x", str(tmp_path), "--max-seconds", "nan", check=False,
+    )
+    assert non_finite.returncode == 1
+    assert "finite" in non_finite.stderr
+
+
 def test_cli_scan_rejects_file_path(tmp_path, agw_home):
     target = tmp_path / "not-a-directory.txt"
     target.write_text("content")
@@ -320,8 +518,31 @@ def _scan_request(path, *, seconds=0.6, no_size=True, block=""):
         "worker_deadline": started + seconds,
         "max_seconds": seconds,
         "max_files": 100,
+        "max_entries": 200,
         "max_depth": 4,
         "no_size": no_size,
+        "profile_override": "auto",
+        "_test_block_stage": block,
+        "_test_block_seconds": 30.0,
+    }
+
+
+def _search_request(path, *, seconds=0.6, block=""):
+    started = time.monotonic()
+    return {
+        "operation": "search",
+        "path": str(path),
+        "query": "needle",
+        "regex": False,
+        "ignore_case": False,
+        "started_at": started,
+        "worker_deadline": started + seconds,
+        "max_seconds": seconds,
+        "max_files": 100,
+        "max_entries": 200,
+        "max_depth": 4,
+        "max_matches": 10,
+        "max_file_bytes": 1024 * 1024,
         "profile_override": "auto",
         "_test_block_stage": block,
         "_test_block_seconds": 30.0,
@@ -383,6 +604,26 @@ def test_scan_blocking_filesystem_stages_obey_parent_deadline(
         assert result["entries_seen"] >= 1
     if stage == "stat":
         assert result["files_inspected"] == 1
+
+
+@pytest.mark.parametrize("stage", ["open", "read"])
+def test_search_blocking_content_stages_obey_parent_deadline(
+        tmp_path, monkeypatch, stage):
+    (tmp_path / "item.txt").write_text("needle", encoding="utf-8")
+    monkeypatch.setenv("AGW_TEST_MODE", "1")
+    request = _search_request(tmp_path, seconds=0.6, block=stage)
+    wall_start = time.monotonic()
+    result, fatal = scan_worker.run_bounded_search(request)
+    wall_elapsed = time.monotonic() - wall_start
+
+    assert fatal is None
+    assert result["complete"] is False
+    assert result["stop_reason"] == "max_seconds"
+    assert result["elapsed_seconds"] <= 0.6
+    assert wall_elapsed < 1.0
+    assert result["worker_terminated"] is True
+    assert result["worker_cleanup"] == "complete"
+    assert not _pid_exists(result["_worker_pid"])
 
 
 def test_scan_max_depth_stops_before_descending(tmp_path):
@@ -566,6 +807,22 @@ def test_fast_no_size_scan_avoids_content_reads_and_stat(
     assert data["placeholder_detection"] == "limited"
     assert data["placeholders"] == []
     assert calls["stat"] == 0
+
+
+def test_filename_search_never_opens_file_content(tmp_path, monkeypatch):
+    (tmp_path / "needle-name.txt").write_text("private content", encoding="utf-8")
+    request = _search_request(tmp_path, seconds=5.0)
+    request.update({
+        "query": "needle", "filename_only": True, "kind": "file",
+        "include_globs": [], "exclude_globs": [],
+    })
+    monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("filename search opened file content")
+    ))
+    data, fatal = scan_worker.search_in_process(request)
+    assert fatal is None
+    assert data["matches_found"] == 1
+    assert data["files_searched"] == 0
 
 
 def test_cli_snapshot_preflight(tmp_path, agw_home):

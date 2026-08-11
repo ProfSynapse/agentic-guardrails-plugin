@@ -3,7 +3,7 @@
 destructive primitives. Every verb is reversible by construction, dual-output
 (human line + JSON via --json), and self-logging.
 
-Verbs: init scan checkout convert diff publish publish-file archive unlink-link
+Verbs: init scan list search checkout convert diff publish publish-file archive unlink-link
        move rename snapshot restore undo status log doctor prune office
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import os
 import re
 import sys
@@ -229,20 +230,15 @@ def cmd_init(args):
 
 def cmd_scan(args):
     started_at = time.monotonic()
-    max_seconds = args.max_seconds if args.max_seconds is not None \
-        else (3.0 if args.fast else 30.0)
-    max_files = args.max_files if args.max_files is not None \
-        else (5000 if args.fast else 100000)
-    max_depth = args.max_depth if args.max_depth is not None \
-        else (4 if args.fast else 64)
-    if max_seconds <= 0 or max_files <= 0 or max_depth < 0:
-        _err("scan bounds require max-seconds > 0, max-files > 0, and max-depth >= 0")
-    no_size = bool(args.no_size or args.fast)
+    deep, max_seconds, max_files, max_entries, max_depth = \
+        _resolve_discovery_bounds(args, "scan")
+    no_size = bool(args.no_size or not deep)
     request = {
         "path": args.path,
         "started_at": started_at,
         "max_seconds": float(max_seconds),
         "max_files": int(max_files),
+        "max_entries": int(max_entries),
         "max_depth": int(max_depth),
         "no_size": no_size,
         "profile_override": getattr(args, "profile", "auto"),
@@ -272,6 +268,181 @@ def cmd_scan(args):
         human += "\n  google-docs stubs (no local content): " + \
                  ", ".join(stats["gdoc_stubs"][:10])
     _out(args, human, stats)
+
+
+def _validate_discovery_bounds(operation: str, *, max_seconds: float,
+                               max_files: int, max_entries: int,
+                               max_depth: int, max_matches: int = 1,
+                               max_file_bytes: int = 1) -> None:
+    if not math.isfinite(max_seconds):
+        _err(f"{operation} requires --max-seconds to be finite")
+    values = {
+        "max-seconds": (max_seconds, 0, scan_worker.HARD_MAX_SECONDS),
+        "max-files": (max_files, 0, scan_worker.HARD_MAX_FILES),
+        "max-entries": (max_entries, 0, scan_worker.HARD_MAX_ENTRIES),
+        "max-depth": (max_depth, -1, scan_worker.HARD_MAX_DEPTH),
+        "max-matches": (max_matches, 0, scan_worker.HARD_MAX_MATCHES),
+        "max-file-bytes": (max_file_bytes, 0, scan_worker.HARD_MAX_FILE_BYTES),
+    }
+    for label, (value, minimum, maximum) in values.items():
+        if value <= minimum:
+            comparator = ">= 0" if label == "max-depth" else "> 0"
+            _err(f"{operation} requires --{label} {comparator}")
+        if value > maximum:
+            _err(f"{operation} --{label} exceeds the hard ceiling of {maximum}")
+
+
+def _resolve_discovery_bounds(args, operation: str):
+    if args.fast and args.deep:
+        _err(f"{operation} accepts either --fast or --deep, not both")
+    deep = bool(args.deep)
+    max_seconds = args.max_seconds if args.max_seconds is not None \
+        else (scan_worker.DEEP_MAX_SECONDS if deep
+              else scan_worker.BOUNDED_MAX_SECONDS)
+    max_files = args.max_files if args.max_files is not None \
+        else (scan_worker.DEEP_MAX_FILES if deep
+              else scan_worker.BOUNDED_MAX_FILES)
+    max_entries = args.max_entries if args.max_entries is not None \
+        else (scan_worker.DEEP_MAX_ENTRIES if deep
+              else scan_worker.BOUNDED_MAX_ENTRIES)
+    max_depth = args.max_depth if args.max_depth is not None \
+        else (scan_worker.DEEP_MAX_DEPTH if deep
+              else scan_worker.BOUNDED_MAX_DEPTH)
+    _validate_discovery_bounds(
+        operation, max_seconds=max_seconds, max_files=max_files,
+        max_entries=max_entries, max_depth=max_depth,
+    )
+    return deep, max_seconds, max_files, max_entries, max_depth
+
+
+def cmd_search(args):
+    if not args.query:
+        _err("search query must not be empty")
+    if args.regex:
+        try:
+            re.compile(args.query, re.IGNORECASE if args.ignore_case else 0)
+        except re.error as exc:
+            _err(f"invalid search pattern: {exc}", code=2)
+
+    _deep, max_seconds, max_files, max_entries, max_depth = \
+        _resolve_discovery_bounds(args, "search")
+    max_matches = args.max_matches if args.max_matches is not None \
+        else scan_worker.DEFAULT_MAX_MATCHES
+    max_file_bytes = args.max_file_bytes if args.max_file_bytes is not None \
+        else scan_worker.DEFAULT_MAX_FILE_BYTES
+    _validate_discovery_bounds(
+        "search", max_seconds=max_seconds, max_files=max_files,
+        max_entries=max_entries, max_depth=max_depth,
+        max_matches=max_matches, max_file_bytes=max_file_bytes,
+    )
+
+    started_at = time.monotonic()
+    request = {
+        "operation": "search",
+        "path": args.path,
+        "query": args.query,
+        "regex": bool(args.regex),
+        "ignore_case": bool(args.ignore_case),
+        "filename_only": bool(args.files),
+        "include_globs": list(args.include or []),
+        "exclude_globs": list(args.exclude or []),
+        "kind": "file",
+        "started_at": started_at,
+        "max_seconds": float(max_seconds),
+        "max_files": int(max_files),
+        "max_entries": int(max_entries),
+        "max_depth": int(max_depth),
+        "max_matches": int(max_matches),
+        "max_file_bytes": int(max_file_bytes),
+        "profile_override": getattr(args, "profile", "auto"),
+    }
+    result, fatal = scan_worker.run_bounded_search(request)
+    result.pop("_worker_pid", None)
+    if fatal:
+        if args.json:
+            print(json.dumps({"ok": False, "error": fatal}, ensure_ascii=False,
+                             separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(2)
+        _err(fatal["message"], code=2)
+
+    if result["filename_only"]:
+        human = (f"{result['path']}: {result['matches_found']} matching "
+                 f"filename(s)")
+    else:
+        human = (
+            f"{result['path']}: {result['matches_found']} match(es) in "
+            f"{result['files_searched']} searched file(s)"
+        )
+    if not result["complete"]:
+        human += f"; partial: {result['stop_reason']}"
+    for item in result["matches"][:20]:
+        if result["filename_only"]:
+            human += f"\n  {item['path']}"
+        else:
+            human += (f"\n  {item['path']}:{item['line']}:{item['column']} "
+                      f"{item['preview']}")
+    if len(result["matches"]) > 20:
+        human += (f"\n  … {len(result['matches']) - 20} more; rerun with --json "
+                  "to return all bounded matches")
+    _out(args, human, result)
+
+
+def cmd_list(args):
+    _deep, max_seconds, max_files, max_entries, max_depth = \
+        _resolve_discovery_bounds(args, "list")
+    max_results = args.max_results if args.max_results is not None \
+        else scan_worker.DEFAULT_MAX_RESULTS
+    _validate_discovery_bounds(
+        "list", max_seconds=max_seconds, max_files=max_files,
+        max_entries=max_entries, max_depth=max_depth,
+        max_matches=max_results,
+    )
+    started_at = time.monotonic()
+    request = {
+        "operation": "list",
+        "path": args.path,
+        "query": args.name,
+        "regex": False,
+        "glob_query": True,
+        "ignore_case": os.name == "nt",
+        "filename_only": True,
+        "include_globs": [],
+        "exclude_globs": list(args.exclude or []),
+        "kind": args.kind,
+        "started_at": started_at,
+        "max_seconds": float(max_seconds),
+        "max_files": int(max_files),
+        "max_entries": int(max_entries),
+        "max_depth": int(max_depth),
+        "max_matches": int(max_results),
+        "max_file_bytes": 1,
+        "profile_override": getattr(args, "profile", "auto"),
+    }
+    result, fatal = scan_worker.run_bounded_list(request)
+    result.pop("_worker_pid", None)
+    if fatal:
+        if args.json:
+            print(json.dumps({"ok": False, "error": fatal}, ensure_ascii=False,
+                             separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(2)
+        _err(fatal["message"], code=2)
+
+    entries = result.pop("matches")
+    result["entries"] = entries
+    result["returned"] = result.pop("matches_found")
+    result["bounds"]["max_results"] = result["bounds"].pop("max_matches")
+    if result["stop_reason"] == "max_matches":
+        result["stop_reason"] = "max_results"
+    human = f"{result['path']}: {result['returned']} bounded path result(s)"
+    if not result["complete"]:
+        human += f"; partial: {result['stop_reason']}"
+    for item in entries[:50]:
+        suffix = "/" if item["kind"] == "directory" else ""
+        human += f"\n  {item['path']}{suffix}"
+    if len(entries) > 50:
+        human += (f"\n  … {len(entries) - 50} more; rerun with --json to "
+                  "return all bounded results")
+    _out(args, human, result)
 
 
 def cmd_checkout(args):
@@ -1201,11 +1372,15 @@ def main(argv=None):
         help="initialize workspace metadata")
     add("scan", cmd_scan, (["path"], {"nargs": "?", "default": "."}),
         (["--fast"], {"action": "store_true",
-                       "help": "safe synced-folder probe: 3s/5000 files/depth 4, no per-file stat"}),
+                       "help": "compatibility alias; bounded mode is already the default"}),
+        (["--deep"], {"action": "store_true",
+                       "help": "explicit larger profile: 30s/100000 files/200000 entries/depth 64"}),
         (["--max-seconds"], {"type": float, "default": None,
-                             "help": "hard wall-clock deadline (default: 3 fast, otherwise 30)"}),
+                             "help": "hard wall-clock deadline (default: 3)"}),
         (["--max-files"], {"type": int, "default": None,
                            "help": "stop after inspecting this many files"}),
+        (["--max-entries"], {"type": int, "default": None,
+                             "help": "stop after visiting this many files/directories"}),
         (["--max-depth"], {"type": int, "default": None,
                            "help": "maximum directory depth below the root"}),
         (["--no-size"], {"action": "store_true",
@@ -1217,6 +1392,71 @@ def main(argv=None):
             "help": "validated folder profile override (default: auto)",
         }),
         help="hard-bounded metadata inventory for safe folder discovery")
+    add("search", cmd_search,
+        (["query"], {"help": "literal text to find (use --regex for a pattern)"}),
+        (["path"], {"nargs": "?", "default": "."}),
+        (["--regex"], {"action": "store_true",
+                        "help": "interpret query as a Python regular expression"}),
+        (["--ignore-case"], {"action": "store_true",
+                              "help": "case-insensitive matching"}),
+        (["--files"], {"action": "store_true",
+                        "help": "match filenames instead of opening file contents"}),
+        (["--include"], {"action": "append", "default": [], "metavar": "GLOB",
+                          "help": "search only matching file paths; repeatable"}),
+        (["--exclude"], {"action": "append", "default": [], "metavar": "GLOB",
+                          "help": "skip matching files or directory subtrees; repeatable"}),
+        (["--fast"], {"action": "store_true",
+                       "help": "compatibility alias; bounded mode is already the default"}),
+        (["--deep"], {"action": "store_true",
+                       "help": "explicit larger traversal profile"}),
+        (["--max-seconds"], {"type": float, "default": None,
+                             "help": "hard wall-clock deadline (default: 3)"}),
+        (["--max-files"], {"type": int, "default": None,
+                           "help": "stop after inspecting this many files"}),
+        (["--max-entries"], {"type": int, "default": None,
+                             "help": "stop after visiting this many files/directories"}),
+        (["--max-depth"], {"type": int, "default": None,
+                           "help": "maximum directory depth below the root"}),
+        (["--max-matches"], {"type": int, "default": None,
+                             "help": "stop after returning this many matches (default: 100)"}),
+        (["--max-file-bytes"], {"type": int, "default": None,
+                                "help": "skip files larger than this size (default: 1048576)"}),
+        (["--profile"], {
+            "choices": ["auto", "local", "git", "gdrive-sync",
+                        "onedrive-sharepoint", "dropbox"],
+            "default": "auto",
+            "help": "validated folder profile override (default: auto)",
+        }),
+        help="killable, bounded content/filename search")
+    add("list", cmd_list,
+        (["path"], {"nargs": "?", "default": "."}),
+        (["--kind"], {"choices": ["all", "file", "directory"],
+                       "default": "all", "help": "result kind (default: all)"}),
+        (["--name"], {"default": "*", "metavar": "GLOB",
+                       "help": "filename/path glob (default: *)"}),
+        (["--exclude"], {"action": "append", "default": [], "metavar": "GLOB",
+                          "help": "skip matching files or directory subtrees; repeatable"}),
+        (["--fast"], {"action": "store_true",
+                       "help": "compatibility alias; bounded mode is already the default"}),
+        (["--deep"], {"action": "store_true",
+                       "help": "explicit larger traversal profile"}),
+        (["--max-seconds"], {"type": float, "default": None,
+                             "help": "hard wall-clock deadline (default: 3)"}),
+        (["--max-files"], {"type": int, "default": None,
+                           "help": "stop after inspecting this many files"}),
+        (["--max-entries"], {"type": int, "default": None,
+                             "help": "stop after visiting this many files/directories"}),
+        (["--max-depth"], {"type": int, "default": None,
+                           "help": "maximum directory depth below the root"}),
+        (["--max-results"], {"type": int, "default": None,
+                             "help": "stop after returning this many paths (default: 500)"}),
+        (["--profile"], {
+            "choices": ["auto", "local", "git", "gdrive-sync",
+                        "onedrive-sharepoint", "dropbox"],
+            "default": "auto",
+            "help": "validated folder profile override (default: auto)",
+        }),
+        help="killable, bounded file/directory listing")
     add("checkout", cmd_checkout, (["path"], {}),
         (["--mode"], {"choices": ["auto", "preserve", "data"],
                        "default": "auto",

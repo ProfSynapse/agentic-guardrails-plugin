@@ -19,8 +19,9 @@
   "$comment_allowManagedHooksOnly": "Set allowManagedHooksOnly to true for maximum lockdown: only hooks from managed settings and managed plugins run, so users cannot add hooks that interfere with the guardrails. Test with your developers' existing hooks first.",
 
   "env": {
-    "$comment_env": "Fleet-wide guardrail tuning. AGW_LEVEL picks an enforcement bundle; the default (omit it) is 'standard'. Levels: 'strict' (archive even node_modules, no session-approval memory), 'standard' (safe default), 'relaxed' (credential reads allowed without prompting, still audited), 'observe' (shadow mode: log only, block nothing — use to trial the plugin without disrupting work). Individual knobs (AGW_SESSION_MEMORY, AGW_REGENERABLE_RM, AGW_RELAXED_ACCESS, AGW_ENFORCEMENT) override the level. AGW_ARCHIVE_MAX_BYTES caps the archive store (0 = unlimited, the safe default); oldest pre-image snapshots are evicted first, never move-archives or the newest version.",
+    "$comment_env": "Fleet-wide guardrail tuning. AGW_LEVEL picks an enforcement bundle; the default (omit it) is 'standard'. Strict also redirects every recursive raw discovery through bounded AGW; standard/relaxed allow narrow project-local forms but redirect broad scopes. AGW_STRICT_DISCOVERY overrides that behavior independently. Other individual knobs (AGW_SESSION_MEMORY, AGW_REGENERABLE_RM, AGW_RELAXED_ACCESS, AGW_ENFORCEMENT) override the level. AGW_ARCHIVE_MAX_BYTES caps the archive store (0 = unlimited); oldest pre-image snapshots are evicted first, never move-archives or the newest version.",
     "AGW_LEVEL": "standard",
+    "$comment_AGW_STRICT_DISCOVERY": "Optional boolean override. true redirects every recursive raw rg/grep/find/fd/tree/listing and native Glob/Grep request to bounded agw list/search even outside strict level.",
     "$comment_AGW_HOME": "The machine-wide archive/session store. Defaults to ~/.agw. Point it at a persistent, NON-cloud-synced path. IMPORTANT on ephemeral/remote runners: if hooks run in a per-session VM whose home (~) is wiped on teardown, ~/.agw does not persist there — set AGW_HOME to a mounted persistent volume.",
     "AGW_HOME": ""
   },

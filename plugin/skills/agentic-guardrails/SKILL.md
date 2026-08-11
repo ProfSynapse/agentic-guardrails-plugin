@@ -34,7 +34,7 @@ continuations; never guess a larger budget.
 | Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
 | Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
 | Publish a validated staged artifact | `publish-file --help` | [synced-folders.md](references/synced-folders.md) |
-| Scan a synced/virtual folder | `scan --help` | [synced-folders.md](references/synced-folders.md) |
+| Scan, list, or search a folder | Relevant verb help | [synced-folders.md](references/synced-folders.md) |
 | `.gdoc`, `.gsheet`, or `.gslides` | Connector/export workflow | [google-stubs.md](references/google-stubs.md) |
 | Environment, recovery, or policy report | `doctor --help` and status help | [diagnostics.md](references/diagnostics.md) |
 

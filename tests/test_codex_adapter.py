@@ -386,6 +386,37 @@ def test_codex_project_keyword_search_is_allowed_without_prompt():
     assert _decision(out) == "allow"
 
 
+def test_codex_native_discovery_routes_broad_and_strict_shapes(tmp_path):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    home = tmp_path / "home"
+
+    local = run_hook({
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "TODO", "path": str(project / "src")},
+        "cwd": str(project), "session_id": "codex-native-local",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "standard"})
+    assert _decision(local) != "deny"
+
+    broad = run_hook({
+        "tool_name": "Glob",
+        "tool_input": {"pattern": "**/*.py", "path": str(outside)},
+        "cwd": str(project), "session_id": "codex-native-broad",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "standard"})
+    assert _decision(broad) == "deny"
+    assert "agw list" in _reason(broad)
+
+    strict = run_hook({
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "TODO", "path": str(project / "src")},
+        "cwd": str(project), "session_id": "codex-native-strict",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "strict"})
+    assert _decision(strict) == "deny"
+
+
 def test_codex_monitor_requires_literal_command_field():
     out = run_hook({
         "tool_name": "Monitor",

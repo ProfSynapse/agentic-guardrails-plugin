@@ -219,9 +219,13 @@ unknown file. See the
 command or predict its writes. JSON identifies this explicitly as
 `"validation_scope":"contract_only"`.
 
-Folder scans are metadata-only and hard-bounded by a parent process. Use
-`agw scan <folder> --fast --json` for a small probe, or set `--max-seconds`,
-`--max-files`, and `--max-depth`; add `--no-size` on slow virtual filesystems.
+Folder discovery is hard-bounded by a parent process. Plain
+`agw scan <folder> --json` now uses the safe profile by default: 3 seconds,
+5,000 files, 10,000 total entries, depth 4, and no per-file stat. `--fast`
+remains as a compatibility alias. Use `--deep` to explicitly select the larger
+30-second/100,000-file/200,000-entry/depth-64 profile, or set a narrower or
+larger explicit `--max-seconds`, `--max-files`, `--max-entries`, and
+`--max-depth` within the CLI's absolute safety ceilings.
 The deadline includes path validation, profile detection, enumeration, metadata
 inspection, cleanup, and bounded result construction. If a filesystem call
 blocks, the parent terminates the scan worker and returns the progress received
@@ -230,6 +234,26 @@ status. Fast/no-size scans avoid per-file `stat()` calls and report
 `placeholder_detection: "limited"`. Mounted Google Drive, OneDrive/SharePoint,
 and Dropbox roots are detected automatically where local path or volume signals
 are available; `--profile` provides a validated override for known roots.
+
+`agw search <text> <folder> --json` provides the same killable bounded defaults
+for content search, with 100 returned matches and a 1 MiB per-file ceiling.
+`--regex`, `--ignore-case`, repeatable `--include`/`--exclude` globs, `--files`
+for filename matching, `--max-matches`, `--max-file-bytes`, the traversal limits
+above, and explicit `--deep` are available. `agw list <folder> --json` returns a
+bounded path list (500 results by default) with `--kind`, `--name`, `--exclude`,
+and `--max-results` filters. Content searches skip credential-type files, binary
+files, cloud placeholders, Google pointer stubs, links, and common dependency/
+build/cache directories. Scan,
+list, and search skip `.git`, `node_modules`, `.venv`, `vendor`, `target`, `dist`,
+`build`, `__pycache__`, and related caches unless one is the exact root.
+
+Raw discovery is shape-checked before launch. Standard mode keeps exact-file and
+narrow project-local searches/listings, but redirects drive/home/cloud roots,
+outside-project recursion, dependency/cache scopes, dynamic paths, ignore-
+disabling flags, and link-following traversal to `agw list` or `agw search`.
+Strict mode redirects every recursive raw discovery. This applies to shell tools
+(`rg`, `grep`, `find`, `fd`, `tree`, recursive `ls`/`Get-ChildItem`) and native
+Glob/Grep tools; Guardrails never silently rewrites their differing semantics.
 | `mv` (untracked) | `agw move` (transactional, undoable) |
 | bulk folder surgery | `agw snapshot` first, then work |
 
@@ -243,12 +267,13 @@ Escalations (`ask`): `git checkout -- <file>`, shrink-suspicious writes
 publish conflicts, `agw prune`/`apply`/`hydrate`, reading credential-type
 files (.env, keys, `~/.aws`...), files whose content prescan finds secrets or
 "CONFIDENTIAL" markings ("this might contain a password, confirm"), and
-recursive credential-keyword searches. Combining a credential file with a
+bounded credential-keyword searches outside the active project. Combining a
+credential file with a
 network tool in one command (`curl -d @.env ...`) is denied as exfiltration. Hard denies: `rm`/`shred`/
 `find -delete`, `git push --force` / `reset --hard` / `clean -f`, `dd` to
 devices, `mkfs`, `sudo`, decode-to-shell and download-to-shell pipes,
 destructive SQL/interpreter one-liners, writes to `.gdoc` stubs, placeholders,
-protected zones, the plugin itself, and the archive store.
+protected zones, the plugin itself, the archive store, and unbounded discovery.
 
 Content scans are span-aware: a destructive string that only appears as a search
 pattern or echoed data (`grep "DROP TABLE" schema.sql`) is not treated as an
@@ -288,7 +313,8 @@ evolve.
   `strict`, `standard` (default), `relaxed`, or `observe`. Observe mode shadows
   ordinary policy-pack asks/denies but keeps non-waivable safety invariants; it
   does not create a separate command ledger. Safe by default; the company sets
-  one knob.
+  one knob. `AGW_STRICT_DISCOVERY` can independently require bounded Guardrails
+  for every recursive discovery command.
   See [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md) for the
   full table.
 - **Disk budget:** `AGW_ARCHIVE_MAX_BYTES` caps the store (0 = unlimited);

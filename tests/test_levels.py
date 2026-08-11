@@ -361,6 +361,7 @@ def test_default_level_is_standard(policy, monkeypatch):
     assert cfg["session_memory"] is True
     assert cfg["regenerable_rm"] is True
     assert cfg["relaxed_access"] is False
+    assert cfg["strict_discovery"] is False
 
 
 def test_strict_level_locks_everything_down(policy, monkeypatch):
@@ -369,6 +370,13 @@ def test_strict_level_locks_everything_down(policy, monkeypatch):
     assert cfg["session_memory"] is False
     assert cfg["regenerable_rm"] is False
     assert cfg["regenerable"] == set()  # empty when the knob is off
+    assert cfg["strict_discovery"] is True
+
+
+def test_strict_discovery_knob_can_be_overridden(policy, monkeypatch):
+    monkeypatch.setenv("AGW_LEVEL", "strict")
+    monkeypatch.setenv("AGW_STRICT_DISCOVERY", "false")
+    assert engine.resolve_settings(policy)["strict_discovery"] is False
 
 
 def test_observe_level_does_not_enforce(policy, monkeypatch):

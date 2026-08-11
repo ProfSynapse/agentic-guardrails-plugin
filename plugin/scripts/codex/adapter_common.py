@@ -71,6 +71,12 @@ def to_events(payload):
         path = ti.get("file_path") or ti.get("path") or ""
         return [events.ToolEvent(kind=events.READ, paths=[path], **common)]
 
+    if tool in ("Glob", "Grep"):
+        path = ti.get("path") or ti.get("directory") or payload.get("cwd", "")
+        return [events.ToolEvent(
+            kind=events.READ, paths=[path], extra={"input": ti}, **common
+        )]
+
     if tool.startswith("mcp__"):
         # A shell-type MCP tool is routed through the EXEC path so the full
         # command rule set applies; other MCP tools keep the name-matched path.

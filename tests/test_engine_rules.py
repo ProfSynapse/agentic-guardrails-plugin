@@ -48,9 +48,35 @@ def test_windows_delete_regenerable_allowed(evaluate):
 
 def test_agw_read_only_verbs_allowed(evaluate):
     for command in ("agw scan .", "agw diff report.docx", "agw status",
-                    "agw log", "agw doctor", "agw office info report.docx",
+                    "agw list .", "agw search TODO tests",
+                    "agw search password tests --files", "agw log", "agw doctor",
+                    "agw office info report.docx",
                     "agw office get-text report.docx", "agw file read --help"):
         assert evaluate(_agw(command)).action == ALLOW, command
+
+
+def test_agw_search_preserves_credential_scope_guard(policy, tmp_path):
+    outside = engine.evaluate(
+        _ev(
+            EXEC, tool="Bash",
+            command=_agw(f'agw search password "{tmp_path}"'),
+            cwd=os.getcwd(),
+        ),
+        policy, REPO,
+    )
+    assert outside.action == ASK
+    assert outside.rule_id == "builtin:credential-hunt"
+    assert outside.presentation_details["targets"] == [str(tmp_path)]
+
+    inside = engine.evaluate(
+        _ev(
+            EXEC, tool="Bash",
+            command=_agw("agw search credential tests"),
+            cwd=os.getcwd(),
+        ),
+        policy, REPO,
+    )
+    assert inside.action == ALLOW
 
 
 def test_agw_file_read_prescans_exact_content(policy, tmp_path):
@@ -105,7 +131,7 @@ def test_agw_prune_always_asks(evaluate):
 def test_unresolved_bare_agw_names_are_never_privileged(evaluate):
     for command in ("agw status", "agw.cmd status", "agw.py --version"):
         decision = evaluate(command)
-        assert decision.action == DENY
+        assert decision.action == DENY, (command, decision.reason, decision.rule_id)
         assert decision.rule_id == "builtin:agw-impostor"
 
 
@@ -343,9 +369,12 @@ def test_credential_named_write_does_not_claim_to_read_secret(evaluate):
     ).action == DENY
 
 
-def test_credential_hunt_asks(evaluate):
-    assert evaluate("grep -ri password /home").action == ASK
-    assert evaluate("rg api_key ~").action == ASK
+def test_broad_credential_hunts_redirect_to_bounded_search(evaluate):
+    for command in ("grep -ri password /home", "rg api_key ~"):
+        decision = evaluate(command)
+        assert decision.action == DENY, (command, decision.reason, decision.rule_id)
+        assert decision.rule_id == "builtin:unbounded-discovery"
+        assert "agw search" in decision.reason
     # file-scoped grep in code is everyday work
     assert evaluate("grep password src/auth.py").action in (DEFER, ALLOW)
 
@@ -364,17 +393,120 @@ def test_project_local_recursive_keyword_searches_are_routine(evaluate):
         assert decision.rule_id == "builtin:project-diagnostic-search"
 
 
-def test_credential_search_records_specific_scope_and_trigger(policy, tmp_path):
+def test_standard_discovery_allows_narrow_project_local_shapes(policy, tmp_path,
+                                                                monkeypatch):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    target = project / "src" / "app.py"
+    target.write_text("TODO\n", encoding="utf-8")
+    monkeypatch.setenv("AGW_LEVEL", "standard")
+    commands = (
+        "rg TODO src",
+        "grep -R TODO src",
+        "rg --files src",
+        "find src -maxdepth 2 -name '*.py'",
+    )
+    for command in commands:
+        decision = engine.evaluate(
+            _ev(EXEC, tool="Bash", command=command, cwd=str(project)),
+            policy, REPO,
+        )
+        assert decision.action != DENY, (command, decision.reason)
+
+    powershell = engine.evaluate(
+        _ev(EXEC, tool="PowerShell", command="Get-ChildItem src -Recurse",
+            cwd=str(project)),
+        policy, REPO,
+    )
+    assert powershell.action != DENY
+
+
+def test_broad_or_guard_disabling_raw_discovery_redirects_to_agw(
+        policy, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    (project / "node_modules").mkdir()
+    (project / "OneDrive - Example").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root_scope = tmp_path.anchor.replace("\\", "/")
+    monkeypatch.setenv("AGW_LEVEL", "standard")
+    commands = (
+        f'rg TODO "{outside}"',
+        "rg --no-ignore TODO src",
+        "rg --hidden TODO src",
+        "rg TODO node_modules",
+        'rg TODO "OneDrive - Example"',
+        f'rg --files "{outside}"',
+        f'find "{outside}" -name "*.py"',
+        f'fd ".*" "{outside}"',
+        f'tree "{outside}"',
+        f'ls "{root_scope}"',
+        "rg TODO $HOME",
+    )
+    for command in commands:
+        decision = engine.evaluate(
+            _ev(EXEC, tool="Bash", command=command, cwd=str(project)),
+            policy, REPO,
+        )
+        assert decision.action == DENY, (command, decision.reason)
+        assert decision.rule_id == "builtin:unbounded-discovery"
+        assert "agw " in decision.reason
+
+    powershell = engine.evaluate(
+        _ev(EXEC, tool="PowerShell",
+            command=f'Get-ChildItem -LiteralPath "{outside}" -Recurse',
+            cwd=str(project)),
+        policy, REPO,
+    )
+    assert powershell.action == DENY
+    assert "agw list" in powershell.reason
+
+
+def test_strict_discovery_redirects_recursive_raw_but_allows_exact_file(
+        policy, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    target = project / "src" / "app.py"
+    target.write_text("TODO\n", encoding="utf-8")
+    monkeypatch.setenv("AGW_LEVEL", "strict")
+
+    recursive = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="rg TODO src", cwd=str(project)),
+        policy, REPO,
+    )
+    assert recursive.action == DENY
+    assert recursive.rule_id == "builtin:unbounded-discovery"
+    filename_listing = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="rg --files src", cwd=str(project)),
+        policy, REPO,
+    )
+    assert filename_listing.action == DENY
+    powershell = engine.evaluate(
+        _ev(EXEC, tool="PowerShell", command="Get-ChildItem src -Recurse",
+            cwd=str(project)),
+        policy, REPO,
+    )
+    assert powershell.action == DENY
+    exact = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="grep TODO src/app.py", cwd=str(project)),
+        policy, REPO,
+    )
+    assert exact.action != DENY
+
+
+def test_credential_search_outside_project_redirects_before_reading(policy, tmp_path):
     decision = engine.evaluate(
         _ev(EXEC, tool="Bash", command=f'rg credential "{tmp_path}"',
             cwd=os.path.dirname(REPO)),
         policy, REPO,
     )
-    assert decision.action == ASK
-    assert decision.rule_id == "builtin:credential-hunt"
-    assert decision.presentation_details["targets"] == [str(tmp_path)]
-    assert "outside the verified project" in \
-        decision.presentation_details["trigger"]
+    assert decision.action == DENY
+    assert decision.rule_id == "builtin:unbounded-discovery"
+    assert "agw search" in decision.reason
 
 
 def test_keyword_search_exemption_rejects_unsafe_scope_or_effect(evaluate):
