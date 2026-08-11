@@ -58,6 +58,10 @@ class PatchHunkCountMismatch(FileConflict):
     error_code = "patch_hunk_count_mismatch"
 
 
+class MalformedPatchHunk(FileOperationError):
+    error_code = "malformed_patch_hunk"
+
+
 class ReplaceMatchConflict(FileConflict):
     error_code = "replace_match_conflict"
 
@@ -534,8 +538,36 @@ def apply_unified_patch(original: str, patch: str) -> str:
     """Apply a single-file unified diff with exact context and no fuzz."""
     source = original.splitlines()
     lines = patch.splitlines()
-    if not lines or not any(line.startswith("@@ ") for line in lines):
+    if not lines:
         raise FileOperationError("patch must contain a unified-diff hunk")
+    expected_header = "@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@"
+    hunk_headers = []
+    for patch_line, line in enumerate(lines, start=1):
+        if not line.startswith("@@"):
+            continue
+        if not _HUNK_RE.match(line):
+            hint = (
+                "bare '@@' apply_patch shorthand is not supported; include "
+                "standard unified-diff line ranges"
+                if line == "@@"
+                else "include standard unified-diff line ranges"
+            )
+            raise MalformedPatchHunk(
+                f"malformed unified-diff hunk header at patch line {patch_line}; "
+                f"expected '{expected_header}'; {hint}",
+                {
+                    "patch_line": patch_line,
+                    "header": line,
+                    "expected_header": expected_header,
+                    "hint": hint,
+                },
+            )
+        hunk_headers.append((patch_line, line))
+    if not hunk_headers:
+        raise FileOperationError(
+            "patch must contain a unified-diff hunk with a header like "
+            f"'{expected_header}'"
+        )
     if sum(line.startswith("--- ") for line in lines) > 1:
         raise FileOperationError("patch must describe exactly one file")
     result = []

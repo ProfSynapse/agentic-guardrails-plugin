@@ -71,6 +71,13 @@ then `python`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
 out in plain-copy mode. Fleet rollout: see
 [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md).
 
+Third-party Office libraries are not bundled with the plugin. `agw office`
+content reads and mutations require the corresponding package in the same
+Python runtime selected by the launcher: `python-docx` for `.docx`, `openpyxl`
+for `.xlsx`, and `python-pptx` for `.pptx`. Package-level inspection and some
+checkout paths use standard-library fallbacks, so a capability check may succeed
+even when a content reader still needs its format-specific library.
+
 ## Updating
 
 New versions ship as a `version` bump on the default branch. Clients cache by
