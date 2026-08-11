@@ -230,6 +230,20 @@ def test_present_and_absent_preimage_receipts(tmp_path, monkeypatch):
     assert all(r.policy_revision == "test-revision" for r in result.receipts)
     assert all(preimages.receipt_valid(r, "test-revision") for r in result.receipts)
     assert all(not preimages.receipt_valid(r, "changed-revision") for r in result.receipts)
+    present_contract = by_target[str(present)].to_dict()
+    absent_contract = by_target[str(absent)].to_dict()
+    assert present_contract["target_existed_before"] is True
+    assert present_contract["preimage_captured"] is True
+    assert present_contract["rollback_available"] is True
+    assert present_contract["recovery_record_kind"] == "archive"
+    assert present_contract["recovery_record_state"] == "COMMITTED"
+    assert present_contract["undo_argv"][-1] == present_contract["transaction_id"]
+    assert by_target[str(present)].to_dict("parent-transaction")["undo_argv"][-1] \
+        == "parent-transaction"
+    assert absent_contract["target_existed_before"] is False
+    assert absent_contract["preimage_captured"] is False
+    assert absent_contract["rollback_available"] is True
+    assert absent_contract["recovery_record_kind"] == "absent_tombstone"
 
 
 def test_preimage_capture_requires_policy_revision(tmp_path, monkeypatch):
@@ -239,6 +253,26 @@ def test_preimage_capture_requires_policy_revision(tmp_path, monkeypatch):
     result = preimages.prepare([str(target)], "test edit", 1024)
     assert not result.ok
     assert "policy revision" in result.reason.lower()
+
+
+def test_absent_receipt_rejects_retargeted_parent_resolution(tmp_path, monkeypatch):
+    target = tmp_path / "linked-parent" / "new.txt"
+    target.parent.mkdir()
+    result = preimages.prepare(
+        [str(target)], "test create", 1024, policy_revision="test-revision"
+    )
+    assert result.ok
+    receipt = result.receipts[0]
+    original_canonical = preimages.archive_tx.canonical_path
+
+    def retargeted(path):
+        resolved = original_canonical(path)
+        if os.path.abspath(str(path)) == os.path.abspath(str(target)):
+            return resolved + "-retargeted"
+        return resolved
+
+    monkeypatch.setattr(preimages.archive_tx, "canonical_path", retargeted)
+    assert not preimages.receipt_valid(receipt, "test-revision")
 
 
 def test_allocated_size_does_not_require_posix_st_blocks():
@@ -452,7 +486,7 @@ def test_enforce_budget_unlimited_by_default():
     assert store.enforce_budget(None) == {"enforced": False}
 
 
-def test_enforce_budget_evicts_oldest_copies_keeps_newest(tmp_path):
+def test_enforce_budget_plans_oldest_copies_without_evicting(tmp_path):
     f = tmp_path / "big.bin"
     # five pre-image copies of the same file, growing so they exceed any budget
     for i in range(5):
@@ -463,22 +497,39 @@ def test_enforce_budget_evicts_oldest_copies_keeps_newest(tmp_path):
 
     result = store.enforce_budget(60_000)
     assert result["enforced"] is True
-    assert result["evicted"] >= 1
+    assert result["over_budget"] is True
+    assert result["required_free_bytes"] == result["retention_plan"]["bytes_to_free"]
+    assert result["evicted"] == 0
+    assert result["destructive"] is False
+    assert result["retention_plan"]["candidates"]
+    assert store.retention_plan_valid(result["retention_plan"])
     # the newest version is never evicted — restore must always have something
     remaining = [v for v in store.list_versions(str(f))
                  if os.path.exists(v["dest"])]
-    assert remaining, "budget eviction must never remove the last copy"
+    assert len(remaining) == len(versions_before)
     newest = versions_before[-1]["dest"]
     assert os.path.exists(newest)
+    candidate_paths = {
+        item["artifact"] for item in result["retention_plan"]["candidates"]
+    }
+    assert newest not in candidate_paths
+
+    tampered = dict(result["retention_plan"])
+    tampered["budget_bytes"] += 1
+    assert not store.retention_plan_valid(tampered)
 
 
-def test_enforce_budget_never_evicts_move_archives(tmp_path):
+def test_enforce_budget_never_selects_move_archives(tmp_path):
     # a moved file is the *only* copy of displaced data — must survive any budget
     f = tmp_path / "displaced.txt"
     f.write_text("y" * 100_000)
     entry = store.archive_file(str(f), mode="move", reason="rm-replacement")
-    store.enforce_budget(1)  # absurdly tight budget
+    result = store.enforce_budget(1)  # absurdly tight budget
     assert os.path.exists(entry["dest"])
+    assert entry["transaction_id"] not in {
+        item["transaction_id"]
+        for item in result["retention_plan"]["candidates"]
+    }
 
 
 def test_enforce_budget_noop_when_under_budget(tmp_path):
@@ -487,3 +538,4 @@ def test_enforce_budget_noop_when_under_budget(tmp_path):
     _snapshot_copy(f)
     result = store.enforce_budget(10_000_000)
     assert result["evicted"] == 0
+    assert result["required_free_bytes"] == 0

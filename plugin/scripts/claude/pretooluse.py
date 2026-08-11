@@ -227,15 +227,6 @@ def main():
             f"{routed_workflow}."
         )
 
-    # Opportunistic retention: keep the store under a configured budget.
-    try:
-        budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES",
-                                    policy.settings.get("archive_max_bytes", 0)) or 0)
-        if budget:
-            store.enforce_budget(budget)
-    except Exception:
-        pass
-
     if out:
         json.dump(out, sys.stdout)
 

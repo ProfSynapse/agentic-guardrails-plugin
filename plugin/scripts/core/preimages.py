@@ -7,6 +7,7 @@ import shutil
 import stat
 
 from . import archive_transactions as archive_tx
+from . import recovery_contracts
 from . import store
 
 
@@ -19,6 +20,33 @@ class PreimageReceipt:
     identity: tuple = ()
     transaction_id: str = ""
     policy_revision: str = ""
+    recovery_record_kind: str = ""
+    recovery_record_state: str = ""
+
+    def to_dict(self, undo_transaction_id: str = "") -> dict:
+        """Return the receipt and its explicit recovery contract.
+
+        Multi-file callers should pass their parent transaction id so the
+        serialized undo command addresses the atomic mutation record.
+        """
+        contract = recovery_contracts.recovery_receipt_fields(
+            target=self.target,
+            state=self.state,
+            artifact=self.artifact,
+            transaction_id=self.transaction_id,
+            recovery_record_kind=self.recovery_record_kind,
+            recovery_record_state=self.recovery_record_state,
+            undo_transaction_id=undo_transaction_id,
+        )
+        return {
+            "target": self.target,
+            "state": self.state,
+            "artifact": self.artifact,
+            "sha256": self.sha256,
+            "identity": list(self.identity),
+            "policy_revision": self.policy_revision,
+            **contract,
+        }
 
 
 @dataclass
@@ -99,6 +127,8 @@ def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0
                     path, "ABSENT", identity=(parent,) + after,
                     transaction_id=tombstone["transaction_id"],
                     policy_revision=policy_revision,
+                    recovery_record_kind="absent_tombstone",
+                    recovery_record_state=str(tombstone.get("state") or ""),
                 ))
                 continue
 
@@ -160,6 +190,8 @@ def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0
                 path, "PRESENT", artifact=artifact, sha256=before_hash,
                 identity=before_identity, transaction_id=transaction_id,
                 policy_revision=policy_revision,
+                recovery_record_kind="archive",
+                recovery_record_state=str(record.get("state") or ""),
             ))
         except (OSError, ValueError, TypeError) as exc:
             return _plain_failure(path, f"The recovery copy could not be completed ({exc}).")
@@ -182,8 +214,20 @@ def receipt_valid(receipt: PreimageReceipt, current_policy_revision: str) -> boo
         record = archive_tx.load(store.agw_home(), receipt.transaction_id)
     except (OSError, ValueError):
         return False
-    return (
-        record.get("state") == archive_tx.COMMITTED
-        and record.get("policy_revision") == current_policy_revision
-        and record.get("kind") in {"archive", "absent_tombstone"}
+    if record.get("state") != archive_tx.COMMITTED \
+            or record.get("policy_revision") != current_policy_revision \
+            or archive_tx.canonical_path(record.get("src", "")) \
+            != archive_tx.canonical_path(receipt.target):
+        return False
+    if receipt.state == "ABSENT":
+        return store.absent_tombstone_is_verified(
+            record, receipt.target, receipt.identity
+        )
+    if receipt.state != "PRESENT" or record.get("kind") != "archive" \
+            or receipt.sha256 != record.get("sha256") \
+            or archive_tx.canonical_path(receipt.artifact) \
+            != archive_tx.canonical_path(record.get("dest", "")):
+        return False
+    return archive_tx.entry_is_verified(
+        store.agw_home(), archive_tx.entry_from_record(record), receipt.target
     )

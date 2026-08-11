@@ -19,13 +19,23 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from datetime import datetime
 
 from . import archive_transactions as archive_tx
+from . import recovery_contracts
 
 SCHEMA_VERSION = 1
 _WINDOWS_SHARING_WINERRORS = {32, 33}
 _WINDOWS_MISSING_LOCK_RETRIES = 3
+
+
+class TransactionUndoError(RuntimeError):
+    """An undo stopped safely; recovery records identify every displaced state."""
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
 
 
 def _ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
@@ -374,11 +384,41 @@ def record_absent_tombstone(target: str, identity: tuple, reason: str = "") -> d
     return archive_tx.create_absent_tombstone(agw_home(), target, identity, reason)
 
 
+def absent_tombstone_is_verified(record: dict, target: str,
+                                 expected_identity: tuple = ()) -> bool:
+    """Verify immutable source and parent identity for an ABSENT record."""
+    if record.get("kind") != "absent_tombstone" \
+            or record.get("state") != archive_tx.COMMITTED:
+        return False
+    target = os.path.abspath(target)
+    if os.path.abspath(str(record.get("src") or "")) != target \
+            or record.get("source_identity") != archive_tx.canonical_path(target):
+        return False
+    recorded_identity = tuple(record.get("identity") or ())
+    if expected_identity and recorded_identity != tuple(expected_identity):
+        return False
+    if len(recorded_identity) < 3:
+        return bool(recorded_identity)
+    try:
+        parent = str(recorded_identity[0])
+        info = os.stat(parent, follow_symlinks=False)
+    except (OSError, TypeError, ValueError):
+        return False
+    expected_dev, expected_ino = recorded_identity[1:3]
+    return (
+        (expected_dev is None or getattr(info, "st_dev", None) == expected_dev)
+        and (expected_ino is None or getattr(info, "st_ino", None) == expected_ino)
+    )
+
+
 def rollback_absent_tombstone(transaction_id: str) -> dict:
     record = archive_tx.load(agw_home(), transaction_id)
-    if record.get("kind") != "absent_tombstone" or record.get("state") != archive_tx.COMMITTED:
-        raise ValueError("rollback requires a committed ABSENT tombstone")
-    target = record["src"]
+    target = str(record.get("src") or "")
+    if not absent_tombstone_is_verified(record, target):
+        raise ValueError(
+            "rollback requires a committed ABSENT tombstone whose source "
+            "and parent identity are unchanged"
+        )
     archived = None
     if os.path.lexists(target):
         archived = archive_file(
@@ -390,6 +430,339 @@ def rollback_absent_tombstone(transaction_id: str) -> dict:
         rollback_archive_transaction=(archived or {}).get("transaction_id", ""),
     )
     return {"target": target, "restored": "ABSENT", "archived": archived}
+
+
+def _mutation_record(transaction_id: str) -> dict:
+    """Find one addressable file mutation without broadening undo to other ops."""
+    for operation in reversed(oplog_read()):
+        kind = operation.get("op")
+        if kind == "file-transaction-state" \
+                and operation.get("prepared_transaction_id") == transaction_id:
+            if operation.get("state") != "COMMITTED":
+                raise TransactionUndoError(
+                    "transaction recovery is prepared but its after-state is not verified",
+                    {
+                        "transaction_id": transaction_id,
+                        "state": operation.get("state", "NEEDS_ATTENTION"),
+                        "cause": operation.get("error", ""),
+                    },
+                )
+            return {
+                **operation, "op": "file-transaction",
+                "transaction_id": transaction_id,
+            }
+        if kind == "file-transaction" \
+                and operation.get("transaction_id") == transaction_id:
+            return operation
+        if kind == "file-mutation" and transaction_id in {
+                operation.get("transaction_id"),
+                operation.get("snapshot_transaction_id")}:
+            return operation
+        if kind == "file-transaction-prepared" \
+                and operation.get("transaction_id") == transaction_id:
+            raise TransactionUndoError(
+                "transaction recovery is prepared but its after-state is not verified",
+                {"transaction_id": transaction_id, "state": "PREPARED",
+                 "operations": operation.get("operations", [])},
+            )
+    raise LookupError(f"no file mutation transaction found: {transaction_id}")
+
+
+def _undo_members(operation: dict) -> list[dict]:
+    if operation.get("op") == "file-mutation":
+        raw_members = [operation]
+    elif operation.get("op") == "file-transaction":
+        raw_members = operation.get("operations") or []
+    else:
+        raise ValueError("transaction undo supports file mutations only")
+    members = []
+    seen_targets = set()
+    for item in raw_members:
+        raw_target = str(item.get("path") or item.get("src") or "")
+        before = str(item.get("before_hash") or item.get("before_sha256") or "")
+        after = str(item.get("after_hash") or item.get("after_sha256") or "")
+        snapshot_id = str(item.get("snapshot_transaction_id") or "")
+        if not raw_target or not before or not after or not snapshot_id:
+            raise ValueError("file mutation record is missing recovery metadata")
+        target = os.path.abspath(raw_target)
+        identity = archive_tx.canonical_path(target)
+        if identity in seen_targets:
+            raise ValueError(f"file mutation record repeats target: {target}")
+        seen_targets.add(identity)
+        members.append({
+            "path": target,
+            "before_sha256": before,
+            "after_sha256": after,
+            "snapshot_transaction_id": snapshot_id,
+            "before_identity": item.get("before_identity"),
+            "after_identity": item.get("after_identity"),
+        })
+    if not members:
+        raise ValueError("file mutation transaction has no operations")
+    return members
+
+
+def _current_file_hash(path: str) -> str:
+    if not os.path.lexists(path):
+        return "absent"
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise ValueError(f"undo target is not an ordinary local file: {path}")
+    return file_sha256(path)
+
+
+def path_identity(path: str) -> dict:
+    """Return an exact, JSON-safe identity for one literal filesystem target."""
+    path = os.path.abspath(path)
+    if not os.path.lexists(path):
+        return {
+            "state": "ABSENT",
+            "path": path,
+            "canonical_path": archive_tx.canonical_path(path),
+        }
+    info = os.lstat(path)
+    link = archive_tx.link_metadata(path)
+    if link is not None:
+        kind = "link"
+    elif os.path.isfile(path):
+        kind = "file"
+    elif os.path.isdir(path):
+        kind = "directory"
+    else:
+        kind = "other"
+    identity = {
+        "state": "PRESENT",
+        "path": path,
+        "canonical_path": archive_tx.canonical_path(path),
+        "kind": kind,
+        "st_dev": getattr(info, "st_dev", None),
+        "st_ino": getattr(info, "st_ino", None),
+        "st_mode": getattr(info, "st_mode", None),
+        "st_size": getattr(info, "st_size", None),
+        "st_mtime_ns": getattr(info, "st_mtime_ns", None),
+        "st_ctime_ns": getattr(info, "st_ctime_ns", None),
+    }
+    if kind != "file":
+        fingerprint_kind, digest, size = archive_tx.artifact_fingerprint(path)
+        identity["fingerprint"] = {
+            "kind": fingerprint_kind, "sha256": digest, "size": size,
+        }
+    if link is not None:
+        identity["link"] = link
+    return identity
+
+
+def _verify_current_after(member: dict):
+    target = member["path"]
+    expected_hash = member["after_sha256"]
+    if expected_hash == "absent":
+        if os.path.lexists(target):
+            raise ValueError(f"undo conflict for {target}: expected absence")
+        expected_identity = member.get("after_identity")
+        if expected_identity and path_identity(target) != expected_identity:
+            raise ValueError(f"undo conflict for {target}: absence identity changed")
+        return
+    if os.path.isfile(target) and not os.path.islink(target):
+        actual = file_sha256(target)
+        if actual != expected_hash:
+            raise ValueError(
+                f"undo conflict for {target}: expected current hash "
+                f"{expected_hash}, found {actual}"
+            )
+        expected_identity = member.get("after_identity")
+        if expected_identity and path_identity(target) != expected_identity:
+            raise ValueError(f"undo conflict for {target}: target identity changed")
+        return
+    expected_identity = member.get("after_identity")
+    if not expected_identity:
+        raise ValueError(
+            f"undo conflict for {target}: non-file target lacks exact after_identity"
+        )
+    actual_identity = path_identity(target)
+    if actual_identity != expected_identity:
+        raise ValueError(f"undo conflict for {target}: target identity changed")
+
+
+def _verify_restored_before(member: dict, snapshot: dict):
+    target = member["path"]
+    if member["before_sha256"] == "absent":
+        if os.path.lexists(target):
+            raise OSError(f"undo verification failed for {target}: expected absence")
+        return
+    expected = (
+        snapshot.get("source_kind", snapshot.get("artifact_kind")),
+        snapshot.get("sha256"), snapshot.get("size"),
+    )
+    try:
+        actual = archive_tx.artifact_fingerprint(target)
+    except OSError as exc:
+        raise OSError(f"undo verification failed for {target}: {exc}") from exc
+    if actual != expected:
+        raise OSError(
+            f"undo verification failed for {target}: restored fingerprint changed"
+        )
+
+
+def _verified_snapshot(member: dict) -> dict:
+    transaction_id = member["snapshot_transaction_id"]
+    record = archive_tx.load(agw_home(), transaction_id)
+    target = member["path"]
+    if record.get("state") != archive_tx.COMMITTED \
+            or archive_tx.canonical_path(record.get("src", "")) \
+            != archive_tx.canonical_path(target):
+        raise ValueError(f"recovery record is not committed for target: {target}")
+    before = member["before_sha256"]
+    if before == "absent":
+        if not absent_tombstone_is_verified(record, target):
+            raise ValueError(f"recovery record does not verify prior absence: {target}")
+        return record
+    if record.get("kind") != "archive" or record.get("sha256") != before:
+        raise ValueError(f"recovery record does not match the prior hash: {target}")
+    entry = archive_tx.entry_from_record(record)
+    if not archive_tx.entry_is_verified(agw_home(), entry, target):
+        raise ValueError(f"recovery artifact failed verification: {target}")
+    return record
+
+
+def _absent_identity(path: str) -> tuple:
+    parent = os.path.dirname(path)
+    while parent and not os.path.isdir(parent):
+        previous = parent
+        parent = os.path.dirname(parent)
+        if parent == previous:
+            break
+    if not parent or not os.path.isdir(parent):
+        raise OSError(f"undo target has no verifiable parent folder: {path}")
+    info = os.stat(parent, follow_symlinks=False)
+    return (
+        os.path.realpath(parent), getattr(info, "st_dev", None),
+        getattr(info, "st_ino", None), getattr(info, "st_mtime_ns", None),
+    )
+
+
+def _capture_undo_prestate(path: str, undo_id: str) -> dict:
+    """Capture the state being displaced by undo and return its transaction."""
+    if os.path.lexists(path):
+        entry = archive_file(
+            path, mode="move", reason=f"pre-image before transaction undo {undo_id}",
+            actor="guardrails-recovery",
+        )
+        return {
+            "kind": "archive", "transaction_id": entry["transaction_id"],
+            "entry": entry,
+        }
+    tombstone = record_absent_tombstone(
+        path, _absent_identity(path), reason=f"verified absence before undo {undo_id}"
+    )
+    return {
+        "kind": "absent_tombstone",
+        "transaction_id": tombstone["transaction_id"],
+    }
+
+
+def _restore_snapshot(member: dict, snapshot: dict):
+    target = member["path"]
+    if member["before_sha256"] == "absent":
+        if os.path.lexists(target):
+            raise FileExistsError(f"undo expected an absent target after capture: {target}")
+        return
+    archive_tx.publish_restore(
+        agw_home(), archive_tx.entry_from_record(snapshot), target
+    )
+
+
+def _rollback_undo_member(member: dict, undo_id: str):
+    """Restore the after-state captured immediately before an undo member."""
+    target = member["path"]
+    recovery_id = member["undo_recovery_transaction_id"]
+    recovery = archive_tx.load(agw_home(), recovery_id)
+    if os.path.lexists(target):
+        archive_file(
+            target, mode="move", reason=f"failed transaction undo {undo_id}",
+            actor="guardrails-recovery",
+        )
+    if recovery.get("kind") == "archive":
+        entry = archive_tx.entry_from_record(recovery)
+        if not archive_tx.entry_is_verified(agw_home(), entry, target):
+            raise ValueError(f"undo rollback artifact failed verification: {target}")
+        archive_tx.publish_restore(agw_home(), entry, target)
+        expected = (
+            recovery.get("source_kind", recovery.get("artifact_kind")),
+            recovery.get("sha256"), recovery.get("size"),
+        )
+        if archive_tx.artifact_fingerprint(target) != expected:
+            raise OSError(f"undo rollback fingerprint changed: {target}")
+    elif not absent_tombstone_is_verified(recovery, target):
+        raise ValueError(f"undo rollback record is not verified: {target}")
+    elif os.path.lexists(target):
+        raise OSError(f"undo rollback expected absence: {target}")
+
+
+def undo_transaction(transaction_id: str) -> dict:
+    """Reverse one logged file mutation after strict hash and artifact checks.
+
+    The current state displaced by the reversal is itself archived in a
+    committed recovery transaction. No recovery record is consumed or deleted.
+    """
+    if not transaction_id:
+        raise ValueError("transaction id is required")
+    operation = _mutation_record(transaction_id)
+    members = _undo_members(operation)
+    prior_undos = {
+        item.get("undid_transaction_id") for item in oplog_read()
+        if item.get("op") == "transaction-undo" and item.get("state") == "COMMITTED"
+    }
+    if transaction_id in prior_undos:
+        raise ValueError(f"transaction was already undone: {transaction_id}")
+
+    snapshots = []
+    for member in members:
+        _verify_current_after(member)
+        snapshots.append(_verified_snapshot(member))
+
+    undo_id = uuid.uuid4().hex
+    completed = []
+    with Lock("transaction-undo"):
+        try:
+            for member, snapshot in zip(members, snapshots):
+                _verify_current_after(member)
+                displaced = _capture_undo_prestate(member["path"], undo_id)
+                result = {**member, "undo_recovery_transaction_id":
+                          displaced["transaction_id"]}
+                completed.append(result)
+                _restore_snapshot(member, snapshot)
+                _verify_restored_before(member, snapshot)
+        except Exception as exc:
+            rollback_errors = []
+            for member in reversed(completed):
+                try:
+                    _rollback_undo_member(member, undo_id)
+                except Exception as rollback_exc:
+                    rollback_errors.append({
+                        "path": member["path"], "error": str(rollback_exc),
+                        "undo_recovery_transaction_id":
+                            member["undo_recovery_transaction_id"],
+                    })
+            failure = {
+                "op": "transaction-undo-failed", "transaction_id": undo_id,
+                "undid_transaction_id": transaction_id,
+                "state": "NEEDS_ATTENTION", "operations": completed,
+                "error": str(exc), "rolled_back": not rollback_errors,
+                "rollback_errors": rollback_errors,
+            }
+            oplog_append(failure)
+            raise TransactionUndoError(
+                "transaction undo stopped; displaced states remain recoverable",
+                failure,
+            ) from exc
+
+    result = {
+        "op": "transaction-undo", "transaction_id": undo_id,
+        "undid_transaction_id": transaction_id,
+        "undid_op": operation.get("op"), "state": "COMMITTED",
+        "operations": completed,
+    }
+    oplog_append(result)
+    return result
 
 
 def restore(src: str, version: int = 0, overwrite: bool = False) -> dict:
@@ -533,58 +906,104 @@ def session_approve(session_id: str, memo_key: str):
 
 # --- retention / disk budget --------------------------------------------------
 
+def retention_inventory() -> list[dict]:
+    """Return verified copy artifacts eligible for human-reviewed retention."""
+    records = []
+    for discovered in archive_tx.discover(agw_home()):
+        record = discovered.get("record")
+        if not record or record.get("kind") != "archive" \
+                or record.get("state") != archive_tx.COMMITTED \
+                or record.get("mode") != "copy":
+            continue
+        entry = archive_tx.entry_from_record(record)
+        if not archive_tx.entry_is_verified(agw_home(), entry, record.get("src")):
+            continue
+        records.append({
+            "transaction_id": record["transaction_id"],
+            "source": record["src"],
+            "artifact": record["dest"],
+            "sha256": record.get("sha256", ""),
+            "bytes": int(record.get("size") or 0),
+            "created_at_ns": int(record.get("created_at_ns") or 0),
+            "version": int(record.get("version") or 0),
+        })
+    return records
+
+
+def select_retention_candidates(inventory: list[dict], bytes_to_free: int) -> list[dict]:
+    """Pure selection: oldest verified copies first, newest source copy kept."""
+    newest = {}
+    for item in inventory:
+        key = archive_tx.canonical_path(item["source"])
+        marker = (item["created_at_ns"], item["version"], item["transaction_id"])
+        if key not in newest or marker > newest[key][0]:
+            newest[key] = (marker, item["transaction_id"])
+    eligible = [
+        item for item in inventory
+        if item["transaction_id"]
+        != newest[archive_tx.canonical_path(item["source"])][1]
+    ]
+    eligible.sort(key=lambda item: (
+        item["created_at_ns"], item["version"], item["transaction_id"]
+    ))
+    selected = []
+    accumulated = 0
+    for item in eligible:
+        if accumulated >= max(0, bytes_to_free):
+            break
+        selected.append(dict(item))
+        accumulated += item["bytes"]
+    return selected
+
+
+def plan_retention(max_bytes: int) -> dict:
+    """Build a hash-bound retention dry run. This function never mutates data."""
+    max_bytes = int(max_bytes or 0)
+    total = archive_size_bytes()
+    configured = max_bytes > 0
+    required = max(0, total - max_bytes) if configured else 0
+    inventory = retention_inventory() if required else []
+    candidates = select_retention_candidates(inventory, required)
+    reclaimable = sum(item["bytes"] for item in candidates)
+    plan = {
+        "schema_version": 1,
+        "operation": "retention-plan",
+        "dry_run": True,
+        "automatic_apply_available": False,
+        "budget_configured": configured,
+        "budget_bytes": max_bytes if configured else 0,
+        "current_bytes": total,
+        "over_budget": bool(required),
+        "bytes_to_free": required,
+        "planned_reclaim_bytes": reclaimable,
+        "projected_bytes": max(0, total - reclaimable),
+        "capacity_satisfied_by_plan": reclaimable >= required,
+        "candidates": candidates,
+    }
+    return recovery_contracts.bind_plan_hash(plan)
+
+
+def retention_plan_valid(plan: dict) -> bool:
+    return recovery_contracts.plan_hash_valid(plan)
+
 def enforce_budget(max_bytes: int) -> dict:
-    """Keep the archive under max_bytes by evicting oldest *pre-image copy*
-    snapshots first. NEVER evicts move-mode archives (the only copy of a
-    displaced file) or the newest version in any file_dir. Returns a summary.
+    """Assess a configured budget without evicting recovery artifacts.
+
+    ``enforced`` retains its compatibility meaning that a positive budget is
+    configured; ``over_budget`` reports whether a human-reviewed plan is needed.
     A budget of 0/None means unlimited (the safe default — keep everything)."""
     if not max_bytes or max_bytes <= 0:
         return {"enforced": False}
-    total = archive_size_bytes()
-    if total <= max_bytes:
-        return {"enforced": True, "evicted": 0, "bytes": total, "freed": 0}
-
-    root = os.path.join(agw_home(), "archive")
-    candidates = []  # (ts, path, size, file_dir)
-    for file_dir, _dirs, files in os.walk(root):
-        versions = sorted(f for f in files if f.startswith("v") and "_" in f)
-        if len(versions) <= 1:
-            continue  # never evict the sole version of anything
-        manifest = os.path.join(file_dir, "manifest.jsonl")
-        modes = {}
-        try:
-            with open(manifest, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        e = json.loads(line)
-                        modes[os.path.basename(e.get("dest", ""))] = e.get("mode")
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            modes = {}
-        for v in versions[:-1]:  # keep the newest version in every file_dir
-            if modes.get(v) and modes.get(v) != "copy":
-                continue  # only evict pre-image *copies*, never moves
-            full = os.path.join(file_dir, v)
-            try:
-                candidates.append((v.split("_", 2)[1] if v.count("_") >= 2 else v,
-                                   full, os.path.getsize(full), file_dir))
-            except OSError:
-                continue
-    candidates.sort()  # oldest timestamp first
-    freed, evicted = 0, 0
-    with Lock("retention"):
-        for _ts_key, full, size, _fd in candidates:
-            if total - freed <= max_bytes:
-                break
-            try:
-                os.unlink(full)
-                _append_jsonl(os.path.join(agw_home(), "oplog.jsonl"),
-                              {"op": "evict", "dest": full, "bytes": size,
-                               "reason": "archive budget"})
-                freed += size
-                evicted += 1
-            except OSError:
-                continue
-    return {"enforced": True, "evicted": evicted, "bytes": total - freed,
-            "freed": freed, "budget": max_bytes}
+    plan = plan_retention(max_bytes)
+    return {
+        "enforced": True,
+        "evicted": 0,
+        "bytes": plan["current_bytes"],
+        "freed": 0,
+        "budget": plan["budget_bytes"],
+        "over_budget": plan["over_budget"],
+        "required_free_bytes": plan["bytes_to_free"],
+        "destructive": False,
+        "retention_plan": plan,
+        "plan_hash": plan["plan_sha256"],
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import bisect
 from contextlib import ExitStack
+import difflib
 import hashlib
 import errno
 import fnmatch
@@ -12,20 +13,21 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import tempfile
 import time
 import uuid
 from typing import Callable, Optional
 
 from core import engine, preimages, profiles, store
+import execution
+import path_safety
 
 
 MAX_TEXT_BYTES = 32 * 1024 * 1024
 DEFAULT_READ_LINES = 200
 DEFAULT_READ_BYTES = 32 * 1024
 MAX_READ_OUTPUT_BYTES = 256 * 1024
-MAX_CAPTURE_BYTES = 64 * 1024
+MAX_CAPTURE_BYTES = execution.MAX_CAPTURE_BYTES
 OUTPUT_OBSERVATION_SECONDS = 5.0
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -82,13 +84,17 @@ class PlaceholderReadRefused(FileOperationError):
     error_code = "placeholder_read_refused"
 
 
+class UnsafeTarget(FileOperationError):
+    error_code = "unsafe_target"
+
+
 def resolve_target(path: str, *, allow_missing_parent: bool = False) -> str:
     raw = str(path or "").strip()
     if not raw or "\x00" in raw:
         raise FileOperationError("target path is missing or invalid")
     if any(char in raw for char in "*?["):
         raise FileOperationError("target path must be literal, not a wildcard")
-    target = os.path.abspath(os.path.expanduser(raw))
+    target = path_safety.identify(raw).absolute
     if os.path.isdir(target):
         raise FileOperationError("target must be a file, not a directory")
     parent = os.path.dirname(target)
@@ -113,6 +119,17 @@ def _current_hash(path: str) -> Optional[str]:
         return None
     if not os.path.isfile(path) or os.path.islink(path):
         raise FileOperationError("target must be an ordinary local file")
+    state = os.stat(path, follow_symlinks=False)
+    if profiles.is_placeholder(path, st=state):
+        raise UnsafeTarget(
+            "target is a cloud-only placeholder; hydrate it before mutation",
+            {"path": path, "classification": "cloud_placeholder"},
+        )
+    if profiles.is_sync_artifact(path):
+        raise UnsafeTarget(
+            "sync lock/conflict artifacts are not valid mutation targets",
+            {"path": path, "classification": "sync_artifact"},
+        )
     return store.file_sha256(path)
 
 
@@ -473,6 +490,7 @@ def write_text(
                 "before_hash": before or "absent", "after_hash": after,
                 "snapshot_transaction_id": receipt.transaction_id,
                 "snapshot_state": receipt.state,
+                "recovery": receipt.to_dict(),
             }
         finally:
             if stage and os.path.exists(stage):
@@ -692,6 +710,70 @@ def _plan_payload(item: dict, inline_key: str, file_key: str, working: str,
     return text
 
 
+def _text_shape(text: str, *, encoding: str = "utf-8") -> dict:
+    crlf = text.count("\r\n")
+    remaining = text.replace("\r\n", "")
+    lf = remaining.count("\n")
+    cr = remaining.count("\r")
+    kinds = [name for name, count in (("crlf", crlf), ("lf", lf), ("cr", cr)) if count]
+    newline = kinds[0] if len(kinds) == 1 else ("mixed" if kinds else "none")
+    return {
+        "encoding": encoding,
+        "bytes": len(text.encode("utf-8")),
+        "lines": len(text.splitlines()),
+        "newline": newline,
+        "final_newline": text.endswith(("\n", "\r")),
+    }
+
+
+def _target_text_encoding(path: str, existed: bool) -> str:
+    if not existed:
+        return "absent"
+    try:
+        with open(path, "rb") as handle:
+            return "utf-8-sig" if handle.read(3) == b"\xef\xbb\xbf" else "utf-8"
+    except OSError:
+        return "utf-8"
+
+
+def _line_changes(before: str, after: str) -> dict:
+    old_lines = before.splitlines()
+    new_lines = after.splitlines()
+    inserted = deleted = replaced = 0
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+            None, old_lines, new_lines, autojunk=False).get_opcodes():
+        if tag == "insert":
+            inserted += new_end - new_start
+        elif tag == "delete":
+            deleted += old_end - old_start
+        elif tag == "replace":
+            deleted += old_end - old_start
+            inserted += new_end - new_start
+            replaced += max(old_end - old_start, new_end - new_start)
+    return {"inserted": inserted, "deleted": deleted, "replaced_span": replaced}
+
+
+def _plan_review(path: str, before: str, after: str, *, existed: bool) -> dict:
+    before_encoding = _target_text_encoding(path, existed)
+    old_shape = _text_shape(before, encoding=before_encoding)
+    if not existed:
+        old_shape = {
+            "encoding": "absent", "bytes": 0, "lines": 0,
+            "newline": "none", "final_newline": False,
+        }
+    new_shape = _text_shape(after, encoding="utf-8")
+    return {
+        "before": old_shape,
+        "after": new_shape,
+        "line_changes": _line_changes(before, after),
+        "encoding_changed": old_shape["encoding"] not in {"absent", new_shape["encoding"]},
+        "newline_changed": (
+            old_shape["newline"] != new_shape["newline"]
+            or old_shape["final_newline"] != new_shape["final_newline"]
+        ),
+    }
+
+
 def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
     """Materialize exact text proposals without changing any target files."""
     if not isinstance(spec, dict) or spec.get("version", 1) != 1:
@@ -704,6 +786,7 @@ def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
         raise FileOperationError("plan working directory does not exist")
     planned = []
     identities = set()
+    unicode_identities = {}
     for number, item in enumerate(supplied, 1):
         if not isinstance(item, dict):
             raise FileOperationError(
@@ -715,14 +798,24 @@ def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
                 "planned op must be write, patch, or replace", {"operation": number},
             )
         target = resolve_target(_plan_path(item.get("path"), working, "path"))
-        identity = os.path.normcase(os.path.realpath(target))
+        path_identity = path_safety.identify(target)
+        identity = path_identity.native_key
         if identity in identities:
             raise FileOperationError(
                 "a transaction may target each file only once",
                 {"operation": number, "path": target},
             )
         identities.add(identity)
+        previous_unicode = unicode_identities.get(path_identity.unicode_key)
+        if previous_unicode:
+            raise FileOperationError(
+                "transaction targets collide after Unicode normalization",
+                {"operation": number, "paths": [previous_unicode, target],
+                 "normalization": "NFC"},
+            )
+        unicode_identities[path_identity.unicode_key] = target
         before = _check_expected(target, str(item.get("expected_hash") or ""))
+        original = read_utf8(target, "target") if before is not None else ""
         if kind == "write":
             updated = _plan_payload(
                 item, "content", "content_file", working, "write content",
@@ -733,7 +826,6 @@ def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
                     f"planned {kind} requires an existing file",
                     {"operation": number, "path": target},
                 )
-            original = read_utf8(target, "target")
             if kind == "patch":
                 patch = _plan_payload(
                     item, "patch", "patch_file", working, "patch",
@@ -757,6 +849,10 @@ def build_file_plan(spec: dict, *, cwd: str = "") -> dict:
             "before_hash": before or "absent",
             "after_hash": hashlib.sha256(payload).hexdigest(),
             "changed": before != hashlib.sha256(payload).hexdigest(),
+            "review": _plan_review(
+                target, original, updated, existed=before is not None,
+            ),
+            "path_warnings": list(path_identity.warnings),
             "content": updated,
         })
     return {
@@ -795,6 +891,8 @@ def create_file_plan(
         "operations": [
             {key: item[key] for key in (
                 "number", "op", "path", "before_hash", "after_hash", "changed",
+                "review",
+                "path_warnings",
             )}
             for item in plan["operations"]
         ],
@@ -818,6 +916,11 @@ def _json_without_duplicates(text: str, label: str) -> dict:
         raise FileOperationError(f"{label} is not valid unambiguous JSON: {exc}") from exc
 
 
+def _publication_retry_seconds(path: str) -> float:
+    profile = profiles.detect(os.path.dirname(path) or path)
+    return 5.0 if profile.sync_provider else 0.0
+
+
 def _restore_published(receipt, before: Optional[str], target: str):
     if before is None:
         if os.path.lexists(target):
@@ -833,7 +936,7 @@ def _restore_published(receipt, before: Optional[str], target: str):
         shutil.copy2(receipt.artifact, stage)
         if store.file_sha256(stage) != before:
             raise OSError("recovery artifact failed hash verification")
-        os.replace(stage, target)
+        replace_with_retry(stage, target, _publication_retry_seconds(target))
         stage = ""
     finally:
         if stage and os.path.exists(stage):
@@ -860,6 +963,7 @@ def apply_file_plan(plan_path: str, *, expected_plan_hash: str) -> dict:
         raise FileOperationError("plan contains no operations")
     operations = []
     identities = set()
+    unicode_identities = set()
     total_bytes = 0
     for number, item in enumerate(supplied, 1):
         if not isinstance(item, dict) or item.get("number") != number:
@@ -869,10 +973,12 @@ def apply_file_plan(plan_path: str, *, expected_plan_hash: str) -> dict:
             raise FileOperationError(
                 "plan targets must be normalized absolute paths", {"operation": number},
             )
-        identity = os.path.normcase(os.path.realpath(target))
-        if identity in identities:
-            raise FileOperationError("plan contains duplicate targets")
+        path_identity = path_safety.identify(target)
+        identity = path_identity.native_key
+        if identity in identities or path_identity.unicode_key in unicode_identities:
+            raise FileOperationError("plan contains duplicate or Unicode-ambiguous targets")
         identities.add(identity)
+        unicode_identities.add(path_identity.unicode_key)
         before_label = str(item.get("before_hash") or "")
         if before_label != "absent" and not _HASH_RE.fullmatch(before_label):
             raise FileOperationError("plan contains an invalid before hash")
@@ -938,7 +1044,10 @@ def apply_file_plan(plan_path: str, *, expected_plan_hash: str) -> dict:
             try:
                 for item, receipt in zip(changed, receipts):
                     stage = stages[item["number"]]
-                    os.replace(stage, item["path"])
+                    item["publish_attempts"] = replace_with_retry(
+                        stage, item["path"],
+                        _publication_retry_seconds(item["path"]),
+                    )
                     stages[item["number"]] = ""
                     published.append((item, receipt))
                     if store.file_sha256(item["path"]) != item["after"]:
@@ -975,6 +1084,8 @@ def apply_file_plan(plan_path: str, *, expected_plan_hash: str) -> dict:
                     "after_hash": item["after"], "changed": 1,
                     "snapshot_transaction_id": receipt.transaction_id,
                     "snapshot_state": receipt.state,
+                    "recovery": receipt.to_dict(transaction_id),
+                    "publish_attempts": item.get("publish_attempts", 1),
                 })
             store.oplog_append({
                 "op": "file-transaction", "transaction_id": transaction_id,
@@ -1007,6 +1118,10 @@ def run_declared(
     max_observed_files: int = 20_000,
     max_observed_depth: int = 8,
     allow_missing_output_parents: bool = False,
+    timeout_seconds: float = execution.DEFAULT_TIMEOUT_SECONDS,
+    isolation_mode: str = "observed",
+    network_policy: str = "inherit",
+    execution_provider=None,
 ) -> dict:
     """Run a command after verified pre-images for every declared output."""
     if not command:
@@ -1018,9 +1133,13 @@ def run_declared(
     output_patterns = list(output_patterns or [])
     if not targets and not output_patterns:
         raise FileOperationError("run requires at least one --output or --output-pattern")
-    folded = [os.path.normcase(os.path.realpath(path)) for path in targets]
-    if len(folded) != len(set(folded)):
-        raise FileOperationError("declared outputs must be unique")
+    try:
+        target_identities = path_safety.require_unique(
+            targets, label="declared outputs"
+        )
+    except path_safety.PathSafetyError as exc:
+        raise FileOperationError(str(exc), exc.details) from exc
+    folded = [item.native_key for item in target_identities]
     expected_hashes = list(expected_hashes or [])
     if expected_hashes and len(expected_hashes) != len(targets):
         raise FileOperationError(
@@ -1067,6 +1186,11 @@ def run_declared(
                 "outputs": preview, "output_roots": roots,
                 "output_patterns": patterns, "executed": False,
                 "validation_scope": "contract_only",
+                "execution_policy": {
+                    "isolation_mode": isolation_mode,
+                    "network_policy": network_policy,
+                    "timeout_seconds": float(timeout_seconds),
+                },
                 "output_observation": {
                     "mode": "root_manifest" if roots else "exact_outputs",
                     "complete": True,
@@ -1086,30 +1210,113 @@ def run_declared(
         before_observation = _observe_requested_roots(
             roots, max_files=max_observed_files, max_depth=max_observed_depth,
         )
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            try:
-                completed = subprocess.run(
-                    command, cwd=working, stdin=subprocess.DEVNULL,
-                    stdout=stdout_file, stderr=stderr_file, check=False,
-                )
-            except OSError as exc:
-                raise FileOperationError(f"command could not be started: {exc}") from exc
-
-            def captured(handle):
-                handle.flush()
-                size = handle.tell()
-                handle.seek(max(0, size - MAX_CAPTURE_BYTES))
-                return handle.read().decode("utf-8", "replace")
-
-            stdout = captured(stdout_file)
-            stderr = captured(stderr_file)
-        after = [_current_hash(path) for path in targets]
-        after_observation = _observe_requested_roots(
-            roots, max_files=max_observed_files, max_depth=max_observed_depth,
-        )
-        observed_changes = _observation_changes(
-            before_observation, after_observation,
-        )
+        transaction_id = uuid.uuid4().hex
+        prepared_operations = [
+            {
+                "path": path, "before_hash": old or "absent",
+                "snapshot_transaction_id": receipt.transaction_id,
+            }
+            for path, old, receipt in zip(targets, before, receipts)
+        ]
+        store.oplog_append({
+            "op": "file-transaction-prepared", "transaction_id": transaction_id,
+            "operation": "declared-run", "command": command[0], "cwd": working,
+            "state": "PREPARED", "operations": prepared_operations,
+        })
+        try:
+            completed = execution.run(
+                execution.ExecutionRequest(
+                    command=list(command), cwd=working,
+                    timeout_seconds=timeout_seconds,
+                    isolation=execution.IsolationRequest(
+                        mode=isolation_mode, network=network_policy,
+                    ),
+                ),
+                provider=execution_provider,
+            )
+        except execution.ExecutionError as exc:
+            store.oplog_append({
+                "op": "file-transaction-state",
+                "prepared_transaction_id": transaction_id,
+                "state": "NOT_STARTED", "error": str(exc),
+            })
+            raise FileOperationError(str(exc), getattr(exc, "details", {})) from exc
+        stdout = completed.stdout_tail
+        stderr = completed.stderr_tail
+        try:
+            post_states = [_post_execution_state(path) for path in targets]
+        except Exception as exc:
+            store.oplog_append({
+                "op": "file-transaction-state",
+                "prepared_transaction_id": transaction_id,
+                "state": "NEEDS_ATTENTION", "error": str(exc),
+            })
+            raise FileTransactionError(
+                "post-execution target state could not be verified; prepared recovery is available",
+                {"transaction_id": transaction_id, "cause": str(exc),
+                 "undo_argv": ["agw", "undo", "--transaction", transaction_id]},
+            ) from exc
+        output_results = []
+        missing_outputs = []
+        unsupported_outputs = []
+        transaction_operations = []
+        for path, old, post_state, receipt, optional in zip(
+                targets, before, post_states, receipts, optional_outputs):
+            after_label = post_state.get("after_hash") or post_state["display_state"]
+            # Optional means an output that was absent may remain absent. It
+            # never makes deletion of a pre-existing output successful.
+            if after_label == "absent" and (old is not None or not optional):
+                missing_outputs.append(path)
+            if post_state.get("after_identity"):
+                unsupported_outputs.append(path)
+            output_results.append({
+                "path": path,
+                "before_hash": old or "absent",
+                "after_hash": after_label,
+                "changed": (old or "absent") != after_label,
+                "snapshot_transaction_id": receipt.transaction_id,
+                "snapshot_state": receipt.state,
+                "recovery": receipt.to_dict(transaction_id),
+                "optional": optional,
+            })
+            operation = {
+                "path": path, "before_hash": old or "absent",
+                "after_hash": post_state["after_hash"],
+                "snapshot_transaction_id": receipt.transaction_id,
+            }
+            if post_state.get("after_identity"):
+                operation["after_identity"] = post_state["after_identity"]
+            transaction_operations.append(operation)
+        # Bind the receipts to an addressable transaction immediately after
+        # process exit, before any broader observation that can time out or
+        # fail. This record is the durable recovery handoff for every later
+        # error path.
+        store.oplog_append({
+            "op": "file-transaction-state",
+            "prepared_transaction_id": transaction_id,
+            "operation": "declared-run", "command": command[0], "cwd": working,
+            "exit_code": completed.exit_code, "state": "COMMITTED",
+            "operations": transaction_operations,
+        })
+        if unsupported_outputs:
+            raise FileTransactionError(
+                "declared output became a non-file target; recovery is available",
+                {"transaction_id": transaction_id, "outputs": unsupported_outputs,
+                 "undo_argv": ["agw", "undo", "--transaction", transaction_id]},
+            )
+        try:
+            after_observation = _observe_requested_roots(
+                roots, max_files=max_observed_files, max_depth=max_observed_depth,
+            )
+            observed_changes = _observation_changes(
+                before_observation, after_observation,
+            )
+        except Exception as exc:
+            raise FileTransactionError(
+                "post-execution observation failed; declared-output recovery is available",
+                {"transaction_id": transaction_id, "cause": str(exc),
+                 "undo_argv": ["agw", "undo", "--transaction", transaction_id]},
+            ) from exc
         declared = {os.path.normcase(os.path.abspath(path)) for path in targets}
         undeclared = []
         for change in observed_changes:
@@ -1118,43 +1325,24 @@ def run_declared(
                     change["path"], roots, patterns):
                 continue
             undeclared.append(change)
-        output_results = []
-        missing_outputs = []
-        for path, old, new, receipt, optional in zip(
-                targets, before, after, receipts, optional_outputs):
-            # Optional means an output that was absent may remain absent. It
-            # never makes deletion of a pre-existing output successful.
-            if new is None and (old is not None or not optional):
-                missing_outputs.append(path)
-            output_results.append({
-                "path": path,
-                "before_hash": old or "absent",
-                "after_hash": new or "absent",
-                "changed": old != new,
-                "snapshot_transaction_id": receipt.transaction_id,
-                "snapshot_state": receipt.state,
-                "optional": optional,
-            })
-        store.oplog_append({
-            "op": "declared-run", "command": command[0], "cwd": working,
-            "exit_code": completed.returncode,
-            "outputs": [
-                {"src": item["path"], "before_sha256": item["before_hash"],
-                 "after_sha256": item["after_hash"],
-                 "snapshot_transaction_id": item["snapshot_transaction_id"]}
-                for item in output_results
-            ],
-        })
         return {
-            "ok": (completed.returncode == 0 and not missing_outputs
-                   and not undeclared),
+            "ok": (completed.exit_code == 0 and not missing_outputs
+                   and not undeclared and not completed.timed_out),
             "executed": True,
-            "exit_code": completed.returncode,
+            "exit_code": completed.exit_code,
             "command": command,
             "cwd": working,
+            "transaction_id": transaction_id,
             "outputs": output_results,
             "stdout_tail": stdout,
             "stderr_tail": stderr,
+            "timed_out": completed.timed_out,
+            "duration_seconds": completed.duration_seconds,
+            "execution_policy": {
+                "isolation_mode": completed.isolation_mode,
+                "network_policy": completed.network_policy,
+                "timeout_seconds": float(timeout_seconds),
+            },
             "declared_outputs_missing": missing_outputs,
             "unclaimed_observed_changes": undeclared,
             # Compatibility alias retained for existing JSON consumers. A
@@ -1170,11 +1358,27 @@ def run_declared(
                 "changed_paths": len(observed_changes),
                 "unclaimed_changes": len(undeclared),
             },
-            "capture_truncated": (
-                len(stdout.encode("utf-8")) >= MAX_CAPTURE_BYTES
-                or len(stderr.encode("utf-8")) >= MAX_CAPTURE_BYTES
-            ),
+            "capture_truncated": completed.capture_truncated,
         }
+
+
+def _post_execution_state(path: str) -> dict:
+    """Capture a hash or exact lstat identity without following non-file targets."""
+    if not os.path.lexists(path):
+        return {"after_hash": "absent", "display_state": "absent"}
+    st = os.lstat(path)
+    if stat.S_ISREG(st.st_mode) and not os.path.islink(path):
+        digest = store.file_sha256(path)
+        return {"after_hash": digest, "display_state": digest}
+    kind = (
+        "symlink" if stat.S_ISLNK(st.st_mode) else
+        "directory" if stat.S_ISDIR(st.st_mode) else "special"
+    )
+    return {
+        "after_hash": "non-file",
+        "display_state": f"unsupported:{kind}",
+        "after_identity": store.path_identity(path),
+    }
 
 
 def _output_roots(supplied: list[str]) -> list[str]:
@@ -1235,7 +1439,10 @@ def _observe_output_roots(roots: list[str], *, max_files: int,
         raise FileOperationError("output observation bounds are invalid")
     entries = {}
     count = 0
+    recovery_root = os.path.normcase(os.path.abspath(store.agw_home()))
     for root in roots:
+        if _path_is_within(root, recovery_root):
+            continue
         stack = [(root, 0)]
         while stack:
             directory, depth = stack.pop()
@@ -1246,6 +1453,8 @@ def _observe_output_roots(roots: list[str], *, max_files: int,
                     f"output root could not be observed safely: {directory}: {exc}"
                 ) from exc
             for child in children:
+                if _path_is_within(child.path, recovery_root):
+                    continue
                 count += 1
                 if count > max_files:
                     raise FileOperationError(
@@ -1486,5 +1695,6 @@ def publish_staged_file(
             "before_hash": before or "absent", "after_hash": after,
             "snapshot_transaction_id": receipt.transaction_id,
             "snapshot_state": receipt.state,
+            "recovery": receipt.to_dict(),
             "publish_attempts": attempts,
         }

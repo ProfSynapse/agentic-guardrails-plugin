@@ -125,12 +125,16 @@ so the agent self-corrects instead of fighting the rails:
 | several dependent text edits | `agw file plan` then `agw file apply-plan` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 | discover an existing script contract | `agw workflow match -- command` |
+| draft a contract without trusting or writing it | `agw workflow propose ... -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
+| inspect an exact CLI contract | `agw schema file apply-plan --json` |
+| reverse one exact mutation | `agw undo --transaction ID` |
 
 Structured Office operations are also available:
 
 ~~~text
 agw office info workbook.xlsx --scope tables --json
+agw office validate workbook.xlsx --tier excel-strict --json
 agw office read-table workbook.xlsx --table RecordsTable --columns RecordID,Status --limit 50 --json
 agw office validate-preservation staged.xlsm --against original.xlsm --json
 agw office ensure-table workbook.xlsx --sheet Records --table RecordsTable --headers-json '["RecordID","Status"]' --create-sheet
@@ -193,12 +197,17 @@ can install a data-only, script-hash-bound manifest with `agw workflow trust`
 and then use `agw run --workflow ID`. A repository cannot trust its own
 manifest merely by placing it beside a script. Exact existing outputs receive
 verified pre-images and exact absent outputs receive tombstones before launch.
+Runs use bounded time and output capture. The default `observed` mode does not
+claim isolation; unavailable read-only, strict, or network-denied execution
+fails closed without silently downgrading.
 Before direct script execution, `agw workflow match -- <command>` checks verified
 machine-local records for the exact runtime, script path, script hash, and bound
 arguments. A single exact match can be routed automatically by supported hooks;
 multiple matches remain explicit. Ambiguous source-only write evidence reports
 the triggering line and primitive, requires one-run review in standard mode,
 stays blocked in strict mode, and is shadowed in observe mode.
+JSON matching includes stable per-candidate mismatch reasons. `agw workflow
+propose` returns an inert validated v2 proposal without writing or trusting it.
 Manifest v2 also binds the exact script arguments, so `agw run --workflow ID`
 can reconstruct the reviewed command without agents restating Unicode paths or
 flags. Use `agw workflow init` to generate v2, `validate` before trust, and
@@ -218,6 +227,12 @@ unknown file. See the
 `agw run --dry-run` is deliberately contract-only: it does not execute the
 command or predict its writes. JSON identifies this explicitly as
 `"validation_scope":"contract_only"`.
+
+Successful file mutations include an explicit recovery receipt and an exact
+`agw undo --transaction ID` command. Multi-file plans and declared runs share a
+parent transaction. Archive budgets are assessment-only; hooks do not
+automatically evict recovery artifacts. `agw checkout close PATH` preserves the
+working copy, and `agw checkout reopen TRANSACTION_ID` restores its tracking.
 
 Folder discovery is hard-bounded by a parent process. Plain
 `agw scan <folder> --json` now uses the safe profile by default: 3 seconds,

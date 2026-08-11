@@ -182,6 +182,29 @@ def test_absent_tombstone_rollback_restores_absence(tmp_path):
     assert not target.exists()
 
 
+def test_absent_tombstone_rollback_rejects_retargeted_parent(
+        tmp_path, monkeypatch):
+    parent = tmp_path / "linked-parent"
+    parent.mkdir()
+    target = parent / "new-file.txt"
+    tombstone = store.record_absent_tombstone(
+        str(target), (str(parent),), reason="before creation"
+    )
+    target.write_text("new work in retargeted location")
+    original_canonical = archive_tx.canonical_path
+
+    def retargeted(path):
+        resolved = original_canonical(path)
+        if os.path.abspath(str(path)) == os.path.abspath(str(target)):
+            return resolved + "-retargeted"
+        return resolved
+
+    monkeypatch.setattr(archive_tx, "canonical_path", retargeted)
+    with pytest.raises(ValueError, match="identity are unchanged"):
+        store.rollback_absent_tombstone(tombstone["transaction_id"])
+    assert target.read_text() == "new work in retargeted location"
+
+
 def test_windows_safe_atomic_publish_with_unicode_and_spaces(tmp_path, monkeypatch):
     source = tmp_path / "Q3 report — final.txt"
     source.write_text("portable")
