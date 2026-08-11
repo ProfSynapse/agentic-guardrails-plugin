@@ -1320,8 +1320,7 @@ def main(argv=None):
         example="agw file write app.js --content-file app.js.new --expected-hash SHA256",
     )
     add_file(
-        "patch", ("Apply one exact-context unified diff atomically; every hunk "
-                  "requires a numbered '@@ -OLD +NEW @@' header"),
+        "patch", "Apply a numbered unified diff atomically",
         (["--patch"], {
             "required": True,
             "help": "standard unified diff file or -; bare '@@' is invalid",

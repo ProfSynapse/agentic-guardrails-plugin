@@ -22,37 +22,12 @@ Prefer compact JSON and bounded reads. On PowerShell, pass fragile JSON by stdin
 or file. For `file read`, omit `--max-bytes` normally and use exact returned
 continuations; never guess a larger budget.
 
-## Text-file writes
-
-Choose the operation by target state and edit shape:
-
-- New file: `agw file write PATH --content-file STAGED --expected-hash absent`.
-  Its parent directory must already exist. Create each missing parent with a
-  separate literal, exact-target directory command before writing the file.
-- Existing file, one or a few exact substitutions: prefer `agw file replace`.
-- Existing file, structured changes: use `agw file patch` with a standard
-  unified diff. Every hunk needs line ranges such as `@@ -12,2 +12,3 @@`.
-  A bare `@@` is `apply_patch` shorthand, not unified-diff syntax, and is
-  invalid. Validate with `--dry-run` before applying.
-- Several dependent text files: use `agw file plan`, retain its exact plan hash,
-  then use `agw file apply-plan`.
-
-A minimal valid patch is:
-
-```diff
---- a/note.md
-+++ b/note.md
-@@ -1 +1 @@
--old text
-+new text
-```
-
 ## Route by intent
 
 | Intent | Route | Read only if needed |
 |---|---|---|
 | Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
-| Read, create, or change a text file | Follow **Text-file writes**, then use exact `file <operation> --help` | None |
+| Read, create, or change text | Exact `file <operation> --help` | [text-files.md](references/text-files.md) |
 | Change dependent text files together | `file plan --help`, then `file apply-plan --help` | None |
 | Run a local script | `workflow match -- <command>`; otherwise `run --help` | [recovery.md](references/recovery.md) |
 | Run a matched workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` | [trusted-workflows.md](references/trusted-workflows.md) |

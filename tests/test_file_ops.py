@@ -255,7 +255,7 @@ def test_bare_patch_hunk_has_specific_cli_json_error(tmp_path):
 
 def test_patch_help_distinguishes_unified_diff_from_apply_patch_shorthand():
     result = run_agw("file", "patch", "--help")
-    assert "numbered '@@ -OLD +NEW @@' header" in result.stdout
+    assert "numbered unified diff" in result.stdout
     assert "bare '@@' is invalid" in result.stdout
     assert "expected SHA-256 of the existing target file" in result.stdout
 

@@ -45,7 +45,7 @@ def test_one_discoverable_skill_with_progressive_references():
     references = sorted((skill_files[0].parent / "references").glob("*.md"))
     assert {path.name for path in references} == {
         "diagnostics.md", "google-stubs.md", "office.md", "recovery.md",
-        "synced-folders.md", "trusted-workflows.md",
+        "synced-folders.md", "text-files.md", "trusted-workflows.md",
     }
     assert all(path.stat().st_size < 1_800 for path in references)
 
