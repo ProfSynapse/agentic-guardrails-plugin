@@ -4,14 +4,16 @@ The sanctioned alternative to ad-hoc interpreter one-liners: every mutating
 operation archives a pre-image snapshot before touching the file, so the edit
 is reversible with `agw restore` no matter what the library does to the file.
 
-Libraries are optional (python-docx, openpyxl, python-pptx); each operation
-reports exactly what to install when its library is missing.
+The built-in OOXML backend covers Word/PowerPoint text operations and surgical
+Excel cell edits without third-party packages. Advanced workbook operations use
+optional openpyxl and report exactly what to install when it is missing.
 """
 from __future__ import annotations
 
 import os
 
 from core import store
+import office_ooxml
 import office_tx
 
 
@@ -28,14 +30,6 @@ class MissingLibrary(OfficeError):
         self.lib, self.pip_name = lib, pip_name
 
 
-def _docx():
-    try:
-        import docx
-        return docx
-    except ImportError:
-        raise MissingLibrary("docx", "python-docx", ".docx")
-
-
 def _openpyxl():
     try:
         import openpyxl
@@ -44,23 +38,18 @@ def _openpyxl():
         raise MissingLibrary("openpyxl", "openpyxl", ".xlsx")
 
 
-def _pptx():
-    try:
-        import pptx
-        return pptx
-    except ImportError:
-        raise MissingLibrary("pptx", "python-pptx", ".pptx")
-
-
 def capabilities() -> dict:
-    caps = {}
-    for key, loader in (("docx", _docx), ("xlsx", _openpyxl), ("pptx", _pptx)):
-        try:
-            loader()
-            caps[key] = True
-        except MissingLibrary:
-            caps[key] = False
-    return caps
+    try:
+        _openpyxl()
+        xlsx_advanced = True
+    except MissingLibrary:
+        xlsx_advanced = False
+    return {
+        "docx": True,
+        "pptx": True,
+        "xlsx": True,
+        "xlsx_advanced": xlsx_advanced,
+    }
 
 
 def _ext(path: str) -> str:
@@ -79,65 +68,19 @@ def _snapshot(path: str, op: str) -> dict:
                               reason=f"pre-image before agw office {op}")
 
 
-def _collect_paragraphs(path: str):
-    """Return (document_object, [(location_label, paragraph), ...]) in
-    document order. Paragraph text is run-joined, so matches that span runs
-    are visible (Office splits runs at arbitrary points: formatting,
-    spellcheck history)."""
-    ext = _ext(path)
-    if ext == ".docx":
-        doc = _docx().Document(path)
-        items = [(f"paragraph {i}", p) for i, p in enumerate(doc.paragraphs, 1)]
-        for t, table in enumerate(doc.tables, 1):
-            for row in table.rows:
-                for cell in row.cells:
-                    items.extend((f"table {t}", p) for p in cell.paragraphs)
-        return doc, items
-    if ext == ".pptx":
-        prs = _pptx().Presentation(path)
-        items = []
-        for s, slide in enumerate(prs.slides, 1):
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    items.extend((f"slide {s}", p)
-                                 for p in shape.text_frame.paragraphs)
-        return prs, items
-    raise OfficeError(f"replace-text supports .docx and .pptx, not {ext or 'this file'}")
-
-
-def _repack_runs(paragraph, new_full: str):
-    """Distribute new paragraph text into the existing runs, left to right.
-    The first affected run's formatting wins for replacement text."""
-    remaining = new_full
-    runs = list(paragraph.runs)
-    for i, run in enumerate(runs):
-        if i == len(runs) - 1:
-            run.text = remaining
-            remaining = ""
-        else:
-            keep = len(run.text)
-            run.text, remaining = remaining[:keep], remaining[keep:]
-
-
 def find_matches(path: str, find: str) -> list:
     """List every occurrence with a 1-based index, location, and context —
     what an agent uses to choose --nth or confirm --all."""
     if not find:
         raise OfficeError("--find must not be empty")
-    _, items = _collect_paragraphs(path)
-    matches = []
-    for loc, p in items:
-        full = "".join(run.text for run in p.runs)
-        start = 0
-        while True:
-            idx = full.find(find, start)
-            if idx < 0:
-                break
-            ctx = full[max(0, idx - 40): idx + len(find) + 40]
-            matches.append({"n": len(matches) + 1, "where": loc,
-                            "context": ctx})
-            start = idx + len(find)
-    return matches
+    try:
+        if _ext(path) == ".docx":
+            return office_ooxml.word_find_matches(path, find)
+        if _ext(path) == ".pptx":
+            return office_ooxml.presentation_find_matches(path, find)
+    except office_ooxml.OoxmlError as exc:
+        raise OfficeError(str(exc)) from exc
+    raise OfficeError("replace-text supports .docx and .pptx")
 
 
 # --- read operations (no snapshot needed) -------------------------------------
@@ -145,22 +88,13 @@ def find_matches(path: str, find: str) -> list:
 def get_text(path: str) -> str:
     preservation_info(path)
     ext = _ext(path)
-    if ext == ".docx":
-        doc = _docx().Document(path)
-        parts = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
-            for row in table.rows:
-                parts.append("\t".join(c.text for c in row.cells))
-        return "\n".join(parts)
-    if ext == ".pptx":
-        prs = _pptx().Presentation(path)
-        parts = []
-        for i, slide in enumerate(prs.slides, 1):
-            parts.append(f"--- slide {i} ---")
-            for shape in slide.shapes:
-                if shape.has_text_frame and shape.text_frame.text:
-                    parts.append(shape.text_frame.text)
-        return "\n".join(parts)
+    try:
+        if ext == ".docx":
+            return office_ooxml.word_get_text(path)
+        if ext == ".pptx":
+            return office_ooxml.presentation_get_text(path)
+    except office_ooxml.OoxmlError as exc:
+        raise OfficeError(str(exc)) from exc
     raise OfficeError(f"get-text supports .docx and .pptx (for {ext or 'this file'}, "
                       "use `agw checkout` / `agw convert`)")
 
@@ -169,12 +103,10 @@ def info(path: str) -> dict:
     ext = _ext(path)
     if ext == ".docx":
         preservation = preservation_info(path)
-        doc = _docx().Document(path)
-        headings = [p.text for p in doc.paragraphs
-                    if p.style.name.startswith("Heading") and p.text.strip()]
-        return {"type": "docx", "paragraphs": len(doc.paragraphs),
-                "tables": len(doc.tables), "headings": headings,
-                "preservation": preservation}
+        try:
+            return {**office_ooxml.word_info(path), "preservation": preservation}
+        except office_ooxml.OoxmlError as exc:
+            raise OfficeError(str(exc)) from exc
     if ext in (".xlsx", ".xlsm"):
         import office_excel
         data = office_excel.workbook_info(path)
@@ -198,13 +130,11 @@ def info(path: str) -> dict:
         return data
     if ext == ".pptx":
         preservation = preservation_info(path)
-        prs = _pptx().Presentation(path)
-        titles = []
-        for slide in prs.slides:
-            title = slide.shapes.title
-            titles.append(title.text if title is not None else "")
-        return {"type": "pptx", "slides": len(prs.slides), "titles": titles,
-                "preservation": preservation}
+        try:
+            return {**office_ooxml.presentation_info(path),
+                    "preservation": preservation}
+        except office_ooxml.OoxmlError as exc:
+            raise OfficeError(str(exc)) from exc
     raise OfficeError(f"unsupported extension: {ext or 'none'}")
 
 
@@ -224,8 +154,7 @@ def replace_text(path: str, find: str, replace: str,
         raise OfficeError("--find must not be empty")
     if all_matches and nth:
         raise OfficeError("--all and --nth are mutually exclusive")
-    _, items = _collect_paragraphs(path)
-    total = sum("".join(r.text for r in p.runs).count(find) for _, p in items)
+    total = len(find_matches(path, find))
     if total == 0:
         return {"replacements": 0, "matches": 0}
     if nth:
@@ -252,27 +181,17 @@ def replace_text(path: str, find: str, replace: str,
         )
 
     def apply(stage, _plan):
-        document, stage_items = _collect_paragraphs(stage)
-        occurrence, replaced_count = 0, 0
-        for _, paragraph in stage_items:
-            full = "".join(run.text for run in paragraph.runs)
-            if find not in full:
-                continue
-            parts = full.split(find)
-            out, hit = parts[0], 0
-            for part in parts[1:]:
-                occurrence += 1
-                if targets is None or occurrence in targets:
-                    out += replace
-                    hit += 1
-                else:
-                    out += find
-                out += part
-            if hit:
-                _repack_runs(paragraph, out)
-                replaced_count += hit
-        result_holder["replacements"] = replaced_count
-        document.save(stage)
+        try:
+            if _ext(stage) == ".docx":
+                result_holder["replacements"] = office_ooxml.word_replace(
+                    stage, find, replace, targets
+                )
+            else:
+                result_holder["replacements"] = office_ooxml.presentation_replace(
+                    stage, find, replace, targets
+                )
+        except office_ooxml.OoxmlError as exc:
+            raise OfficeError(str(exc)) from exc
 
     def validate(stage, _plan):
         remaining = len(find_matches(stage, find))
@@ -313,7 +232,7 @@ def set_cell(path: str, sheet: str, cell: str, value: str,
     office_tx._package_preflight(path, mutating=False)
     risks = office_tx.inspect_preservation_risks(path)
     macro_enabled = _ext(path) == ".xlsm"
-    if risks or macro_enabled:
+    if _ext(path) in (".xlsx", ".xlsm"):
         import office_surgical
         state = {"new": _coerce(value, force_text)}
 
