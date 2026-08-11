@@ -31,6 +31,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))  # scripts/ -> core importable
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(os.path.dirname(_HERE))
 
+from core import agw_contract              # noqa: E402
 from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 from core import archive_transactions as archive_tx  # noqa: E402
@@ -1362,6 +1363,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="verb", required=True, metavar="command")
 
     def add(name, fn, *specs, **kw):
+        if agw_contract.operation(name) is None:
+            raise RuntimeError(f"AGW command is absent from the shared contract: {name}")
         p = sub.add_parser(name, parents=[common], **kw)
         for spec in specs:
             p.add_argument(*spec[0], **spec[1])
@@ -1923,6 +1926,10 @@ def main(argv=None):
     )
     add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}),
         help="human-only permanent archive cleanup")
+
+    contract_problem = agw_contract.registration_problem(sub.choices)
+    if contract_problem:
+        raise RuntimeError("AGW command contract mismatch: " + contract_problem)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "json"):

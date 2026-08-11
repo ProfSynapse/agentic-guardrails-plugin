@@ -247,7 +247,8 @@ def main(approval_provider=None):
             "rule_code": decision.rule_id,
             "reason_code": outcome if outcome in {
                 "provider-unavailable", "provider-timeout", "provider-error",
-                "headless-deny", "not-prompt-eligible", "policy-revision-unavailable"
+                "headless-deny", "not-prompt-eligible",
+                "policy-revision-unavailable", "prompt-incomplete",
             } else "approval",
             "policy_health": decision.policy_health,
             "policy_revision": decision.policy_revision,
@@ -265,7 +266,7 @@ def main(approval_provider=None):
             action = events.DENY
             if outcome in {"provider-unavailable", "provider-timeout", "provider-error",
                            "headless-deny", "not-prompt-eligible",
-                           "policy-revision-unavailable"}:
+                           "policy-revision-unavailable", "prompt-incomplete"}:
                 decision.reason = ((decision.reason + " | ") if decision.reason else "") + \
                     ("Approval could not be safely obtained, so this action was blocked.")
 

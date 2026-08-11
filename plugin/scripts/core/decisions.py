@@ -15,6 +15,11 @@ LOW = "low"
 MEDIUM = "medium"
 HIGH = "high"
 
+TARGET_EXACT = "exact"
+TARGET_CATEGORY = "category"
+TARGET_UNRESOLVED = "unresolved"
+_INFORMATIVE_TARGET_RESOLUTIONS = {TARGET_EXACT, TARGET_CATEGORY}
+
 
 @dataclass
 class GuardrailDecision:
@@ -82,18 +87,33 @@ class PromptRequest:
     safeguard: str
     event_id: str
     operation_fingerprint: str
+    target_resolution: str = TARGET_EXACT
     policy_revision: str = ""
     allow_label: str = "Allow once"
     cancel_label: str = "Cancel (recommended)"
     default_choice: str = "cancel"
     technical_details: str = ""
 
+    def validation_problem(self) -> str:
+        """Return why this request cannot support informed consent."""
+        if self.target_resolution not in _INFORMATIVE_TARGET_RESOLUTIONS:
+            return "target-unresolved"
+        if not self.targets or not all(str(value).strip() for value in self.targets):
+            return "target-missing"
+        for name in ("title", "action", "reason", "consequence"):
+            if not str(getattr(self, name) or "").strip():
+                return name + "-missing"
+        if not self.operation_fingerprint:
+            return "fingerprint-missing"
+        return ""
+
     def primary_text(self) -> str:
         sections = [
             "Target: " + (", ".join(self.targets) if self.targets else
-                          "The exact files could not be identified"),
+                          "Unresolved"),
             "Why we're asking: " + self.reason,
             "What could happen: " + self.consequence,
-            "Safety measure: " + self.safeguard,
         ]
+        if self.safeguard.strip():
+            sections.append("Recovery: " + self.safeguard)
         return "\n\n".join(sections)

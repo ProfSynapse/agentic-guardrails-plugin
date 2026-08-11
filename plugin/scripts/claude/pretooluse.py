@@ -178,7 +178,19 @@ def main():
         ), sys.stdout)
         return
 
-    if effective.action == events.ASK and decision.memo_key and cfg.get("session_memory"):
+    action = effective.action
+    prompt_request = None
+    approval_outcome = ""
+    if action == events.ASK:
+        prompt_decision = GuardrailDecision.from_legacy(decision)
+        prompt_request = presentation.build_prompt(
+            prompt_decision, evaluation_payload, [event]
+        )
+        if prompt_request.validation_problem():
+            action = events.DENY
+            approval_outcome = "prompt-incomplete"
+
+    if action == events.ASK and decision.memo_key and cfg.get("session_memory"):
         fingerprint = presentation.operation_fingerprint(
             evaluation_payload, [event], decision.policy_revision
         )
@@ -188,14 +200,12 @@ def main():
         )
 
     out = {}
-    if effective.action in (events.ALLOW, events.ASK, events.DENY):
-        if effective.action == events.ASK:
-            prompt_decision = GuardrailDecision.from_legacy(decision)
-            request = presentation.build_prompt(prompt_decision, evaluation_payload, [event])
-            reason = request.action + "\n\n" + request.primary_text()
-        elif effective.action == events.DENY:
+    if action in (events.ALLOW, events.ASK, events.DENY):
+        if action == events.ASK:
+            reason = prompt_request.action + "\n\n" + prompt_request.primary_text()
+        elif action == events.DENY:
             reason = presentation.build_denial_feedback(
-                GuardrailDecision.from_legacy(decision)
+                GuardrailDecision.from_legacy(decision), approval_outcome
             )
         else:
             reason = decision.reason
@@ -203,13 +213,13 @@ def main():
             reason = (reason + " | " if reason else "") + "; ".join(decision.warnings)
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": effective.action,
+            "permissionDecision": action,
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
 
     out = launcher.attach_rewrite(
-        out, payload, rewritten_command, may_run=effective.action != events.DENY
+        out, payload, rewritten_command, may_run=action != events.DENY
     )
     if routed_workflow and out.get("hookSpecificOutput"):
         out["hookSpecificOutput"]["permissionDecisionReason"] = (

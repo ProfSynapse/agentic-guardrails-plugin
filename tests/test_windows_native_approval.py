@@ -85,7 +85,7 @@ def _request():
         targets=("customer.env",),
         reason="The file may contain private information.",
         consequence="Its contents may enter the agent's work.",
-        safeguard="Allow access only when needed.",
+        safeguard="Guardrails does not create a recovery copy for this action.",
         event_id="event", operation_fingerprint="fingerprint",
         policy_revision="revision",
     )

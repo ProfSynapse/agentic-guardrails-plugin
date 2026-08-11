@@ -107,12 +107,23 @@ def test_agw_documented_safe_verbs_allowed_without_redundant_prompt(evaluate):
         assert evaluate(_agw(command)).action == ALLOW, command
 
 
-def test_agw_unknown_verbs_ask_nonwaivably(evaluate):
-    commands = ("agw future-operation file.txt", "agw --json")
+def test_agw_unknown_or_missing_verbs_deny_nonwaivably(evaluate):
+    commands = (
+        "agw future-operation file.txt", "agw --json", "agw help",
+        "agw apply plan.json", "agw hydrate cloud.docx",
+    )
     for command in commands:
         decision = evaluate(_agw(command))
-        assert decision.action == ASK, command
+        assert decision.action == DENY, command
         assert decision.enforcement_class.name == "NON_WAIVABLE_INVARIANT"
+
+
+def test_agw_nested_help_is_informational_and_unknown_workflow_denies(evaluate):
+    for command in ("agw search --help", "agw workflow --help"):
+        assert evaluate(_agw(command)).action == ALLOW, command
+    decision = evaluate(_agw("agw workflow future-operation"))
+    assert decision.action == DENY
+    assert decision.rule_id == "builtin:agw-workflow-unknown"
 
 
 def test_agw_help_has_no_empty_unknown_verb(evaluate):

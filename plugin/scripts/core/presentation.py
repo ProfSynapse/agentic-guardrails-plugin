@@ -7,7 +7,8 @@ import os
 import re
 
 from . import events
-from .decisions import GuardrailDecision, PromptRequest
+from .decisions import GuardrailDecision, PromptRequest, TARGET_CATEGORY, \
+    TARGET_EXACT, TARGET_UNRESOLVED
 
 
 def operation_fingerprint(payload: dict, evlist, policy_revision: str = "") -> str:
@@ -32,11 +33,6 @@ _COPY_BY_RULE = {
         "The agent wants Guardrails to change managed files or stored copies.",
         "This Guardrails operation changes retained data or working files.",
         "Files or retained recovery copies may be moved, replaced, or removed.",
-    ),
-    "builtin:agw-unknown": (
-        "The agent wants to run an unrecognized Guardrails operation.",
-        "Guardrails cannot verify the effects of this operation name.",
-        "The operation could change files or retained recovery copies.",
     ),
     "builtin:agw-empty": (
         "The agent wants to run Guardrails without a documented operation.",
@@ -197,6 +193,13 @@ def _safe_next_step(rule_id: str) -> str:
         return "Make the file available offline, verify the local copy, and then retry."
     if rule_id == "builtin:agw-impostor":
         return "Use the packaged Guardrails launcher reported at session start."
+    if rule_id in {
+            "builtin:agw-empty", "builtin:agw-search-empty",
+            "builtin:agw-unknown", "builtin:agw-workflow-unknown"}:
+        return (
+            "Use `agw --help`, choose a documented operation, and retry with "
+            "literal arguments and explicit targets."
+        )
     if rule_id.startswith("policy:health-"):
         return "Repair or reinstall the Guardrails policy package, verify its health, and retry."
     if ":snippets[" in rule_id:
@@ -222,6 +225,15 @@ def build_denial_feedback(decision: GuardrailDecision,
         next_step = (
             "Do not retry the same operation. Continue without it or propose a "
             "safer alternative that still serves the user's request."
+        )
+    elif approval_outcome == "prompt-incomplete":
+        blocked = (
+            "Guardrails could not identify enough structured information to "
+            "request informed approval."
+        )
+        next_step = (
+            "Retry with one documented, direct operation that provides a "
+            "meaningful target or bounded target category."
         )
     elif approval_outcome:
         blocked = "Guardrails could not safely obtain approval for the requested operation."
@@ -359,6 +371,8 @@ def _friendly_targets(decision: GuardrailDecision, evlist) -> tuple[str, ...]:
         return tuple(f"File: {label}" for label in labels)
     if labels and target_kind == "search_scope":
         return ("Search scope: " + _natural_list(labels),)
+    if labels and target_kind == "category":
+        return labels
     if context == events.DecisionContext.AGW_ARCHIVE:
         return ("Stored Guardrails recovery copies",)
     if context == events.DecisionContext.AGW_MUTATION:
@@ -398,18 +412,58 @@ def _friendly_targets(decision: GuardrailDecision, evlist) -> tuple[str, ...]:
     return ("The exact files could not be identified",)
 
 
+def _target_resolution(decision: GuardrailDecision, evlist,
+                       targets: tuple[str, ...]) -> str:
+    """Classify deterministic target evidence without a confidence score."""
+    context = decision.presentation_context
+    details = decision.presentation_details or {}
+    target_kind = details.get("target_kind")
+    labels = _detail_labels(decision)
+    count = _target_count(evlist)
+    if context in {
+            events.DecisionContext.AGW_UNKNOWN,
+            events.DecisionContext.PATCH_UNKNOWN}:
+        return TARGET_UNRESOLVED
+    if target_kind in {"file", "search_scope"} and labels:
+        return TARGET_EXACT
+    if target_kind == "category" and labels:
+        return TARGET_CATEGORY
+    if count:
+        return TARGET_EXACT
+    if context in {
+            events.DecisionContext.AGW_ARCHIVE,
+            events.DecisionContext.AGW_MUTATION,
+            events.DecisionContext.RESTORE_FILES,
+            events.DecisionContext.SENSITIVE_READ,
+            events.DecisionContext.CREDENTIAL_SEARCH,
+            events.DecisionContext.CONNECTED_SERVICE}:
+        return TARGET_CATEGORY
+    kinds = {ev.kind for ev in evlist}
+    if kinds in ({events.READ}, {events.MCP}) and targets:
+        return TARGET_CATEGORY
+    return TARGET_UNRESOLVED
+
+
 def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
     details = decision.presentation_details or {}
     labels = _detail_labels(decision)
     target_text = _natural_list(labels)
     signal = str(details.get("signal") or "potentially sensitive information")
     trigger = str(details.get("trigger") or "This operation needs confirmation.")
+    if (decision.rule_id == "builtin:agw-ask"
+            and decision.presentation_context == events.DecisionContext.AGW_ARCHIVE):
+        return (
+            "The agent wants Guardrails to permanently prune stored recovery copies.",
+            "Permanent recovery cleanup requires your explicit approval.",
+            "Archived versions may be permanently removed and become unrecoverable.",
+            "Guardrails cannot restore recovery copies after they are permanently pruned.",
+        )
     if details and decision.rule_id == "builtin:credential-hunt":
         return (
             f"The agent wants to search {target_text} for {signal}.",
             trigger,
             "Private matches could be included in the agent's work.",
-            "Choose Cancel to keep search results out of the agent's work.",
+            "",
         )
     if details and decision.rule_id in {
             "builtin:secret-file", "builtin:content-prescan",
@@ -418,7 +472,7 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
             f"The agent wants to read {target_text}, which may contain {signal}.",
             trigger,
             "The file's contents could be included in the agent's work.",
-            "Choose Cancel to keep the content out of the agent's work.",
+            "",
         )
     if decision.rule_id in {"builtin:mcp-mutation", "builtin:mcp-remove"}:
         summary = _connector_summary(evlist)
@@ -434,11 +488,11 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
                 f"The agent wants to {summary['operation']} in {summary['service']}.",
                 f"This {summary['service']} operation needs your approval before it continues.",
                 consequence,
-                "Choose Cancel to leave the connected service unchanged.",
+                "",
             )
     mapped = _COPY_BY_RULE.get(decision.rule_id)
     if mapped:
-        return (*mapped, "Choose Cancel to make no changes.")
+        return (*mapped, "")
     kinds = {ev.kind for ev in evlist}
     opaque = any(ev.extra.get("opaque") for ev in evlist)
     if opaque:
@@ -446,39 +500,40 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
             "The agent wants to change files, but Guardrails could not identify which files.",
             "Guardrails could not determine every file this action may affect.",
             "Files may be changed in ways that cannot be shown here.",
-            "Choose Cancel to make no changes.",
+            "",
         )
     if kinds == {events.READ}:
         return (
             "The agent wants to read a potentially sensitive file.",
             "The file may contain private or confidential information.",
             "Its contents may be included in the agent's work.",
-            "Choose Cancel to keep the content out of the agent's work.",
+            "",
         )
     if kinds & {events.WRITE, events.EDIT}:
         return (
             "The agent wants to change one or more files.",
             "This change needs your approval before it continues.",
             "Existing file contents may be replaced or updated.",
-            "Choose Cancel to make no changes.",
+            "",
         )
     if kinds == {events.MCP}:
         return (
             "The agent wants to use a connected service.",
             "This service action needs your approval.",
             "Information in the connected service may be read or changed.",
-            "Choose Cancel to make no changes.",
+            "",
         )
     return (
         "The agent wants to perform an operation that needs review.",
         "Guardrails could not confirm that this operation is routine.",
         "Files, applications, or settings may change.",
-        "Choose Cancel to make no changes.",
+        "",
     )
 
 
 def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRequest:
     action, reason, consequence, safeguard = _copy(decision, evlist)
+    targets = _friendly_targets(decision, evlist)
     event_id = str(payload.get("event_id") or payload.get("invocation_id") or
                    payload.get("tool_use_id") or "")
     recommended_allow = (
@@ -491,7 +546,7 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
     return PromptRequest(
         title="Agent safety check",
         action=action,
-        targets=_friendly_targets(decision, evlist),
+        targets=targets,
         reason=reason,
         consequence=consequence,
         safeguard=safeguard,
@@ -499,6 +554,7 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
         operation_fingerprint=operation_fingerprint(
             payload, evlist, decision.policy_revision
         ),
+        target_resolution=_target_resolution(decision, evlist, targets),
         policy_revision=decision.policy_revision,
         allow_label=("Allow once (recommended)" if recommended_allow else "Allow once"),
         cancel_label=("Cancel" if recommended_allow else "Cancel (recommended)"),

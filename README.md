@@ -264,7 +264,7 @@ and huge to archive). `strict` archives even those. The list is extensible via
 
 Escalations (`ask`): `git checkout -- <file>`, shrink-suspicious writes
 (replacing a large file with tiny content), reading cloud-only placeholders,
-publish conflicts, `agw prune`/`apply`/`hydrate`, reading credential-type
+publish conflicts, `agw prune`, reading credential-type
 files (.env, keys, `~/.aws`...), files whose content prescan finds secrets or
 "CONFIDENTIAL" markings ("this might contain a password, confirm"), and
 bounded credential-keyword searches outside the active project. Combining a
@@ -281,8 +281,14 @@ executed command, so it isn't blocked.
 
 ### Human-readable approvals and connected services
 
-Approval dialogs describe the action, affected category, reason, consequence,
-and safety measure without requiring the user to interpret raw shell syntax.
+Approval dialogs describe the action, affected category, reason, and consequence
+without requiring the user to interpret raw shell syntax. They add a recovery
+line only when it communicates a distinct, factual recovery limitation.
+Those facts are produced locally from the shared command contract, policy rule,
+and parsed targets; no model generates a rationale or confidence score. A prompt
+with unresolved operation or target evidence is denied before any approval UI
+can open. Unsupported `agw` operations are likewise denied with a bounded verb
+label and a route to `agw --help` rather than an uninformative confirmation.
 Connected-service prompts name the sanitized service, action, and target name or
 identifier when available; message bodies, tokens, and raw payloads stay hidden.
 They offer **Allow once** and **Cancel (recommended)**; known reversible

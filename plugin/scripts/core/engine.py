@@ -19,7 +19,7 @@ import re
 import shutil
 from typing import Optional
 
-from . import launcher, policy_health, powershell_bind, profiles as prof
+from . import agw_contract, launcher, policy_health, powershell_bind, profiles as prof
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     ToolEvent, worst
@@ -30,22 +30,6 @@ from .shellparse import DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
                     "instead — it moves files to the archive store and is fully reversible "
                     "with `agw restore`.")
-
-# Documented agw verbs are built to be reversible or non-destructive. Trust the
-# packaged safety vocabulary rather than adding a second Guardrails prompt; a
-# host sandbox may still request its normal outside-workspace approval for
-# ~/.agw. Permanent/special verbs remain in AGW_ASK_VERBS below.
-AGW_READ_ONLY_VERBS = {
-    "scan", "list", "search", "diff", "status", "log", "doctor",
-}
-AGW_SAFE_MUTATING_VERBS = {
-    "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
-    "restore", "undo", "publish", "publish-file", "unlink-link",
-    "file", "run", "office", "workflow",
-}
-AGW_ASK_VERBS = {"prune": "prune permanently destroys archived versions (human decision)",
-                 "apply": "bulk apply executes a stored plan — review the manifest",
-                 "hydrate": "hydration downloads cloud-only content"}
 
 # --- secret/confidential detection: ask, don't block --------------------------
 # Reading a credential-type file is often legitimate (dev setup), so it asks.
@@ -1566,18 +1550,38 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
             return Decision(ALLOW, "", "builtin:agw-info")
         if not verb:
             return Decision(
-                ASK, "No documented Guardrails operation was supplied.",
+                DENY, "No documented Guardrails operation was supplied.",
                 "builtin:agw-empty",
                 enforcement_class=NON_WAIVABLE_INVARIANT,
                 presentation_context=DecisionContext.AGW_UNKNOWN,
             )
-        if verb in AGW_ASK_VERBS:
-            context = (DecisionContext.AGW_ARCHIVE if verb == "prune"
-                       else DecisionContext.AGW_MUTATION)
+        operation_spec = agw_contract.operation(verb)
+        if operation_spec is None:
+            display_verb = agw_contract.display_unknown_verb(verb)
             return Decision(
-                ASK, f"Guardrails {verb} needs confirmation.", "builtin:agw-ask",
+                DENY,
+                f"The Guardrails operation '{display_verb}' is not supported by "
+                "this installed package.",
+                "builtin:agw-unknown",
                 enforcement_class=NON_WAIVABLE_INVARIANT,
-                presentation_context=context,
+                presentation_context=DecisionContext.AGW_UNKNOWN,
+                presentation_details={
+                    "operation": display_verb,
+                    "target_kind": "unresolved",
+                },
+            )
+        if operation_spec.effect == agw_contract.OperationEffect.HUMAN_APPROVAL:
+            return Decision(
+                ASK, "Permanently pruning stored recovery copies needs confirmation.",
+                "builtin:agw-ask",
+                enforcement_class=NON_WAIVABLE_INVARIANT,
+                presentation_context=DecisionContext.AGW_ARCHIVE,
+                presentation_details={
+                    "operation": "permanently prune stored recovery copies",
+                    "targets": ["Stored Guardrails recovery copies"],
+                    "target_kind": "category",
+                    "trigger": "This operation permanently removes retained recovery data.",
+                },
             )
         if verb == "file":
             read_target = _agw_file_read_target(args)
@@ -1596,8 +1600,10 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         if verb == "search":
             search_command = _agw_search_command(args, cmd.dialect)
             if search_command is None:
+                if any(value in {"-h", "--help"} for value in args[1:]):
+                    return Decision(ALLOW, "", "builtin:agw-info")
                 return Decision(
-                    ASK, "No search query was supplied.",
+                    DENY, "No search query was supplied.",
                     "builtin:agw-search-empty",
                     enforcement_class=NON_WAIVABLE_INVARIANT,
                     presentation_context=DecisionContext.AGW_UNKNOWN,
@@ -1660,21 +1666,18 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                         "trigger": "The agent requested a new or replacement trusted workflow record.",
                     },
                 )
-            if workflow_op not in {"list", "match", "info", "validate", "status", "init"}:
+            workflow_help = any(
+                value in {"-h", "--help"} for value in args[verb_index + 1:]
+            )
+            if not workflow_help and workflow_op not in {
+                    "list", "match", "info", "validate", "status", "init"}:
                 return Decision(
-                    ASK, "This workflow operation is not recognized.",
+                    DENY, "This workflow operation is not recognized.",
                     "builtin:agw-workflow-unknown",
                     enforcement_class=NON_WAIVABLE_INVARIANT,
                     presentation_context=DecisionContext.AGW_UNKNOWN,
                 )
-        if verb in AGW_READ_ONLY_VERBS or verb in AGW_SAFE_MUTATING_VERBS:
-            return Decision(ALLOW, "", "builtin:agw")
-        return Decision(
-            ASK, "This Guardrails operation is not recognized.",
-            "builtin:agw-unknown",
-            enforcement_class=NON_WAIVABLE_INVARIANT,
-            presentation_context=DecisionContext.AGW_UNKNOWN,
-        )
+        return Decision(ALLOW, "", "builtin:agw")
 
     # ---- built-in semantic deny table ----
     if name in _DELETE_VERBS or name in _SECURE_WIPE_VERBS:

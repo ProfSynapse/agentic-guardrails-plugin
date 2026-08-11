@@ -263,7 +263,7 @@ def test_bash_literal_mkdir_then_move_has_reversible_prestate(
     assert not archive.exists()
 
 
-def test_claude_ask_copy_is_plain_language_and_excludes_raw_operation():
+def test_claude_unknown_agw_verb_denies_with_bounded_correction():
     canary = "PRIVATE-CANARY-client-command"
     out = run_hook({
         "tool_name": "PowerShell",
@@ -272,13 +272,13 @@ def test_claude_ask_copy_is_plain_language_and_excludes_raw_operation():
         "session_id": "human-copy",
         "hook_event_name": "PreToolUse",
     })
-    assert _decision(out) == "ask"
+    assert _decision(out) == "deny"
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "unrecognized Guardrails operation" in reason
-    assert "The exact files could not be identified" in reason
-    assert "Cancel to make no changes" in reason
+    assert "future-operation" in reason
+    assert "not supported by this installed package" in reason
+    assert "Use `agw --help`" in reason
+    assert "did not run" in reason
     assert canary not in reason
-    assert "future-operation" not in reason
     assert "PowerShell" not in reason
 
 
@@ -569,6 +569,9 @@ def test_external_mutation_asks_instead_of_requiring_local_recovery(tmp_path):
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "update a file in Google Drive" in reason
     assert "Google Drive file: Board Budget.xlsx" in reason
+    assert "Google Drive may create or change the specified file" in reason
+    assert "Recovery:" not in reason
+    assert "Choose Cancel" not in reason
     assert "PRIVATE-CANARY" not in reason
     assert "local recovery store" not in reason.lower()
 

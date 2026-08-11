@@ -23,6 +23,7 @@ scripts/codex/posttooluse.py
 scripts/codex/pretooluse.py
 scripts/codex/sessionstart.py
 scripts/core/__init__.py
+scripts/core/agw_contract.py
 scripts/core/approvals.py
 scripts/core/archive_transactions.py
 scripts/core/auditlog.py
