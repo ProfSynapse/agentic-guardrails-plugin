@@ -38,7 +38,9 @@ def _spec(name: str, effect: OperationEffect, *, canonical_name: str = ""):
 
 _OPERATIONS = {
     name: _spec(name, OperationEffect.READ_ONLY)
-    for name in {"scan", "list", "search", "diff", "status", "log", "doctor"}
+    for name in {
+        "scan", "list", "search", "diff", "status", "log", "doctor", "schema",
+    }
 }
 _OPERATIONS.update({
     name: _spec(name, OperationEffect.RECOVERABLE_MUTATION)

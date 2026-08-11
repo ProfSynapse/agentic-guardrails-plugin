@@ -1670,7 +1670,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 value in {"-h", "--help"} for value in args[verb_index + 1:]
             )
             if not workflow_help and workflow_op not in {
-                    "list", "match", "info", "validate", "status", "init"}:
+                "list", "match", "propose", "info", "validate", "status", "init",
+            }:
                 return Decision(
                     DENY, "This workflow operation is not recognized.",
                     "builtin:agw-workflow-unknown",

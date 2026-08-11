@@ -4,7 +4,8 @@ Trust seals script/manifest hashes, arguments, and outputs locally; repository
 manifests remain inert until approved. V2 is exact; v3 adds typed slots:
 
 Run `agw workflow match -- <command>` before a script. Exact single matches may
-route automatically; multiple matches stay explicit.
+route automatically; multiple matches stay explicit. JSON explains mismatches;
+`workflow propose` is inert.
 
 ```json
 {"schema":"agw.workflow/v3","id":"org.example.load",

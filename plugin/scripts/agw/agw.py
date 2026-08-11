@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import uuid
 
 # Windows consoles default to a legacy code page (cp1252) that cannot encode
 # non-ASCII output; force UTF-8 so the CLI never dies with a UnicodeEncodeError
@@ -38,18 +39,36 @@ from core import archive_transactions as archive_tx  # noqa: E402
 from core import launcher                   # noqa: E402
 from core import workflows                  # noqa: E402
 import converters                           # noqa: E402
+import cli_schema                           # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
 import scan_worker                          # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
+_ROOT_CLI_PARSER = None
+_JSON_ERRORS_ACTIVE = False
 
 
 class _CompactArgumentParser(argparse.ArgumentParser):
     """Keep invalid nested-operation errors actionable and token efficient."""
 
+    json_errors_enabled = False
+
     def error(self, message):
+        if self.json_errors_enabled:
+            payload = {
+                "ok": False,
+                "error": {
+                    "code": "argument_error",
+                    "message": str(message),
+                    "details": {"command": self.prog},
+                },
+            }
+            self.exit(
+                2,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            )
         if (self.prog == "agw office"
                 and "argument operation: invalid choice" in str(message)):
             self.exit(
@@ -67,8 +86,19 @@ def _out(args, human: str, data: dict):
         print(human)
 
 
-def _err(message: str, code: int = 1):
-    print(f"agw: {message}", file=sys.stderr)
+def _err(message: str, code: int = 1, *, error_code: str = "cli_error",
+         details: dict | None = None):
+    if _JSON_ERRORS_ACTIVE:
+        print(json.dumps({
+            "ok": False,
+            "error": {
+                "code": error_code,
+                "message": str(message),
+                "details": details or {},
+            },
+        }, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+    else:
+        print(f"agw: {message}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -447,6 +477,19 @@ def cmd_list(args):
 
 
 def cmd_checkout(args):
+    control_target = str(getattr(args, "control_target", "") or "")
+    if args.path == "close":
+        if not control_target:
+            _err("checkout close requires the original source path")
+        args.path = control_target
+        return cmd_checkout_close(args)
+    if args.path == "reopen":
+        if not control_target:
+            _err("checkout reopen requires a checkout-close transaction id")
+        args.transaction_id = control_target
+        return cmd_checkout_reopen(args)
+    if control_target:
+        _err("checkout takes one file; use `agw checkout close PATH` to close tracking")
     src = _resolve(args.path)
     if not os.path.isfile(src):
         _err("checkout takes a single file")
@@ -480,11 +523,14 @@ def cmd_checkout(args):
         ws = os.path.join(folder, "_workspace")
     result = converters.to_open_format(src, ws, mode=args.mode)
     state = store.state_load()
+    created_at_ns = time.time_ns()
     state["checkouts"][src] = {
         "working": result["dest"], "workings": result.get("dests", [result["dest"]]),
         "base_sha256": store.file_sha256(src), "mode": result["mode"],
         "checkout_mode": result.get("checkout_mode", "data"),
         "workspace": ws,
+        "created_at_ns": created_at_ns,
+        "last_activity_at_ns": created_at_ns,
     }
     store.state_save(state)
     store.oplog_append({"op": "checkout", "src": src, "working": result["dest"]})
@@ -493,6 +539,79 @@ def cmd_checkout(args):
         (" (lossy data checkout)" if result.get("lossy") else "")
     _out(args, f"checked out -> {result['dest']}{note}",
          {"src": src, "workspace": ws, **result})
+
+
+def cmd_checkout_close(args):
+    src = os.path.abspath(os.path.expanduser(args.path))
+    state = store.state_load()
+    entry = state.get("checkouts", {}).get(src)
+    if not entry:
+        _err(f"no checkout registered for {src}")
+    working = str(entry.get("working") or "")
+    working_hash = store.file_sha256(working) if os.path.isfile(working) else "absent"
+    expected = str(args.expected_working_hash or "").strip().lower()
+    if expected and expected != working_hash.lower():
+        _file_err(args, file_ops.PreimageHashConflict(
+            "CONFLICT: working-copy hash does not match expected version",
+            {"path": working, "expected": expected, "actual": working_hash},
+        ))
+    transaction_id = uuid.uuid4().hex
+    del state["checkouts"][src]
+    store.state_save(state)
+    store.oplog_append({
+        "op": "checkout-close", "transaction_id": transaction_id,
+        "src": src, "working": working, "working_sha256": working_hash,
+        "checkout_entry": entry, "closed_at_ns": time.time_ns(),
+    })
+    data = {
+        "transaction_id": transaction_id,
+        "src": src,
+        "working": working,
+        "working_preserved": os.path.lexists(working),
+        "working_hash": working_hash,
+        "undo_argv": ["agw", "checkout", "reopen", transaction_id],
+    }
+    _out(args, f"closed checkout registry entry for {src}; working copy preserved", data)
+
+
+def cmd_checkout_reopen(args):
+    transaction_id = str(args.transaction_id or "").strip()
+    closed = None
+    operations = store.oplog_read()
+    if any(
+            operation.get("op") == "checkout-reopen"
+            and operation.get("reopened_transaction_id") == transaction_id
+            for operation in operations):
+        _err("checkout close transaction was already reopened")
+    for operation in reversed(operations):
+        if operation.get("op") == "checkout-close" \
+                and operation.get("transaction_id") == transaction_id:
+            closed = operation
+            break
+    if not closed:
+        _err("checkout close transaction was not found")
+    src = str(closed.get("src") or "")
+    entry = closed.get("checkout_entry")
+    if not src or not isinstance(entry, dict):
+        _err("checkout close transaction is incomplete")
+    state = store.state_load()
+    if src in state.get("checkouts", {}):
+        _err("CONFLICT: a checkout is already registered for this source", code=3)
+    state.setdefault("checkouts", {})[src] = entry
+    entry["last_activity_at_ns"] = time.time_ns()
+    store.state_save(state)
+    store.oplog_append({
+        "op": "checkout-reopen", "transaction_id": uuid.uuid4().hex,
+        "reopened_transaction_id": transaction_id, "src": src,
+    })
+    data = {
+        "reopened_transaction_id": transaction_id,
+        "src": src,
+        "working": entry.get("working", ""),
+        "source_exists": os.path.isfile(src),
+        "working_exists": os.path.isfile(str(entry.get("working") or "")),
+    }
+    _out(args, f"reopened checkout registry entry for {src}", data)
 
 
 def cmd_convert(args):
@@ -571,13 +690,16 @@ def cmd_publish(args):
     try:
         office_validation = None
         extension = os.path.splitext(src)[1].lower()
+        if extension in {".docx", ".pptx", ".xlsx", ".xlsm"}:
+            package_validation = _validate_office_stage(tmp_out, extension)
+            office_validation = package_validation
         if extension == ".xlsm":
-            office_validation = office_tx.validate_package_preservation(
+            preservation = office_tx.validate_package_preservation(
                 src, tmp_out, expected_original_sha256=live_hash or ""
             )
-        elif extension == ".xlsx":
-            office_tx._package_preflight(tmp_out, mutating=False)
-            office_validation = {"verified": True, "package": "valid-ooxml"}
+            office_validation = {
+                **preservation, "package_validation": package_validation,
+            }
         published = file_ops.publish_staged_file(
             src, tmp_out, expected_hash=live_hash or "absent",
             operation="checkout-publish", retry_seconds=args.retry_seconds,
@@ -589,6 +711,7 @@ def cmd_publish(args):
     except (OSError, file_ops.FileOperationError) as exc:
         _file_err(args, exc)
     entry["base_sha256"] = store.file_sha256(src)
+    entry["last_activity_at_ns"] = time.time_ns()
     store.state_save(state)
     store.oplog_append({"op": "publish", "src": src, "working": working,
                         "conversion": result["mode"]})
@@ -726,8 +849,21 @@ def cmd_file(args):
                 expected_plan_hash=args.expected_plan_hash,
             )
         elif args.file_op == "apply-plan":
+            positional = str(getattr(args, "plan_file", "") or "")
+            option = str(getattr(args, "plan_file_option", "") or "")
+            if positional and option and os.path.abspath(positional) != os.path.abspath(option):
+                raise file_ops.FileOperationError(
+                    "positional plan path and --plan-file refer to different files",
+                    {"positional": positional, "plan_file": option},
+                )
+            plan_file = option or positional
+            if not plan_file:
+                raise file_ops.FileOperationError(
+                    "apply-plan requires a plan path, positionally or with --plan-file",
+                    {"suggested_correction": "agw file apply-plan --plan-file PLAN --expected-plan-hash SHA256"},
+                )
             data = file_ops.apply_file_plan(
-                args.plan_file, expected_plan_hash=args.expected_plan_hash,
+                plan_file, expected_plan_hash=args.expected_plan_hash,
             )
         else:
             raise file_ops.FileOperationError("unknown file operation")
@@ -739,10 +875,19 @@ def cmd_file(args):
         else:
             sys.stdout.write(data["content"])
     elif args.file_op == "plan":
+        reviews = []
+        for item in data["operations"]:
+            review = item.get("review", {})
+            changes = review.get("line_changes", {})
+            reviews.append(
+                f"{item['path']}: +{changes.get('inserted', 0)} "
+                f"-{changes.get('deleted', 0)}; {item['before_hash']} -> {item['after_hash']}"
+            )
         _out(
             args,
             (f"planned {len(data['operations'])} operation(s) in "
-             f"{data['plan_file']} ({data['plan_hash']})"),
+             f"{data['plan_file']} ({data['plan_hash']})"
+             + (("\n" + "\n".join(reviews)) if reviews else "")),
             data,
         )
     elif args.file_op == "apply-plan":
@@ -808,6 +953,9 @@ def cmd_run(args):
             output_patterns=output_patterns,
             optional_outputs=(workflow or {}).get("optional_outputs", []),
             allow_missing_output_parents=bool(workflow),
+            timeout_seconds=getattr(args, "timeout_seconds", 300.0),
+            isolation_mode=getattr(args, "isolation", "observed"),
+            network_policy=getattr(args, "network", "inherit"),
         )
         if workflow:
             data["workflow"] = workflow["workflow"]
@@ -825,6 +973,8 @@ def cmd_run(args):
         "validated declared outputs" if data.get("dry_run") else
         f"command exited {data['exit_code']}; {len(data['outputs'])} declared output(s) tracked"
     )
+    if data.get("timed_out"):
+        human_parts.append("command exceeded its bounded timeout and its process tree was terminated")
     _out(args, "\n".join(part for part in human_parts if part), data)
     if data.get("executed") and data.get("exit_code"):
         raise SystemExit(data["exit_code"])
@@ -872,9 +1022,10 @@ def cmd_workflow(args):
                 raise workflows.WorkflowError(
                     "workflow match requires a literal script command after --"
                 )
-            workflow_ids = workflows.matching_workflows(
+            diagnostics = workflows.diagnose_matching_workflows(
                 command, args.cwd or os.getcwd(),
             )
+            workflow_ids = diagnostics["matches"]
             available = {
                 item.get("id"): item for item in workflows.list_trusted()
                 if item.get("verified") and item.get("id")
@@ -887,6 +1038,7 @@ def cmd_workflow(args):
                     ["agw", "run", "--workflow", workflow_ids[0], "--", *command]
                     if len(workflow_ids) == 1 else []
                 ),
+                "diagnostics": diagnostics,
             }
             human = (
                 f"exact trusted workflow match: {workflow_ids[0]}"
@@ -894,6 +1046,20 @@ def cmd_workflow(args):
                 ("multiple exact workflow matches: " + ", ".join(workflow_ids)
                  if workflow_ids else "no exact trusted workflow match")
             )
+        elif args.workflow_op == "propose":
+            command = list(args.command)
+            if command and command[0] == "--":
+                command = command[1:]
+            if not command:
+                raise workflows.WorkflowError(
+                    "workflow propose requires a literal script command after --"
+                )
+            data = workflows.build_workflow_proposal(
+                command, args.cwd or os.getcwd(), workflow_id=args.workflow_id,
+                outputs=args.output, allowed_roots=args.allowed_root,
+                expected_states=args.expected, description=args.description,
+            )
+            human = json.dumps(data, ensure_ascii=True, indent=2)
         elif args.workflow_op == "info":
             record = workflows.load_trusted(args.workflow_id)
             manifest = record["manifest"]
@@ -957,6 +1123,16 @@ def cmd_workflow(args):
     _out(args, human, data)
 
 
+def _validate_office_stage(path: str, extension: str, requested_tier: str = "auto") -> dict:
+    """Apply one shared Office publication boundary with compatibility fields."""
+    office_tx._package_preflight(path, mutating=False)
+    tier = requested_tier
+    if tier == "auto":
+        tier = "excel-strict" if extension in {".xlsx", ".xlsm"} else "office-schema"
+    report = office_tx.validate_office_package(path, tier=tier)
+    return {**report, "verified": True, "package": "valid-ooxml"}
+
+
 def cmd_publish_file(args):
     try:
         staged = os.path.abspath(os.path.expanduser(args.staged))
@@ -967,13 +1143,16 @@ def cmd_publish_file(args):
         effective_expected_hash = args.expected_hash
         if not effective_expected_hash and os.path.isfile(target):
             effective_expected_hash = store.file_sha256(target)
-        if staged_extension in {".xlsx", ".xlsm"} \
-                or target_extension in {".xlsx", ".xlsm"}:
+        office_extensions = {".docx", ".pptx", ".xlsx", ".xlsm"}
+        if staged_extension in office_extensions or target_extension in office_extensions:
             if staged_extension != target_extension:
                 raise file_ops.FileOperationError(
                     "Office publish requires matching staged and target extensions"
                 )
-            office_tx._package_preflight(staged, mutating=False)
+            validation_tier = getattr(args, "office_validation_tier", "auto")
+            office_validation = _validate_office_stage(
+                staged, staged_extension, validation_tier,
+            )
             if target_extension == ".xlsm":
                 baseline = os.path.abspath(os.path.expanduser(
                     args.preserve_against or target
@@ -985,12 +1164,13 @@ def cmd_publish_file(args):
                 expected_baseline = args.expected_preservation_hash
                 if not expected_baseline and os.path.normcase(baseline) == os.path.normcase(target):
                     expected_baseline = args.expected_hash
-                office_validation = office_tx.validate_package_preservation(
+                preservation = office_tx.validate_package_preservation(
                     baseline, staged,
                     expected_original_sha256=expected_baseline,
                 )
-            else:
-                office_validation = {"verified": True, "package": "valid-ooxml"}
+                office_validation = {
+                    **preservation, "package_validation": office_validation,
+                }
         data = file_ops.publish_staged_file(
             target, staged,
             expected_hash=effective_expected_hash,
@@ -1046,23 +1226,63 @@ def cmd_restore(args):
 
 def cmd_undo(args):
     try:
-        op = store.undo_last()
-    except LookupError as exc:
-        _err(str(exc))
-    _out(args, f"undid {op['undone']}: {op['restored']} is back", op)
+        if getattr(args, "transaction", ""):
+            op = store.undo_transaction(args.transaction)
+            human = (
+                f"undid transaction {op['undid_transaction_id']}; "
+                f"restored {len(op['operations'])} target(s)"
+            )
+        else:
+            op = store.undo_last()
+            human = f"undid {op['undone']}: {op['restored']} is back"
+    except (LookupError, ValueError, store.TransactionUndoError) as exc:
+        _file_err(args, exc)
+    _out(args, human, op)
 
 
 def cmd_status(args):
     state = store.state_load()
     size = store.archive_size_bytes()
-    checkouts = state.get("checkouts", {})
+    all_checkouts = state.get("checkouts", {})
+    cwd_filter = os.path.realpath(os.path.abspath(os.path.expanduser(args.cwd))) \
+        if getattr(args, "cwd", "") else ""
+    now_ns = time.time_ns()
+    stale_days = max(0.0, float(getattr(args, "stale_days", 30.0)))
+    checkouts = {}
+    for src, raw_entry in all_checkouts.items():
+        if cwd_filter:
+            try:
+                if os.path.commonpath([
+                        os.path.normcase(os.path.realpath(src)),
+                        os.path.normcase(cwd_filter),
+                ]) != os.path.normcase(cwd_filter):
+                    continue
+            except ValueError:
+                continue
+        entry = dict(raw_entry)
+        created = int(entry.get("created_at_ns") or 0)
+        age_days = ((now_ns - created) / 86_400_000_000_000) if created else None
+        reasons = []
+        if not os.path.isfile(src):
+            reasons.append("source_missing")
+        working = str(entry.get("working") or "")
+        if not os.path.isfile(working):
+            reasons.append("working_copy_missing")
+        if age_days is not None and age_days >= stale_days:
+            reasons.append("age_threshold")
+        if os.path.isfile(src) and store.file_sha256(src) != entry.get("base_sha256"):
+            reasons.append("live_file_changed")
+        entry["age_days"] = age_days
+        entry["stale"] = bool(reasons)
+        entry["stale_reasons"] = reasons
+        checkouts[src] = entry
     lines = [f"archive store: {store.agw_home()} ({size / 1e6:.1f} MB)",
-             f"open checkouts: {len(checkouts)}"]
+             f"open checkouts: {len(checkouts)}"
+             + (f" (filtered from {len(all_checkouts)})" if cwd_filter else "")]
     for src, entry in list(checkouts.items())[:20]:
-        drift = ""
-        if os.path.exists(src) and store.file_sha256(src) != entry["base_sha256"]:
-            drift = "  [LIVE FILE CHANGED]"
-        lines.append(f"  {src} -> {entry['working']}{drift}")
+        suffix = ("  [" + ", ".join(entry["stale_reasons"]) + "]") \
+            if entry["stale_reasons"] else ""
+        lines.append(f"  {src} -> {entry['working']}{suffix}")
     pending_office = office_tx.transaction_status()
     lines.append(f"incomplete office transactions: {len(pending_office)}")
     for item in pending_office[:20]:
@@ -1071,7 +1291,11 @@ def cmd_status(args):
             f"{item.get('operation', '')}"
         )
     _out(args, "\n".join(lines),
-         {"archive_bytes": size, "checkouts": checkouts, "home": store.agw_home(),
+         {"archive_bytes": size, "checkouts": checkouts,
+          "checkout_count_total": len(all_checkouts),
+          "checkout_filter_cwd": cwd_filter,
+          "stale_days": stale_days,
+          "home": store.agw_home(),
           "incomplete_office_transactions": pending_office})
 
 
@@ -1094,7 +1318,11 @@ def cmd_doctor(args):
     except OSError:
         size = 0
     budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES", 0) or 0)
+    retention = store.enforce_budget(budget) if budget else {
+        "over_budget": False, "required_free_bytes": 0, "evicted": 0,
+    }
     office_caps = office.capabilities()
+    validation_caps = office_tx.office_validation_capabilities()
     checks = {
         "agw_home": home, "agw_home_writable": writable,
         "python": sys.version.split()[0], "cwd_profile": profile.name,
@@ -1103,8 +1331,16 @@ def cmd_doctor(args):
         "regenerable_rm": cfg.get("regenerable_rm"),
         "archive_bytes": size,
         "archive_budget": budget or "unlimited",
+        "archive_over_budget": retention["over_budget"],
+        "archive_required_free_bytes": retention["required_free_bytes"],
+        "archive_automatic_evictions": retention["evicted"],
         **{f"converter_{k}": v for k, v in caps.items()},
         **{f"office_{k}": v for k, v in office_caps.items()},
+        "office_validation_tiers": ",".join(validation_caps["tiers"]),
+        "office_native_roundtrip_available": validation_caps["roundtrip"]["available"],
+        "office_native_roundtrip_reason": validation_caps["roundtrip"].get(
+            "reason_code", ""
+        ),
     }
     lines = [f"{'OK ' if v is not False and v is not None else 'MISSING '} {k}: {v}"
              for k, v in checks.items()]
@@ -1118,14 +1354,20 @@ def cmd_doctor(args):
         )
     if budget and size > budget:
         lines.append(f"note: archive ({size} B) exceeds budget ({budget} B); "
-                     "oldest pre-image snapshots will be evicted on next write.")
+                     "recovery artifacts are preserved; review a retention plan manually.")
     _out(args, "\n".join(lines), checks)
 
 
 def cmd_office(args):
     path = _resolve(args.path)
     try:
-        if args.op == "info":
+        if args.op == "validate":
+            data = office_tx.validate_office_package(path, tier=args.tier)
+            human = (
+                f"valid {args.tier} Office package; "
+                f"{len(data['validators'])} validator tier(s) passed"
+            )
+        elif args.op == "info":
             if args.scope == "preservation":
                 data = office_tx.package_preservation_manifest(path)
             elif os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm") and args.scope:
@@ -1345,12 +1587,29 @@ def cmd_prune(args):
     _err("prune is not implemented in v0.1 (retention is keep-everything)", code=4)
 
 
+def cmd_schema(args):
+    try:
+        data = cli_schema.project(_ROOT_CLI_PARSER, list(args.command_path))
+    except cli_schema.SchemaLookupError as exc:
+        if args.json:
+            print(json.dumps({
+                "ok": False,
+                "error": {"code": exc.error_code, "message": str(exc), "details": {}},
+            }, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(2)
+        _err(str(exc), code=2)
+    _out(args, json.dumps(data, ensure_ascii=False, indent=2), data)
+
+
 def main(argv=None):
+    global _ROOT_CLI_PARSER, _JSON_ERRORS_ACTIVE
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
         argv = launcher.decode_internal_argv(argv)
     except ValueError as exc:
         _err(f"invalid trusted-launcher arguments: {exc}", code=2)
+    _JSON_ERRORS_ACTIVE = "--json" in argv
+    _CompactArgumentParser.json_errors_enabled = "--json" in argv
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="machine-readable output")
@@ -1360,6 +1619,7 @@ def main(argv=None):
         epilog=("Use `agw <command> --help`; for Office use "
                 "`agw office <operation> --help`."),
     )
+    _ROOT_CLI_PARSER = parser
     sub = parser.add_subparsers(dest="verb", required=True, metavar="command")
 
     def add(name, fn, *specs, **kw):
@@ -1461,6 +1721,10 @@ def main(argv=None):
         }),
         help="killable, bounded file/directory listing")
     add("checkout", cmd_checkout, (["path"], {}),
+        (["control_target"], {
+            "nargs": "?", "default": "", "metavar": "PATH_OR_TRANSACTION",
+            "help": argparse.SUPPRESS,
+        }),
         (["--mode"], {"choices": ["auto", "preserve", "data"],
                        "default": "auto",
                        "help": "preserve .xlsx/.xlsm by default; data is lossy"}),
@@ -1468,6 +1732,9 @@ def main(argv=None):
             "default": "",
             "help": ("working-copy directory; preserved Excel defaults to a "
                      "non-synced Guardrails workspace"),
+        }),
+        (["--expected-working-hash"], {
+            "default": "", "help": argparse.SUPPRESS,
         }),
         help="create a tracked working copy")
     add("convert", cmd_convert, (["path"], {}), (["--dest"], {"default": ""}),
@@ -1498,6 +1765,11 @@ def main(argv=None):
         (["--retry-seconds"], {
             "type": float, "default": 5.0,
             "help": "bounded retry window for sharing violations/EBUSY",
+        }),
+        (["--office-validation-tier"], {
+            "choices": ["auto", "package", "office-schema", "excel-strict"],
+            "default": "auto",
+            "help": argparse.SUPPRESS,
         }),
         (["--dry-run"], {"action": "store_true",
                            "help": "validate hashes without publishing"}),
@@ -1624,7 +1896,13 @@ def main(argv=None):
                 "--expected-plan-hash SHA256 --json"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    apply_plan_parser.add_argument("plan_file", help="self-contained plan file")
+    apply_plan_parser.add_argument(
+        "plan_file", nargs="?", default="", help="self-contained plan file",
+    )
+    apply_plan_parser.add_argument(
+        "--plan-file", dest="plan_file_option", default="",
+        help="self-contained plan file (alternative to the positional form)",
+    )
     apply_plan_parser.add_argument(
         "--expected-plan-hash", required=True, help="exact SHA-256 of the plan file",
     )
@@ -1644,6 +1922,18 @@ def main(argv=None):
         (["--expected-hash"], {"action": "append", "default": [], "metavar": "HASH",
                                "help": "hash/absent per output"}),
         (["--cwd"], {"default": "", "metavar": "DIR", "help": "working dir"}),
+        (["--timeout-seconds"], {
+            "type": float, "default": 300.0, "metavar": "SECONDS",
+            "help": argparse.SUPPRESS,
+        }),
+        (["--isolation"], {
+            "choices": ["observed", "read-only", "strict"], "default": "observed",
+            "help": argparse.SUPPRESS,
+        }),
+        (["--network"], {
+            "choices": ["inherit", "deny"], "default": "inherit",
+            "help": argparse.SUPPRESS,
+        }),
         (["--dry-run"], {"action": "store_true",
                           "help": "validate only; no execution"}),
         (["command"], {"nargs": argparse.REMAINDER, "metavar": "...",
@@ -1695,6 +1985,26 @@ def main(argv=None):
         "command", nargs=argparse.REMAINDER, metavar="...", help="command after --",
     )
     workflow_match.set_defaults(fn=cmd_workflow)
+    workflow_propose = workflow_sub.add_parser(
+        "propose", parents=[common],
+        help="draft",
+        description=("Build and validate a workflow proposal without writing a "
+                     "manifest or changing trusted workflow state."),
+    )
+    workflow_propose.add_argument("--id", dest="workflow_id", required=True,
+                                  help="stable workflow id")
+    workflow_propose.add_argument("--cwd", default="", help="command working directory")
+    workflow_propose.add_argument("--output", action="append", default=[], required=True,
+                                  help="exact declared output; repeat")
+    workflow_propose.add_argument("--expected", action="append", default=[], required=True,
+                                  help="any/absent/present/SHA-256 per output; repeat")
+    workflow_propose.add_argument("--allowed-root", action="append", default=[], required=True,
+                                  help="permitted output root; repeat")
+    workflow_propose.add_argument("--description", default="", help="short reviewed purpose")
+    workflow_propose.add_argument(
+        "command", nargs=argparse.REMAINDER, metavar="...", help="command after --",
+    )
+    workflow_propose.set_defaults(fn=cmd_workflow)
     workflow_info = workflow_sub.add_parser(
         "info", parents=[common], help="verify and inspect one trusted workflow",
     )
@@ -1747,16 +2057,28 @@ def main(argv=None):
     add("restore", cmd_restore, (["path"], {}),
         (["--version"], {"type": int, "default": 0}),
         help="recover an archived version")
-    add("undo", cmd_undo, help="reverse the last archive or move")
-    add("status", cmd_status, help="show checkouts and incomplete transactions")
+    add("undo", cmd_undo,
+        (["--transaction"], {
+            "default": "", "metavar": "ID",
+            "help": "reverse one exact file-mutation transaction",
+        }),
+        help="reverse recovery")
+    add("status", cmd_status,
+        (["--cwd"], {"default": "", "help": "show only checkouts under this folder"}),
+        (["--stale-days"], {"type": float, "default": 30.0,
+                             "help": "age threshold used for stale warnings"}),
+        help="show scoped checkouts and incomplete transactions")
     add("log", cmd_log, (["-n"], {"type": int, "default": 20}),
         help="show recent recovery operations")
     add("doctor", cmd_doctor, help="check environment, policy, and recovery health")
+    add("schema", cmd_schema,
+        (["command_path"], {"nargs": "+", "metavar": "COMMAND",
+                            "help": "narrow command path, for example: file apply-plan"}),
+        help="argument schema")
     office_parser = sub.add_parser(
         "office", parents=[common],
         help="guarded Office reads and atomic edits",
-        description=("Guarded Office operations. Choose an operation, then run "
-                     "`agw office <operation> --help` for only its arguments."),
+        description="Guarded Office operations; choose one for leaf help.",
     )
     office_sub = office_parser.add_subparsers(
         dest="op", required=True, metavar="operation",
@@ -1787,6 +2109,15 @@ def main(argv=None):
         (["--limit"], {"type": int, "default": 50}),
     )
 
+    add_office(
+        "validate", "Validate OOXML",
+        (["--tier"], {
+            "choices": ["package", "office-schema", "excel-strict"],
+            "default": "office-schema",
+            "help": "cumulative validation tier",
+        }),
+        example="agw office validate workbook.xlsx --tier excel-strict --json",
+    )
     add_office(
         "info", "Inspect Office structure and risks",
         (["--scope"], {"choices": ["tables", "names", "preservation"], "default": "",

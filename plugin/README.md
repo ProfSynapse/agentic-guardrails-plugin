@@ -124,13 +124,17 @@ so the agent self-corrects instead of fighting the rails:
 | unbounded shell or Python text reads | `agw file read PATH --start-line N --limit N --json` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
 | discover an existing script contract | `agw workflow match -- command` |
+| draft a contract without trusting or writing it | `agw workflow propose ... -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
+| inspect an exact CLI contract | `agw schema file apply-plan --json` |
+| reverse one exact mutation | `agw undo --transaction ID` |
 
 Structured Office operations are also available:
 
 ~~~text
 agw office info workbook.xlsx --scope tables --json
+agw office validate workbook.xlsx --tier excel-strict --json
 agw office read-table workbook.xlsx --table RecordsTable --columns RecordID,Status --limit 50 --json
 agw office read-table workbook.xlsx --table RecordsTable --include-formulas --json
 agw office read-range workbook.xlsx --sheet Records --range A1:D20 --formulas --json
@@ -189,6 +193,10 @@ output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders and need not be inside an observed root, so unrelated app
 or sync-client updates are ignored. A recoverable state file can therefore be
 paired with a separate, narrowly patterned cache root.
+Runs have a bounded timeout and bounded output capture. The default `observed`
+mode does not claim filesystem or network isolation; requests for read-only,
+strict, or network-denied execution fail closed unless an OS isolation provider
+is installed, and are never silently downgraded.
 
 Use `file write --expected-hash absent` to create a file after its literal parent
 directory exists. `file patch` and `file replace` modify existing files. Patch
@@ -203,6 +211,9 @@ arguments. A single exact match can be routed automatically by supported hooks;
 multiple matches remain explicit. Ambiguous source-only write evidence reports
 the triggering line and primitive, requires one-run review in standard mode,
 stays blocked in strict mode, and is shadowed in observe mode.
+JSON matching includes per-candidate stable mismatch reason codes. `agw workflow
+propose` builds an inert validated v2 manifest from explicit outputs, expected
+states, and allowed roots without writing a file or changing trust state.
 For dependent changes across several UTF-8 files, `agw file plan` validates a
 version-1 JSON list of `write`, `patch`, and `replace` operations and writes a
 self-contained proposal without changing the targets. `agw file apply-plan`
@@ -242,6 +253,14 @@ when a sync client keeps the target busy. An `.xlsm` stage is compared with the
 live target automatically; creating a new target requires `--preserve-against`.
 `agw run --dry-run` validates only the declared contract and never executes the
 command; its JSON result reports `"validation_scope":"contract_only"`.
+
+Successful file mutations include an explicit recovery receipt stating whether
+the target existed, whether a pre-image was captured, whether rollback is
+available, and the exact `agw undo --transaction ID` command. Multi-file plans
+and declared runs share one parent transaction ID. Archive budgets are
+assessment-only: hooks do not automatically evict recovery artifacts. `agw
+checkout close PATH` removes only checkout tracking and preserves the working
+copy; its receipt can be reversed with `agw checkout reopen TRANSACTION_ID`.
 
 Approval prompts for sensitive reads and credential searches show a sanitized
 filename or search scope, the detected risk category, and the specific reason

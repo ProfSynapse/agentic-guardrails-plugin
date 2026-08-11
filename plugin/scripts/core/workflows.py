@@ -29,6 +29,17 @@ MANIFEST_SCHEMA = "agw.workflow/v2"
 PARAMETERIZED_SCHEMA = "agw.workflow/v3"
 MANIFEST_SCHEMAS = {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}
 RECORD_SCHEMA = "agw.trusted-workflow/v1"
+DIAGNOSTIC_SCHEMA = "agw.workflow-diagnostics/v1"
+DIAGNOSTIC_REASON_CODES = frozenset({
+    "command_normalization_failed",
+    "unverified_record",
+    "invalid_record",
+    "runtime_mismatch",
+    "script_path_mismatch",
+    "script_hash_mismatch",
+    "arguments_mismatch",
+    "parameters_mismatch",
+})
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_WORKFLOWS = 256
 MAX_OUTPUTS = 128
@@ -591,25 +602,116 @@ def initialize_manifest(
         script_value = os.path.relpath(script_path, manifest_dir).replace("\\", "/")
     except ValueError:
         script_value = script_path
-    manifest = {
+    manifest = _build_v2_manifest(
+        workflow_id=workflow_id,
+        description=description,
+        runtime=runtime,
+        script=script_value,
+        script_sha256=store.file_sha256(script_path),
+        args=list(args or []),
+        outputs=outputs,
+        expected_states=expected,
+        allowed_roots=roots,
+    )
+    normalized = validate_manifest(manifest, manifest_path)
+    return {"manifest": manifest, "normalized": normalized}
+
+
+def _build_v2_manifest(
+    *,
+    workflow_id: str,
+    description: str,
+    runtime: str,
+    script: str,
+    script_sha256: str,
+    args: list[str],
+    outputs: list[str],
+    expected_states: list[str],
+    allowed_roots: list[str],
+) -> dict:
+    """Assemble a v2 manifest; validation remains the caller's responsibility."""
+    return {
         "schema": MANIFEST_SCHEMA,
         "id": workflow_id,
         "description": description,
         "command": {
             "runtime": runtime,
-            "script": script_value,
-            "script_sha256": store.file_sha256(script_path),
-            "args": list(args or []),
+            "script": script,
+            "script_sha256": script_sha256,
+            "args": list(args),
         },
-        "allowed_roots": roots,
+        "allowed_roots": list(allowed_roots),
         "outputs": [
             {"path": path, "expected": expectation}
-            for path, expectation in zip(outputs, expected)
+            for path, expectation in zip(outputs, expected_states)
         ],
         "observed_roots": [],
     }
-    normalized = validate_manifest(manifest, manifest_path)
-    return {"manifest": manifest, "normalized": normalized}
+
+
+def _explicit_string_list(value, label: str) -> list[str]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise WorkflowError(f"{label} must be an explicitly supplied non-empty array")
+    return list(value)
+
+
+def _validate_explicit_expected_states(states: list[str]) -> None:
+    for index, state in enumerate(states):
+        if not isinstance(state, str):
+            raise WorkflowError(f"expected_states[{index}] must be a string")
+        normalized = state.strip().lower()
+        if normalized.startswith("sha256:"):
+            normalized = normalized.split(":", 1)[1]
+        if normalized not in {"any", "absent", "missing", "new", "present"} \
+                and not _HASH_RE.fullmatch(normalized):
+            raise WorkflowError(
+                f"expected_states[{index}] must be any, absent, present, or a SHA-256"
+            )
+
+
+def build_workflow_proposal(
+    command: list[str],
+    cwd: str,
+    *,
+    workflow_id: str,
+    outputs: list[str],
+    allowed_roots: list[str],
+    expected_states: list[str],
+    description: str = "",
+) -> dict:
+    """Return an inert, validated v2 proposal for one exact command.
+
+    This function performs read-only normalization and validation.  It never
+    writes a manifest, creates a trusted record, or changes trust state.
+    """
+    working = os.path.realpath(os.path.abspath(os.path.expanduser(cwd or os.getcwd())))
+    if not os.path.isdir(working):
+        raise WorkflowError("workflow working directory does not exist")
+    normalized = normalize_command(command, working)
+    output_list = _explicit_string_list(outputs, "outputs")
+    root_list = _explicit_string_list(allowed_roots, "allowed_roots")
+    expected_list = _explicit_string_list(expected_states, "expected_states")
+    if len(expected_list) != len(output_list):
+        raise WorkflowError(
+            "expected_states must contain exactly one entry per output, in the same order"
+        )
+    _validate_explicit_expected_states(expected_list)
+    manifest = _build_v2_manifest(
+        workflow_id=workflow_id,
+        description=description,
+        runtime=normalized["runtime"],
+        script=normalized["script"],
+        script_sha256=normalized["script_sha256"],
+        args=normalized["args"],
+        outputs=output_list,
+        expected_states=expected_list,
+        allowed_roots=root_list,
+    )
+    # An absolute script path keeps the proposal valid regardless of where a
+    # caller later chooses to serialize it.  The synthetic path is never used
+    # for I/O; validate_manifest only uses its directory for relative inputs.
+    validate_manifest(manifest, os.path.join(working, ".agw-workflow-proposal.json"))
+    return manifest
 
 
 def _trust_dir() -> str:
@@ -1224,46 +1326,163 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str,
     }
 
 
-def matching_workflows(command: list[str], cwd: str) -> list[str]:
-    """Return every authenticated workflow matching one exact command."""
+def _diagnostic_reason(code: str, message: str, **details) -> dict:
+    if code not in DIAGNOSTIC_REASON_CODES:
+        raise ValueError(f"unsupported workflow diagnostic reason code: {code}")
+    return {"code": code, "message": message, **details}
+
+
+def _arguments_sha256(arguments: list) -> str:
+    return hashlib.sha256(_canonical_json({"arguments": arguments})).hexdigest()
+
+
+def _normalized_command_diagnostic(normalized: dict) -> dict:
+    return {
+        "runtime": normalized["runtime"],
+        "script": normalized["script"],
+        "script_sha256": normalized["script_sha256"],
+        "args": list(normalized["args"]),
+        "argument_count": len(normalized["args"]),
+        "arguments_sha256": _arguments_sha256(normalized["args"]),
+    }
+
+
+def _candidate_metadata(manifest: dict) -> dict:
+    command = manifest["command"]
+    return {
+        "id": manifest["id"],
+        "schema": manifest["schema"],
+        "verified": True,
+        "runtime": command["runtime"],
+        "script": command["script"],
+        "script_sha256": command["script_sha256"],
+        "argument_count": len(command.get("args", [])),
+        "parameter_count": len(manifest.get("parameters", {})),
+    }
+
+
+def _candidate_mismatch_reasons(manifest: dict, normalized: dict, cwd: str) -> list[dict]:
+    """Compare identities without echoing trusted argument or parameter values."""
+    bound = manifest["command"]
+    reasons = []
+    if bound["runtime"] != normalized["runtime"]:
+        reasons.append(_diagnostic_reason(
+            "runtime_mismatch", "runtime does not match the trusted workflow",
+            expected=bound["runtime"], actual=normalized["runtime"],
+        ))
+    if os.path.normcase(bound["script"]) != os.path.normcase(normalized["script"]):
+        reasons.append(_diagnostic_reason(
+            "script_path_mismatch", "script path does not match the trusted workflow",
+            expected=bound["script"], actual=normalized["script"],
+        ))
+    if not hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"]):
+        reasons.append(_diagnostic_reason(
+            "script_hash_mismatch", "script content does not match the trusted workflow",
+            expected=bound["script_sha256"], actual=normalized["script_sha256"],
+        ))
+    if manifest.get("schema") == MANIFEST_SCHEMA \
+            and bound.get("args", []) != normalized["args"]:
+        reasons.append(_diagnostic_reason(
+            "arguments_mismatch", "arguments do not match the trusted workflow",
+            expected_count=len(bound.get("args", [])),
+            actual_count=len(normalized["args"]),
+            expected_sha256=_arguments_sha256(bound.get("args", [])),
+            actual_sha256=_arguments_sha256(normalized["args"]),
+        ))
+    if manifest.get("schema") == PARAMETERIZED_SCHEMA:
+        context = {
+            "cwd": os.path.realpath(os.path.abspath(cwd or os.getcwd())),
+            "script_dir": os.path.dirname(normalized["script"]),
+            "script_name": os.path.basename(normalized["script"]),
+            "script_stem": os.path.splitext(os.path.basename(normalized["script"]))[0],
+            "temp": os.path.realpath(os.path.abspath(tempfile.gettempdir())),
+            "args": normalized["args"], "parameters": {},
+        }
+        try:
+            _resolve_parameter_args(
+                manifest, {}, context, actual_args=normalized["args"],
+            )
+        except WorkflowError as exc:
+            reasons.append(_diagnostic_reason(
+                "parameters_mismatch",
+                "arguments do not satisfy the trusted parameter contract",
+                expected_count=len(bound.get("args", [])),
+                actual_count=len(normalized["args"]),
+                cause_code=exc.error_code,
+            ))
+    return reasons
+
+
+def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
+    """Explain how every trusted-store candidate compares with one command.
+
+    Raw argument values are present only once in ``normalized``.  Candidate
+    mismatch records use counts and hashes so diagnostics do not duplicate
+    potentially confidential argument or parameter values.
+    """
+    normalized = None
+    normalization_error = None
     try:
         normalized = normalize_command(command, cwd)
-    except WorkflowError:
-        return []
+    except WorkflowError as exc:
+        normalization_error = _diagnostic_reason(
+            "command_normalization_failed", str(exc), cause_code=exc.error_code,
+        )
+
+    candidates = []
     matches = []
     for item in list_trusted():
         if not item.get("verified"):
+            candidates.append({
+                "record": item.get("record", ""),
+                "verified": False,
+                "matched": False,
+                "mismatch_reasons": [_diagnostic_reason(
+                    "unverified_record", "trusted workflow record could not be verified",
+                )],
+            })
             continue
         try:
             record = load_trusted(item["id"])
-        except WorkflowError:
+        except WorkflowError as exc:
+            candidates.append({
+                "id": item["id"],
+                "verified": False,
+                "matched": False,
+                "mismatch_reasons": [_diagnostic_reason(
+                    "invalid_record", "trusted workflow record failed verification",
+                    cause_code=exc.error_code,
+                )],
+            })
             continue
         manifest = record["manifest"]
-        bound = manifest["command"]
-        if not (bound["runtime"] == normalized["runtime"]
-                and os.path.normcase(bound["script"]) == os.path.normcase(normalized["script"])
-                and hmac.compare_digest(bound["script_sha256"], normalized["script_sha256"])):
-            continue
-        if manifest.get("schema") == MANIFEST_SCHEMA \
-                and bound.get("args", []) != normalized["args"]:
-            continue
-        if manifest.get("schema") == PARAMETERIZED_SCHEMA:
-            context = {
-                "cwd": os.path.realpath(os.path.abspath(cwd or os.getcwd())),
-                "script_dir": os.path.dirname(normalized["script"]),
-                "script_name": os.path.basename(normalized["script"]),
-                "script_stem": os.path.splitext(os.path.basename(normalized["script"]))[0],
-                "temp": os.path.realpath(os.path.abspath(tempfile.gettempdir())),
-                "args": normalized["args"], "parameters": {},
-            }
-            try:
-                _resolve_parameter_args(
-                    manifest, {}, context, actual_args=normalized["args"],
-                )
-            except WorkflowError:
-                continue
-        matches.append(item["id"])
-    return matches
+        candidate = _candidate_metadata(manifest)
+        if normalized is None:
+            reasons = [_diagnostic_reason(
+                "command_normalization_failed",
+                "candidate was not evaluated because the command could not be normalized",
+            )]
+        else:
+            reasons = _candidate_mismatch_reasons(manifest, normalized, cwd)
+        candidate["matched"] = not reasons
+        candidate["mismatch_reasons"] = reasons
+        candidates.append(candidate)
+        if candidate["matched"]:
+            matches.append(candidate["id"])
+    return {
+        "schema": DIAGNOSTIC_SCHEMA,
+        "ok": normalization_error is None,
+        "normalized": _normalized_command_diagnostic(normalized) if normalized else None,
+        "normalization_error": normalization_error,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "matches": matches,
+    }
+
+
+def matching_workflows(command: list[str], cwd: str) -> list[str]:
+    """Return every authenticated workflow matching one exact command."""
+    return diagnose_matching_workflows(command, cwd)["matches"]
 
 
 def matching_workflow(command: list[str], cwd: str) -> str:
