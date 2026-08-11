@@ -208,6 +208,7 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
         packed_plugin / "scripts" / "codex" / "_dispatch.py",
         packed_plugin / "scripts" / "claude" / "_dispatch.py",
         packed_plugin / "scripts" / "core" / "engine.py",
+        packed_plugin / "scripts" / "core" / "agw_contract.py",
         packed_plugin / "scripts" / "core" / "enforcement.py",
         packed_plugin / "scripts" / "core" / "powershell_bind.py",
         packed_plugin / "scripts" / "core" / "common-controls-v6.manifest",
@@ -402,6 +403,43 @@ def test_packed_project_keyword_search_is_ordinary_diagnostic(
         tmp_path,
     )
     assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+def test_packed_discovery_commands_and_contract_are_available_without_site_packages(
+        packed_plugin, tmp_path):
+    for operation in ("list", "search"):
+        output = _run_packed_agw_without_site_packages(
+            packed_plugin, tmp_path, operation, "--help"
+        )
+        assert f"usage: agw {operation}" in output
+    names = json.loads(_packed_core(
+        packed_plugin,
+        "from core import agw_contract; import json; "
+        "print(json.dumps(sorted(agw_contract.operation_names())))",
+    ))
+    assert "list" in names and "search" in names
+    assert "apply" not in names and "hydrate" not in names
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_packed_unknown_agw_operation_denies_without_generic_approval(
+        packed_plugin, tmp_path, host):
+    canary = "PRIVATE-PACKED-ARGUMENT"
+    out = _run_dispatch(
+        packed_plugin, host,
+        {"tool_name": "PowerShell" if os.name == "nt" else "Bash",
+         "tool_input": {"command": f"agw future-operation {canary}"},
+         "cwd": str(tmp_path), "session_id": f"packed-unknown-{host}",
+         "event_id": f"packed-unknown-{host}"},
+        tmp_path,
+    )
+    specific = out["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    reason = specific["permissionDecisionReason"]
+    assert "future-operation" in reason
+    assert "Use `agw --help`" in reason
+    assert "The exact files could not be identified" not in reason
+    assert canary not in reason
 
 
 def test_authoritative_packager_excludes_experimental_audit_v2():

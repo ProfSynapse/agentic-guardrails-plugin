@@ -32,7 +32,7 @@ class ApprovalResponse:
         return self.outcome in {
             "denied", "cancelled", "headless-deny", "provider-unavailable",
             "provider-error", "not-prompt-eligible", "invalid-response",
-            "policy-revision-unavailable",
+            "policy-revision-unavailable", "prompt-incomplete",
         }
 
     def authorizes(self) -> bool:
@@ -259,6 +259,11 @@ class NativeApprovalProvider(ApprovalProvider):
         _ = timeout_s
 
     def request(self, request: PromptRequest) -> ApprovalResponse:
+        prompt_problem = request.validation_problem()
+        if prompt_problem:
+            return ApprovalResponse(
+                False, "prompt-incomplete", "validation:" + prompt_problem
+            )
         if os.name != "nt":
             return ApprovalResponse(False, "provider-unavailable", "platform:not-windows")
         try:
@@ -271,6 +276,11 @@ class NativeApprovalProvider(ApprovalProvider):
             )
 
     def _task_dialog(self, request: PromptRequest) -> ApprovalResponse:
+        prompt_problem = request.validation_problem()
+        if prompt_problem:
+            return ApprovalResponse(
+                False, "prompt-incomplete", "validation:" + prompt_problem
+            )
         buttons = (TASKDIALOG_BUTTON * 2)(
             TASKDIALOG_BUTTON(self.ALLOW_ID, request.allow_label),
             TASKDIALOG_BUTTON(self.CANCEL_ID, request.cancel_label),
@@ -317,6 +327,11 @@ def request_approval(decision: GuardrailDecision, request: PromptRequest,
     """Request approval, coalescing only an identical host event and operation."""
     if not decision.prompt_eligible or decision.confidence == LOW:
         return ApprovalResponse(False, "not-prompt-eligible")
+    prompt_problem = request.validation_problem()
+    if prompt_problem:
+        return ApprovalResponse(
+            False, "prompt-incomplete", "validation:" + prompt_problem
+        )
     if not decision.policy_revision or request.policy_revision != decision.policy_revision:
         return ApprovalResponse(False, "policy-revision-unavailable")
 

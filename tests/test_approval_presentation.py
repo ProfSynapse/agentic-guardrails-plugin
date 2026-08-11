@@ -13,7 +13,13 @@ from core.decisions import GuardrailDecision, LOW  # noqa: E402
 
 def _request(event_id="event-1"):
     decision = GuardrailDecision(
-        events.ASK, rule_id="builtin:review", policy_revision="revision-a"
+        events.ASK, rule_id="builtin:review", policy_revision="revision-a",
+        presentation_context=events.DecisionContext.FILE_CHANGE,
+        presentation_details={
+            "operation": "change file",
+            "targets": ["review-target.txt"],
+            "target_kind": "file",
+        },
     )
     ev = events.ToolEvent(kind=events.OTHER, tool="apply_patch",
                           command="PowerShell -Command Remove-Item x",
@@ -59,18 +65,25 @@ def test_prompt_copy_contains_no_shell_jargon():
     assert request.default_choice == "cancel"
     assert "Why we're asking:" in request.primary_text()
     assert "What could happen:" in request.primary_text()
-    assert "Safety measure:" in request.primary_text()
-    assert "Cancel to make no changes" in request.primary_text()
+    assert "Safety measure:" not in request.primary_text()
+    assert "Choose Cancel" not in request.primary_text()
+    assert "Recovery:" not in request.primary_text()
     assert request.action not in request.primary_text()
+
+
+def test_optional_recovery_copy_is_not_required_for_an_informative_prompt():
+    _decision, request = _request()
+    assert request.safeguard == ""
+    assert request.validation_problem() == ""
 
 
 def test_closed_prompt_copy_uses_safe_categories_not_raw_inputs():
     canary = "PRIVATE-CANARY-client-secret-command"
     cases = (
         ("builtin:agw-ask", events.DecisionContext.AGW_ARCHIVE,
-         "Stored Guardrails recovery copies", "changes retained data"),
+         "Stored Guardrails recovery copies", "permanently prune"),
         ("builtin:agw-unknown", events.DecisionContext.AGW_UNKNOWN,
-         "exact files could not be identified", "unrecognized Guardrails operation"),
+         "exact files could not be identified", "needs review"),
         ("builtin:patch-opaque", events.DecisionContext.PATCH_UNKNOWN,
          "exact files could not be identified", "proposed change"),
         ("builtin:secret-file", events.DecisionContext.SENSITIVE_READ,
@@ -104,7 +117,7 @@ def test_closed_prompt_copy_uses_safe_categories_not_raw_inputs():
         assert "remove-item" not in rendered
 
 
-def test_unknown_target_is_honest_and_cancel_is_recommended():
+def test_unknown_target_is_marked_unresolved_and_cannot_prompt():
     decision = GuardrailDecision(
         events.ASK, rule_id="builtin:agw-unknown",
         policy_revision="revision-a",
@@ -113,9 +126,51 @@ def test_unknown_target_is_honest_and_cancel_is_recommended():
     event = events.ToolEvent(kind=events.EXEC, command="private raw text")
     request = presentation.build_prompt(decision, {"event_id": "unknown"}, [event])
     assert "The exact files could not be identified" in request.primary_text()
+    assert request.validation_problem() == "target-unresolved"
     assert request.allow_label == "Allow once"
     assert request.cancel_label == "Cancel (recommended)"
     assert request.default_choice == "cancel"
+
+
+def test_incomplete_prompt_never_invokes_provider():
+    class MustNotRun(ApprovalProvider):
+        def request(self, request):
+            raise AssertionError("an unresolved prompt must never reach a provider")
+
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:agw-unknown",
+        policy_revision="revision-a",
+        presentation_context=events.DecisionContext.AGW_UNKNOWN,
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "unknown"},
+        [events.ToolEvent(kind=events.EXEC, command="private raw text")],
+    )
+    response = approvals.request_approval(decision, request, MustNotRun())
+    assert response == ApprovalResponse(
+        False, "prompt-incomplete", "validation:target-unresolved"
+    )
+
+
+def test_native_boundary_refuses_incomplete_prompt_before_platform_or_ui(monkeypatch):
+    decision = GuardrailDecision(
+        events.ASK, rule_id="builtin:agw-unknown",
+        policy_revision="revision-a",
+        presentation_context=events.DecisionContext.AGW_UNKNOWN,
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "native-unknown"},
+        [events.ToolEvent(kind=events.EXEC, command="private raw text")],
+    )
+    provider = object.__new__(approvals.NativeApprovalProvider)
+
+    def must_not_open(_request):
+        raise AssertionError("native UI must not receive an incomplete prompt")
+
+    monkeypatch.setattr(provider, "_task_dialog", must_not_open)
+    assert provider.request(request) == ApprovalResponse(
+        False, "prompt-incomplete", "validation:target-unresolved"
+    )
 
 
 def test_sensitive_read_prompt_names_sanitized_file_and_signal():
@@ -138,7 +193,7 @@ def test_sensitive_read_prompt_names_sanitized_file_and_signal():
     assert "board notes.txt" in rendered
     assert "a confidentiality marking" in rendered
     assert "File: board notes.txt" in rendered
-    assert "keep the content out" in rendered
+    assert "Recovery:" not in rendered
     assert "\nnotes.txt" not in rendered
 
 
@@ -185,6 +240,8 @@ def test_connected_service_prompt_names_service_action_and_safe_target():
     assert "Target: Google Drive file: Board Budget.xlsx" in rendered
     assert "This Google Drive operation needs your approval" in rendered
     assert "Google Drive may create or change the specified file" in rendered
+    assert "Recovery:" not in rendered
+    assert "Choose Cancel" not in rendered
     assert "PRIVATE-CANARY" not in rendered
     assert "access_token" not in rendered
 
@@ -207,6 +264,9 @@ def test_connected_service_prompt_uses_safe_id_when_name_is_unavailable():
 
     assert request.action == "The agent wants to send a message in Slack."
     assert "Target: Slack message: Channel ID: C012345" in rendered
+    assert "Slack may create or change the specified message" in rendered
+    assert "Recovery:" not in rendered
+    assert "Choose Cancel" not in rendered
     assert "PRIVATE-CANARY" not in rendered
 
 

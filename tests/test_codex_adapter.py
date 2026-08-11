@@ -386,6 +386,34 @@ def test_codex_project_keyword_search_is_allowed_without_prompt():
     assert _decision(out) == "allow"
 
 
+def test_codex_unknown_agw_verb_denies_without_invoking_provider(
+        monkeypatch, capsys, tmp_path):
+    import io
+    from core.approvals import ApprovalProvider
+
+    ptu = _load_codex_pretooluse_isolated()
+    canary = "PRIVATE-CANARY-unknown-argument"
+    payload = {
+        "tool_name": "PowerShell" if os.name == "nt" else "Bash",
+        "tool_input": {"command": f"agw future-operation {canary}"},
+        "cwd": str(tmp_path), "session_id": "unknown-agw",
+        "event_id": "unknown-agw-event", "hook_event_name": "PreToolUse",
+    }
+
+    class MustNotRun(ApprovalProvider):
+        def request(self, request):
+            raise AssertionError("unknown AGW verbs must not open an approval UI")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    ptu.main(MustNotRun())
+    out = json.loads(capsys.readouterr().out)
+    assert _decision(out) == "deny"
+    reason = _reason(out)
+    assert "future-operation" in reason
+    assert "Use `agw --help`" in reason
+    assert canary not in reason
+
+
 def test_codex_native_discovery_routes_broad_and_strict_shapes(tmp_path):
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -608,7 +636,8 @@ def test_codex_provider_receives_closed_human_prompt(monkeypatch, capsys, tmp_pa
     rendered = request.action + "\n" + request.primary_text()
     assert "wants to read" in rendered
     assert "a confidentiality marking" in rendered
-    assert "keep the content out" in rendered
+    assert "Choose Cancel" not in rendered
+    assert "Recovery:" not in rendered
     assert request.allow_label == "Allow once"
     assert request.cancel_label == "Cancel (recommended)"
     assert f"{canary}.txt" in rendered
@@ -649,6 +678,8 @@ def test_codex_provider_receives_specific_connected_service_prompt(
     rendered = request.action + "\n" + request.primary_text()
     assert "update a file in Google Drive" in rendered
     assert "Target: Google Drive file: Board Budget.xlsx" in rendered
+    assert "Google Drive may create or change the specified file" in rendered
+    assert "Recovery:" not in rendered
     assert "PRIVATE-CANARY" not in rendered
 
 
