@@ -17,6 +17,7 @@ import fnmatch
 import os
 import re
 import shutil
+from typing import Optional
 
 from . import launcher, policy_health, powershell_bind, profiles as prof
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
@@ -34,7 +35,9 @@ ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archiv
 # packaged safety vocabulary rather than adding a second Guardrails prompt; a
 # host sandbox may still request its normal outside-workspace approval for
 # ~/.agw. Permanent/special verbs remain in AGW_ASK_VERBS below.
-AGW_READ_ONLY_VERBS = {"scan", "diff", "status", "log", "doctor"}
+AGW_READ_ONLY_VERBS = {
+    "scan", "list", "search", "diff", "status", "log", "doctor",
+}
 AGW_SAFE_MUTATING_VERBS = {
     "init", "checkout", "convert", "archive", "move", "rename", "snapshot",
     "restore", "undo", "publish", "publish-file", "unlink-link",
@@ -294,20 +297,20 @@ _SECRET_READ_RULES = {"builtin:secret-file", "builtin:content-prescan",
 _LEVELS = {
     "strict":   {"enforcement": "enforce", "session_memory": False,
                  "regenerable_rm": False, "relaxed_access": False,
-                 "deny_secret_read": True},
+                 "deny_secret_read": True, "strict_discovery": True},
     "standard": {"enforcement": "enforce", "session_memory": True,
                  "regenerable_rm": True,  "relaxed_access": False,
-                 "deny_secret_read": False},
+                 "deny_secret_read": False, "strict_discovery": False},
     "relaxed":  {"enforcement": "enforce", "session_memory": True,
                  "regenerable_rm": True,  "relaxed_access": True,
-                 "deny_secret_read": False},
+                 "deny_secret_read": False, "strict_discovery": False},
     "observe":  {"enforcement": "observe", "session_memory": True,
                  "regenerable_rm": True,  "relaxed_access": False,
-                 "deny_secret_read": False},
+                 "deny_secret_read": False, "strict_discovery": False},
 }
 _DEFAULT_LEVEL = "standard"
 _BOOL_KNOBS = {"session_memory", "regenerable_rm", "relaxed_access",
-               "deny_secret_read"}
+               "deny_secret_read", "strict_discovery"}
 
 
 def _as_bool(val):
@@ -333,7 +336,8 @@ def resolve_settings(policy: "Policy") -> dict:
     # env overrides win last
     env_map = {"AGW_ENFORCEMENT": "enforcement", "AGW_SESSION_MEMORY": "session_memory",
                "AGW_REGENERABLE_RM": "regenerable_rm", "AGW_RELAXED_ACCESS": "relaxed_access",
-               "AGW_DENY_SECRET_READ": "deny_secret_read"}
+               "AGW_DENY_SECRET_READ": "deny_secret_read",
+               "AGW_STRICT_DISCOVERY": "strict_discovery"}
     for env, knob in env_map.items():
         if env in os.environ:
             cfg[knob] = (os.environ[env].lower() if knob == "enforcement"
@@ -562,7 +566,7 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
     elif event.kind in (WRITE, EDIT):
         decision = _eval_write(event, policy)
     elif event.kind == READ:
-        decision = _eval_read(event, policy)
+        decision = _eval_native_discovery(event, cfg) or _eval_read(event, policy)
     elif event.kind == MCP:
         decision = _eval_mcp(event, policy)
     elif event.kind == OTHER and event.extra.get("apply_patch") \
@@ -997,11 +1001,13 @@ def _search_shape(cmd: SimpleCommand, event: ToolEvent):
         positionals.append(arg)
         i += 1
 
-    pattern = explicit_patterns[0] if explicit_patterns else \
-        (positionals.pop(0) if positionals else "")
+    file_listing = cmd.name in {"rg", "ripgrep"} \
+        and any(value.lower() == "--files" for value in args)
+    pattern = "" if file_listing else (explicit_patterns[0] if explicit_patterns else \
+        (positionals.pop(0) if positionals else ""))
     scopes = explicit_scopes + positionals
     recursive = explicit_recursive
-    if cmd.name in {"rg", "ag"} and not recursive:
+    if cmd.name in {"rg", "ripgrep", "ag", "ack"} and not recursive:
         if not scopes:
             recursive = True
         else:
@@ -1031,11 +1037,9 @@ def _project_search_assessment(cmd: SimpleCommand, event: ToolEvent,
         return False, "Guardrails could not verify this as a bounded recursive search.", labels
     if filename_only:
         return False, "The requested search shape could not be verified.", labels
-    if not plugin_root:
-        return False, "The active project root could not be verified.", labels
     if redirect_targets(event.command) or _has_mutation_evidence(event.command):
         return False, "The search command may also write or redirect output.", labels
-    root = os.path.realpath(os.path.dirname(os.path.realpath(plugin_root)))
+    root = _active_project_root(event)
     cwd = os.path.realpath(event.cwd or os.getcwd())
     if not _within(cwd, root):
         return False, "The current folder is outside the verified project.", labels
@@ -1074,6 +1078,232 @@ def _project_search_is_routine(cmd: SimpleCommand, event: ToolEvent,
     return _project_search_assessment(cmd, event, plugin_root)[0]
 
 
+_RAW_LIST_TOOLS = {"ls", "dir", "get-childitem", "gci", "tree", "find", "fd", "fdfind"}
+_RAW_SEARCH_TOOLS = _SEARCH_TOOLS
+_DISCOVERY_CLOUD_PARTS = {value.casefold() for value in _CLOUD_SCOPE_PARTS}
+_DISCOVERY_HEAVY_PARTS = {value.casefold() for value in _REGENERABLE} | {
+    "vendor", "bower_components",
+}
+_DISCOVERY_RISK_FLAGS = {
+    "--no-ignore", "--no-ignore-vcs", "--hidden", "--follow",
+    "--dereference-recursive", "-follow", "-followsymlink", "-force",
+}
+
+
+def _active_project_root(event: ToolEvent) -> str:
+    cwd = os.path.realpath(event.cwd or os.getcwd())
+    if os.path.isfile(cwd):
+        cwd = os.path.dirname(cwd)
+    current = cwd
+    for _ in range(32):
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return cwd
+
+
+def _is_root_or_home(path: str) -> bool:
+    literal = str(path).strip().strip("'\"")
+    if literal in {"/", "\\", "~"} or re.fullmatch(r"[A-Za-z]:[\\/]*", literal):
+        return True
+    resolved = os.path.realpath(path)
+    anchor = os.path.realpath(os.path.abspath(os.path.splitdrive(resolved)[0] + os.sep))
+    home = os.path.realpath(os.path.expanduser("~"))
+    return os.path.normcase(resolved) in {
+        os.path.normcase(anchor), os.path.normcase(home),
+    }
+
+
+def _discovery_scope_assessment(scopes: list[str], event: ToolEvent,
+                                *, recursive: bool, strict: bool):
+    labels = [str(value) for value in scopes] or ["."]
+    if strict and recursive:
+        return False, "strict mode requires bounded Guardrails for recursive discovery", labels
+    cwd = os.path.realpath(event.cwd or os.getcwd())
+    project_root = _active_project_root(event)
+    for raw_value in scopes or ["."]:
+        scope = str(raw_value).strip("'\"") or "."
+        if any(marker in scope for marker in ("$", "%", "SUBST_OUT")):
+            return False, "the discovery scope is dynamic or ambiguous", labels
+        if _is_root_or_home(scope):
+            return False, "the scope is a filesystem or home-directory root", labels
+        static_scope = re.split(r"[\*\?\[]", scope, maxsplit=1)[0] or "."
+        if static_scope.endswith(("/", "\\")):
+            static_scope = static_scope[:-1] or "."
+        resolved = os.path.realpath(os.path.expanduser(
+            static_scope.replace("\\", os.sep) if os.path.isabs(static_scope)
+            else os.path.join(cwd, static_scope.replace("\\", os.sep))
+        ))
+        if not os.path.exists(resolved):
+            if not os.path.isabs(static_scope) and _within(resolved, project_root):
+                continue
+            return False, "the discovery scope could not be verified", labels
+        if os.path.isfile(resolved):
+            continue
+        if not os.path.isdir(resolved):
+            return False, "the discovery scope is not a normal file or directory", labels
+        parts = {value.casefold() for value in resolved.replace("\\", "/").split("/")}
+        if _is_root_or_home(resolved):
+            return False, "the scope is a filesystem or home-directory root", labels
+        if any(marker in part for part in parts for marker in _DISCOVERY_CLOUD_PARTS):
+            return False, "the scope is inside a cloud-synced tree", labels
+        if parts & _DISCOVERY_HEAVY_PARTS:
+            return False, "the scope is a dependency, build, or cache tree", labels
+        if recursive and not _within(resolved, project_root):
+            return False, "the recursive scope is outside the active project", labels
+    return True, "the scope is narrow and project-local", labels
+
+
+def _positionals(argv: list[str], value_options: set[str], *, slash_flags=False):
+    values = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        lowered = value.lower()
+        if lowered in value_options:
+            index += 2
+            continue
+        if any(lowered.startswith(option + "=") for option in value_options):
+            index += 1
+            continue
+        if value.startswith("-") or (slash_flags and re.fullmatch(r"/[A-Za-z]+", value)):
+            index += 1
+            continue
+        values.append(value)
+        index += 1
+    return values
+
+
+def _raw_discovery_shape(cmd: SimpleCommand, event: ToolEvent):
+    name = cmd.name
+    lowered = [value.lower() for value in cmd.argv[1:]]
+    if name in _RAW_SEARCH_TOOLS:
+        _pattern, recursive, filename_only, scopes = _search_shape(cmd, event)
+        file_listing = name in {"rg", "ripgrep"} and "--files" in lowered
+        return recursive, scopes, "list" if file_listing else "search"
+    if name in {"find"}:
+        scopes = []
+        for value in cmd.argv[1:]:
+            if value.startswith("-") or value in {"!", "("}:
+                break
+            scopes.append(value)
+        max_depth = _named_arg(cmd.argv, ("-maxdepth",))
+        recursive = not (max_depth and max_depth.isdigit() and int(max_depth) == 0)
+        return recursive, scopes or ["."], "list"
+    if name in {"fd", "fdfind"}:
+        operands = _positionals(
+            cmd.argv[1:],
+            {"--max-depth", "--min-depth", "--type", "-t", "--extension", "-e",
+             "--glob", "-g", "--exclude", "-e", "--search-path"},
+        )
+        scopes = operands[1:] if len(operands) > 1 else ["."]
+        max_depth = _named_arg(cmd.argv, ("--max-depth",))
+        recursive = not (max_depth and max_depth.isdigit() and int(max_depth) == 0)
+        return recursive, scopes, "list"
+    if name == "tree":
+        scopes = _positionals(cmd.argv[1:], set(), slash_flags=True)
+        return True, scopes or ["."], "list"
+    if name in {"get-childitem", "gci", "dir", "ls"}:
+        named = _named_arg(cmd.argv, ("-path", "-literalpath"))
+        operands = _positionals(
+            cmd.argv[1:],
+            {"-path", "-literalpath", "-filter", "-include", "-exclude", "-depth",
+             "--color", "--sort", "--time-style", "--block-size"},
+            slash_flags=name == "dir",
+        )
+        scopes = [named] if named else (operands or ["."])
+        recursive = any(value in {"-recurse", "--recursive", "/s"}
+                        for value in lowered)
+        if cmd.dialect == DIALECT_POWERSHELL:
+            recursive = recursive or "-r" in lowered
+        recursive = recursive or any(
+            value.startswith("-") and "R" in value[1:]
+            for value in cmd.argv[1:] if name == "ls"
+        )
+        depth = _named_arg(cmd.argv, ("-depth",))
+        recursive = recursive or bool(depth and depth.lstrip("+-").isdigit()
+                                      and int(depth) > 0)
+        return recursive, scopes, "list"
+    return None
+
+
+def _raw_discovery_risk_flag(cmd: SimpleCommand) -> bool:
+    lowered = [value.lower() for value in cmd.argv[1:]]
+    if any(value in _DISCOVERY_RISK_FLAGS for value in lowered):
+        return True
+    if cmd.name in {"rg", "ripgrep"} and any(
+            re.fullmatch(r"-u{1,3}", value) for value in lowered):
+        return True
+    if cmd.name == "find" and "-l" in lowered:
+        return True
+    return False
+
+
+def _eval_raw_discovery(cmd: SimpleCommand, event: ToolEvent, cfg: dict):
+    shape = _raw_discovery_shape(cmd, event)
+    if shape is None:
+        return None
+    recursive, scopes, replacement = shape
+    if replacement == "search" and not recursive:
+        return None
+    safe, trigger, _labels = _discovery_scope_assessment(
+        scopes, event, recursive=recursive,
+        strict=bool(cfg.get("strict_discovery")),
+    )
+    if recursive and not scopes and re.search(
+            r"(?:^|\s)(?:\$[A-Za-z_{]|%[A-Za-z_][A-Za-z0-9_]*%)",
+            event.command):
+        safe = False
+        trigger = "the recursive scope is supplied dynamically"
+    if recursive and _raw_discovery_risk_flag(cmd):
+        safe = False
+        trigger = "an option disables ignore, hidden-file, or link safeguards"
+    if safe:
+        return None
+    example = ("agw search <query> <folder>" if replacement == "search"
+               else "agw list <folder>")
+    return Decision(
+        DENY,
+        f"This raw discovery is not hard-bounded: {trigger}. Use `{example}` "
+        "with its default limits, `--deep`, or explicit bounds instead.",
+        "builtin:unbounded-discovery",
+        enforcement_class=NON_WAIVABLE_INVARIANT,
+    )
+
+
+def _eval_native_discovery(event: ToolEvent, cfg: dict):
+    tool = (event.tool or "").casefold()
+    if tool not in {"glob", "grep"}:
+        return None
+    data = event.extra.get("input") or {}
+    scope = data.get("path") or data.get("directory") or "."
+    pattern = str(data.get("pattern") or data.get("glob") or "")
+    resolved = os.path.realpath(os.path.expanduser(
+        scope if os.path.isabs(scope)
+        else os.path.join(event.cwd or os.getcwd(), scope)
+    ))
+    recursive = tool == "grep" and os.path.isdir(resolved)
+    recursive = recursive or (tool == "glob" and "**" in pattern)
+    safe, trigger, _labels = _discovery_scope_assessment(
+        [scope], event, recursive=recursive,
+        strict=bool(cfg.get("strict_discovery")),
+    )
+    if safe:
+        return None
+    example = "agw search <query> <folder>" if tool == "grep" \
+        else "agw list <folder> --name <glob>"
+    return Decision(
+        DENY,
+        f"This native discovery is not hard-bounded: {trigger}. Use `{example}` "
+        "with Guardrails limits instead.",
+        "builtin:unbounded-discovery",
+        enforcement_class=NON_WAIVABLE_INVARIANT,
+    )
+
+
 def _agw_file_read_target(args: list[str]) -> str:
     """Return the literal path from a trusted `agw file read` invocation."""
     try:
@@ -1101,6 +1331,39 @@ def _agw_file_read_target(args: list[str]) -> str:
             return value
         index += 1
     return ""
+
+
+def _agw_search_command(args: list[str], dialect: str) -> Optional[SimpleCommand]:
+    """Translate documented agw search arguments into the normal search classifier."""
+    try:
+        search_index = args.index("search")
+    except ValueError:
+        return None
+    value_options = {
+        "--max-seconds", "--max-files", "--max-entries", "--max-depth",
+        "--max-matches", "--max-file-bytes", "--profile", "--include",
+        "--exclude",
+    }
+    positionals = []
+    index = search_index + 1
+    while index < len(args):
+        value = args[index]
+        if value in value_options:
+            index += 2
+            continue
+        if any(value.startswith(option + "=") for option in value_options):
+            index += 1
+            continue
+        if value.startswith("-"):
+            index += 1
+            continue
+        positionals.append(value)
+        index += 1
+    if not positionals:
+        return None
+    query = positionals[0]
+    scope = positionals[1] if len(positionals) > 1 else "."
+    return SimpleCommand(["rg", query, scope], dialect=dialect)
 
 def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) -> Decision:
     if event.tool == "Monitor" and not event.command.strip():
@@ -1131,6 +1394,24 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                         "builtin:unparseable-no-effect")
 
     decisions = []
+
+    if re.match(
+            r"(?is)^\s*(?:rg|ripgrep|grep|egrep|fgrep|ag|ack|find|fd|fdfind|"
+            r"tree|get-childitem|gci|dir|ls|select-string)\b",
+            event.command) and (
+                (re.search(r"(?:\$[A-Za-z_{][A-Za-z0-9_{}]*|%[A-Za-z_][A-Za-z0-9_]*%)\s*$",
+                           event.command)
+                 and not re.search(r"(?i)\$null\s*$", event.command))
+                or re.search(r"(?i)-(?:path|literalpath)\s+\$[A-Za-z_{]", event.command)
+            ):
+        decisions.append(Decision(
+            DENY,
+            "This raw discovery uses a dynamic scope that cannot be hard-bounded. "
+            "Use `agw list <folder>` or `agw search <query> <folder>` with a "
+            "literal scope instead.",
+            "builtin:unbounded-discovery",
+            enforcement_class=NON_WAIVABLE_INVARIANT,
+        ))
 
     if FLAG_INNER_UNCERTAIN in parsed.flags and any(
             _has_mutation_evidence(payload) for payload in parsed.payloads):
@@ -1312,6 +1593,39 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 ), policy)
                 if read_decision.action != DEFER:
                     return read_decision
+        if verb == "search":
+            search_command = _agw_search_command(args, cmd.dialect)
+            if search_command is None:
+                return Decision(
+                    ASK, "No search query was supplied.",
+                    "builtin:agw-search-empty",
+                    enforcement_class=NON_WAIVABLE_INVARIANT,
+                    presentation_context=DecisionContext.AGW_UNKNOWN,
+                )
+            pattern, _recursive, _filename_only, _scopes = _search_shape(
+                search_command, event
+            )
+            if "--files" not in args and _HUNT_RE.search(pattern):
+                routine, trigger, scopes = _project_search_assessment(
+                    search_command, event, plugin_root,
+                )
+                if not routine:
+                    return Decision(
+                        ASK,
+                        "This bounded search looks for credential-related keywords. "
+                        "Confirm the scope because matching content would enter the "
+                        "conversation.",
+                        "builtin:credential-hunt",
+                        memo_key=f"credential-hunt:{pattern}",
+                        enforcement_class=NON_WAIVABLE_INVARIANT,
+                        presentation_context=DecisionContext.CREDENTIAL_SEARCH,
+                        presentation_details={
+                            "operation": "search", "targets": scopes,
+                            "target_kind": "search_scope",
+                            "signal": "credential-related terms",
+                            "trigger": trigger,
+                        },
+                    )
         if verb == "workflow":
             try:
                 verb_index = args.index("workflow")
@@ -1407,6 +1721,10 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                                 "builtin:interpreter-delete")
     if name == "trash" or name == "gio" and "trash" in cmd.argv:
         return Decision(ALLOW, "", "builtin:trash-ok")
+
+    discovery_decision = _eval_raw_discovery(cmd, event, cfg)
+    if discovery_decision is not None:
+        return discovery_decision
 
     # recursive keyword sweeps for credentials: ask, with the why
     if name in ("grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack",

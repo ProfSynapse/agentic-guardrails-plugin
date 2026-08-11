@@ -69,12 +69,12 @@ The company picks one "level" and the individual knobs follow from it. Safe by
 default: omit everything and you get `standard`. Set `AGW_LEVEL` in the managed
 `env` block (fleet-wide) or per machine; individual `AGW_*` knobs override it.
 
-| Level | Blocks destruction/exfil | rm of build dirs (node_modules, dist) | Credential reads | Ask-once memory |
-|---|---|---|---|---|
-| `strict` | yes | archived, never rm'd | ask every time | off |
-| `standard` (default) | yes | allowed (pointless to archive) | ask, remembered per session | on |
-| `relaxed` | yes | allowed | allowed, audited only | on |
-| `observe` | non-waivable invariants only | allowed | policy asks shadowed | on |
+| Level | Blocks destruction/exfil | rm of build dirs | Raw recursive discovery | Credential reads | Ask-once memory |
+|---|---|---|---|---|---|
+| `strict` | yes | archived, never rm'd | always redirect to bounded AGW | blocked | off |
+| `standard` (default) | yes | allowed | narrow project-local allowed; broad redirected | ask, remembered | on |
+| `relaxed` | yes | allowed | narrow project-local allowed; broad redirected | allowed, audited | on |
+| `observe` | non-waivable invariants only | allowed | broad forms still redirected | policy asks shadowed | on |
 
 `observe` is the trial mode: it shadows ordinary organization-policy asks and
 denies while leaving non-waivable safety invariants active. Any notices the host

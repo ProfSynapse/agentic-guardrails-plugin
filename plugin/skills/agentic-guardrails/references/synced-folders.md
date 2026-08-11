@@ -1,17 +1,17 @@
 # Synced and virtual folders
 
-OneDrive, SharePoint, Google Drive, and Dropbox trees may block during metadata
-calls, contain cloud-only placeholders, expose Google pointer stubs, or hold sync
-conflict artifacts.
+Cloud-sync trees may block on metadata, contain placeholders or Google pointer
+stubs, and hold sync conflicts.
 
-Use the bounded scan as the default first step for broad discovery or recursive
-listing. Narrow later content searches to the returned subtree; do not begin with
-an unbounded recursive shell, PowerShell, or interpreter traversal.
+Start broad discovery with bounded `agw scan`, then refine its subtree using
+`agw list` or `agw search`. `--deep` is explicit. Never begin with unbounded
+shell, PowerShell, interpreter, Glob, or Grep traversal. Standard permits narrow
+project-local raw discovery; strict routes every recursive form through AGW.
 
-The scan runs filesystem work in a killable worker and returns partial progress
-when a time, file, or depth bound is reached. Partial output is useful, not a CLI
-failure. A fast/no-size scan deliberately reports limited placeholder detection;
-an empty placeholder list does not prove that every file is hydrated.
+All three run in a killable worker and return useful partial progress at any time,
+file, entry, depth, match, or size bound. A no-size scan has limited placeholder
+detection; an empty list does not prove hydration. Content search skips sensitive
+files and checks placeholders before opening.
 
 Never edit a cloud-only placeholder. Ask the user to make it available offline,
 then scan again. Leave conflict copies, upload temporaries, and Office lock files

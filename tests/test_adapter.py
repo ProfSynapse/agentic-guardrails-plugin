@@ -613,6 +613,40 @@ def test_observe_mode_still_asks_for_nonwaivable_security_read(tmp_path):
     assert _decision(out) == "ask"
 
 
+def test_claude_native_grep_and_glob_use_discovery_guard(tmp_path):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    home = tmp_path / "home"
+
+    local = run_hook({
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "TODO", "path": str(project / "src")},
+        "cwd": str(project), "session_id": "native-local",
+        "hook_event_name": "PreToolUse",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "standard"})
+    assert _decision(local) != "deny"
+
+    broad = run_hook({
+        "tool_name": "Glob",
+        "tool_input": {"pattern": "**/*.py", "path": str(outside)},
+        "cwd": str(project), "session_id": "native-broad",
+        "hook_event_name": "PreToolUse",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "standard"})
+    assert _decision(broad) == "deny"
+    assert "agw list" in broad["hookSpecificOutput"]["permissionDecisionReason"]
+
+    strict = run_hook({
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "TODO", "path": str(project / "src")},
+        "cwd": str(project), "session_id": "native-strict",
+        "hook_event_name": "PreToolUse",
+    }, env_extra={"AGW_HOME": str(home), "AGW_LEVEL": "strict"})
+    assert _decision(strict) == "deny"
+
+
 def test_observe_mode_shadows_explicit_custom_policy_deny(tmp_path):
     home = tmp_path / "home"
     policies = home / "policies.d"

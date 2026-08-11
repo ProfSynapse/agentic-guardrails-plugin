@@ -1,9 +1,11 @@
 """Killable, progress-reporting worker for bounded filesystem scans."""
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import queue
+import re
 import stat
 import subprocess
 import sys
@@ -19,7 +21,36 @@ from core import profiles
 MAX_REPORTED_ENTRIES = 50
 MAX_EXTENSION_KEYS = 200
 MAX_STDERR_TAIL_CHARS = 2048
-IGNORED_DIRECTORIES = {"_workspace", ".git", "node_modules"}
+MAX_MATCH_PREVIEW_CHARS = 240
+BOUNDED_MAX_SECONDS = 3.0
+BOUNDED_MAX_FILES = 5_000
+BOUNDED_MAX_ENTRIES = 10_000
+BOUNDED_MAX_DEPTH = 4
+DEEP_MAX_SECONDS = 30.0
+DEEP_MAX_FILES = 100_000
+DEEP_MAX_ENTRIES = 200_000
+DEEP_MAX_DEPTH = 64
+DEFAULT_MAX_MATCHES = 100
+DEFAULT_MAX_RESULTS = 500
+DEFAULT_MAX_FILE_BYTES = 1024 * 1024
+HARD_MAX_SECONDS = 300.0
+HARD_MAX_FILES = 1_000_000
+HARD_MAX_ENTRIES = 2_000_000
+HARD_MAX_DEPTH = 256
+HARD_MAX_MATCHES = 10_000
+HARD_MAX_FILE_BYTES = 16 * 1024 * 1024
+IGNORED_DIRECTORIES = {
+    "_workspace", ".git", ".hg", ".svn", "node_modules",
+    "bower_components", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".cache", ".next",
+    ".nuxt", "dist", "build", "target", "vendor",
+}
+SENSITIVE_DIRECTORIES = {".ssh", ".aws", ".azure", ".kube", "gcloud"}
+SENSITIVE_NAMES = {
+    ".netrc", ".pgpass", ".git-credentials", "credentials", "credentials.json",
+    "service_account.json", "service-account.json", "secrets.json", "secrets.yaml",
+    "secrets.yml",
+}
 FATAL_EXIT_CODES = {
     "path_not_found": 10,
     "not_directory": 11,
@@ -29,6 +60,8 @@ EXIT_FATAL_CODES = {value: key for key, value in FATAL_EXIT_CODES.items()}
 
 
 def initial_result(request: dict) -> dict:
+    if request.get("operation") in {"search", "list"}:
+        return initial_search_result(request)
     no_size = bool(request["no_size"])
     return {
         "path": request["path"],
@@ -51,9 +84,54 @@ def initial_result(request: dict) -> dict:
         "bounds": {
             "max_seconds": request["max_seconds"],
             "max_files": request["max_files"],
+            "max_entries": request.get(
+                "max_entries", max(request["max_files"] * 2, 1)
+            ),
             "max_depth": request["max_depth"],
             "no_size": no_size,
         },
+        "ignored_directories": sorted(IGNORED_DIRECTORIES),
+        "errors": [],
+    }
+
+
+def initial_search_result(request: dict) -> dict:
+    return {
+        "operation": request.get("operation", "search"),
+        "path": request["path"],
+        "query": request["query"],
+        "regex": bool(request["regex"]),
+        "ignore_case": bool(request["ignore_case"]),
+        "filename_only": bool(request.get("filename_only")),
+        "include_globs": list(request.get("include_globs", [])),
+        "exclude_globs": list(request.get("exclude_globs", [])),
+        "kind": request.get("kind", "file"),
+        "matches": [],
+        "matches_found": 0,
+        "entries_tested": 0,
+        "files_inspected": 0,
+        "files_searched": 0,
+        "files_skipped_binary": 0,
+        "files_skipped_large": 0,
+        "files_skipped_placeholder": 0,
+        "files_skipped_sensitive": 0,
+        "files_skipped_link": 0,
+        "directories_inspected": 0,
+        "entries_seen": 0,
+        "profile": "unknown",
+        "profile_detection": "pending",
+        "complete": True,
+        "stop_reason": "",
+        "elapsed_seconds": 0.0,
+        "bounds": {
+            "max_seconds": request["max_seconds"],
+            "max_files": request["max_files"],
+            "max_entries": request["max_entries"],
+            "max_depth": request["max_depth"],
+            "max_matches": request["max_matches"],
+            "max_file_bytes": request["max_file_bytes"],
+        },
+        "ignored_directories": sorted(IGNORED_DIRECTORIES),
         "errors": [],
     }
 
@@ -144,6 +222,7 @@ def scan_in_process(
     publish()
 
     stack = [(path, 0)]
+    max_entries = request.get("max_entries", max(request["max_files"] * 2, 1))
     while stack:
         if _deadline_reached(request):
             result["complete"] = False
@@ -171,6 +250,11 @@ def scan_in_process(
                     result["stop_reason"] = "max_seconds"
                     publish("final")
                     return result, None
+                if result["entries_seen"] >= max_entries:
+                    result["complete"] = False
+                    result["stop_reason"] = "max_entries"
+                    publish("final")
+                    return result, None
                 publish()
                 _test_block(request, "scandir_next")
                 try:
@@ -193,7 +277,7 @@ def scan_in_process(
                     _record_error(result, os.path.relpath(entry.path, path), exc)
 
                 if is_dir:
-                    if entry.name in IGNORED_DIRECTORIES:
+                    if entry.name.casefold() in IGNORED_DIRECTORIES:
                         continue
                     result["dirs"] += 1
                     if depth >= request["max_depth"]:
@@ -251,6 +335,321 @@ def scan_in_process(
     return result, None
 
 
+def _path_matches_globs(relative: str, name: str, patterns: list[str]) -> bool:
+    relative = relative.replace("\\", "/")
+    candidates = (relative, name)
+    if os.name == "nt":
+        candidates = tuple(value.casefold() for value in candidates)
+        patterns = [value.replace("\\", "/").casefold() for value in patterns]
+    else:
+        patterns = [value.replace("\\", "/") for value in patterns]
+    return any(
+        fnmatch.fnmatchcase(candidate, pattern)
+        for pattern in patterns for candidate in candidates
+    )
+
+
+def _path_selected(relative: str, name: str, request: dict) -> bool:
+    excludes = request.get("exclude_globs", [])
+    if excludes and _path_matches_globs(relative, name, excludes):
+        return False
+    includes = request.get("include_globs", [])
+    return not includes or _path_matches_globs(relative, name, includes)
+
+
+def _is_sensitive_search_path(relative: str, name: str) -> bool:
+    lowered = name.casefold()
+    if lowered.startswith(".env") and not lowered.endswith(
+            (".example", ".sample", ".template", ".dist")):
+        return True
+    if lowered in SENSITIVE_NAMES or re.fullmatch(
+            r"id_(?:rsa|dsa|ecdsa|ed25519)|.*\.(?:pem|key|p12|pfx|jks|keystore|ppk)",
+            lowered):
+        return True
+    parts = {value.casefold() for value in relative.replace("\\", "/").split("/")}
+    return bool(parts & SENSITIVE_DIRECTORIES)
+
+
+def search_in_process(
+    request: dict,
+    emit: Optional[Callable[[str, dict], None]] = None,
+) -> tuple[dict, Optional[dict]]:
+    """Run one bounded content search. The caller must isolate it in a process."""
+    result = initial_search_result(request)
+    pending_matches = []
+
+    def publish(kind="progress", **extra):
+        result["elapsed_seconds"] = _elapsed(request)
+        if emit is None:
+            return
+        if kind == "final" or kind == "fatal":
+            emit(kind, {"result": result, **extra})
+            pending_matches.clear()
+            return
+        snapshot = {key: value for key, value in result.items() if key != "matches"}
+        payload = {"result": snapshot, "merge_result": True, **extra}
+        if pending_matches:
+            payload["append_matches"] = list(pending_matches)
+            pending_matches.clear()
+        emit(kind, payload)
+
+    path = request["path"]
+    publish()
+    _test_block(request, "path_validation")
+    try:
+        path_state = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        fatal = {"code": "path_not_found", "message": f"path not found: {path}"}
+        publish("fatal", fatal=fatal)
+        return result, fatal
+    except OSError as exc:
+        fatal = {
+            "code": "path_validation_error",
+            "message": f"search could not validate path: {type(exc).__name__}",
+        }
+        publish("fatal", fatal=fatal)
+        return result, fatal
+    if not stat.S_ISDIR(path_state.st_mode):
+        fatal = {
+            "code": "not_directory",
+            "message": f"search requires a directory, not a file: {path}",
+        }
+        publish("fatal", fatal=fatal)
+        return result, fatal
+
+    if request.get("glob_query"):
+        expression = fnmatch.translate(request["query"])
+    else:
+        expression = request["query"] if request["regex"] \
+            else re.escape(request["query"])
+    flags = re.IGNORECASE if request["ignore_case"] else 0
+    try:
+        matcher = re.compile(expression, flags)
+    except re.error as exc:
+        fatal = {
+            "code": "invalid_pattern",
+            "message": f"invalid search pattern: {exc}",
+        }
+        publish("fatal", fatal=fatal)
+        return result, fatal
+
+    def add_match(item: dict) -> bool:
+        result["matches"].append(item)
+        result["matches_found"] += 1
+        pending_matches.append(item)
+        publish()
+        if result["matches_found"] >= request["max_matches"]:
+            result["complete"] = False
+            result["stop_reason"] = "max_matches"
+            publish("final")
+            return True
+        return False
+
+    def filename_matches(relative: str) -> bool:
+        candidate = relative.replace("\\", "/")
+        return bool(matcher.search(candidate))
+
+    publish()
+    _test_block(request, "profile_detection")
+    override = request.get("profile_override", "auto")
+    try:
+        profile = profiles.detect(
+            path,
+            assume_directory=True,
+            override="" if override == "auto" else override,
+        )
+        result["profile"] = profile.name
+        result["profile_detection"] = "explicit" if override != "auto" else "complete"
+    except (OSError, ValueError) as exc:
+        profile = profiles.BUILTIN["unknown"]
+        result["profile_detection"] = "error"
+        _record_error(result, ".", exc)
+    publish()
+
+    stack = [(path, 0)]
+    while stack:
+        if _deadline_reached(request):
+            result["complete"] = False
+            result["stop_reason"] = "max_seconds"
+            publish("final")
+            return result, None
+
+        dirpath, depth = stack.pop()
+        result["directories_inspected"] += 1
+        publish()
+        _test_block(request, "scandir")
+        try:
+            iterator = os.scandir(dirpath)
+        except OSError as exc:
+            result["complete"] = False
+            result["stop_reason"] = result["stop_reason"] or "search_errors"
+            _record_error(result, os.path.relpath(dirpath, path), exc)
+            publish()
+            continue
+
+        try:
+            while True:
+                if _deadline_reached(request):
+                    result["complete"] = False
+                    result["stop_reason"] = "max_seconds"
+                    publish("final")
+                    return result, None
+                if result["entries_seen"] >= request["max_entries"]:
+                    result["complete"] = False
+                    result["stop_reason"] = "max_entries"
+                    publish("final")
+                    return result, None
+                publish()
+                _test_block(request, "scandir_next")
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    result["complete"] = False
+                    result["stop_reason"] = result["stop_reason"] or "search_errors"
+                    _record_error(result, os.path.relpath(dirpath, path), exc)
+                    break
+
+                result["entries_seen"] += 1
+                publish()
+                try:
+                    if entry.is_symlink():
+                        result["files_skipped_link"] += 1
+                        publish()
+                        continue
+                except OSError as exc:
+                    _record_error(result, os.path.relpath(entry.path, path), exc)
+                    publish()
+                    continue
+                _test_block(request, "is_dir")
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError as exc:
+                    is_dir = False
+                    _record_error(result, os.path.relpath(entry.path, path), exc)
+
+                if is_dir:
+                    relative = os.path.relpath(entry.path, path)
+                    if entry.name.casefold() in IGNORED_DIRECTORIES:
+                        continue
+                    if request.get("exclude_globs") and _path_matches_globs(
+                            relative, entry.name, request["exclude_globs"]):
+                        continue
+                    if request.get("filename_only") \
+                            and request.get("kind") in {"all", "directory"}:
+                        result["entries_tested"] += 1
+                        if _path_selected(relative, entry.name, request) \
+                                and filename_matches(relative):
+                            if add_match({"path": relative, "kind": "directory"}):
+                                return result, None
+                    if depth >= request["max_depth"]:
+                        result["complete"] = False
+                        result["stop_reason"] = result["stop_reason"] or "max_depth"
+                    else:
+                        stack.append((entry.path, depth + 1))
+                    publish()
+                    continue
+
+                if result["files_inspected"] >= request["max_files"]:
+                    result["complete"] = False
+                    result["stop_reason"] = "max_files"
+                    publish("final")
+                    return result, None
+                result["files_inspected"] += 1
+                relative = os.path.relpath(entry.path, path)
+                if not _path_selected(relative, entry.name, request):
+                    publish()
+                    continue
+
+                if request.get("filename_only"):
+                    if request.get("kind") in {"all", "file"}:
+                        result["entries_tested"] += 1
+                        if filename_matches(relative):
+                            if add_match({"path": relative, "kind": "file"}):
+                                return result, None
+                    publish()
+                    continue
+
+                if _is_sensitive_search_path(relative, entry.name):
+                    result["files_skipped_sensitive"] += 1
+                    publish()
+                    continue
+
+                publish()
+                _test_block(request, "stat")
+                try:
+                    file_state = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    _record_error(result, relative, exc)
+                    publish()
+                    continue
+                if file_state.st_size > request["max_file_bytes"]:
+                    result["files_skipped_large"] += 1
+                    publish()
+                    continue
+                if profiles.is_gdoc_stub(entry.path):
+                    result["files_skipped_placeholder"] += 1
+                    publish()
+                    continue
+                try:
+                    if profiles.is_placeholder(
+                        entry.path, st=file_state, profile=profile
+                    ):
+                        result["files_skipped_placeholder"] += 1
+                        publish()
+                        continue
+                except OSError as exc:
+                    _record_error(result, relative, exc)
+                    publish()
+                    continue
+
+                publish()
+                _test_block(request, "open")
+                try:
+                    with open(entry.path, "rb") as handle:
+                        _test_block(request, "read")
+                        payload = handle.read(request["max_file_bytes"] + 1)
+                except OSError as exc:
+                    _record_error(result, relative, exc)
+                    publish()
+                    continue
+                if len(payload) > request["max_file_bytes"]:
+                    result["files_skipped_large"] += 1
+                    publish()
+                    continue
+                if b"\x00" in payload[:8192]:
+                    result["files_skipped_binary"] += 1
+                    publish()
+                    continue
+
+                text = payload.decode("utf-8", errors="replace")
+                result["files_searched"] += 1
+                result["entries_tested"] += 1
+                for line_number, line in enumerate(text.splitlines(), 1):
+                    for match in matcher.finditer(line):
+                        preview = " ".join(line.strip().split())
+                        if len(preview) > MAX_MATCH_PREVIEW_CHARS:
+                            preview = preview[:MAX_MATCH_PREVIEW_CHARS - 1] + "…"
+                        item = {
+                            "path": relative,
+                            "line": line_number,
+                            "column": match.start() + 1,
+                            "preview": preview,
+                        }
+                        if add_match(item):
+                            return result, None
+                publish()
+        finally:
+            try:
+                iterator.close()
+            except OSError:
+                pass
+
+    publish("final")
+    return result, None
+
+
 def _worker_cli() -> int:
     request = None
     try:
@@ -277,7 +676,10 @@ def _worker_cli() -> int:
             )
             _write_json_line(message)
 
-        _result, fatal = scan_in_process(request, emit=emit)
+        if request.get("operation") in {"search", "list"}:
+            _result, fatal = search_in_process(request, emit=emit)
+        else:
+            _result, fatal = scan_in_process(request, emit=emit)
         return FATAL_EXIT_CODES.get(fatal["code"], 13) if fatal else 0
     except BaseException as exc:  # child must convert failures to structured output
         if request is None:
@@ -314,7 +716,15 @@ def _drain(messages: queue.Queue, latest: dict):
             message = messages.get_nowait()
         except queue.Empty:
             break
-        latest = message.get("result", latest)
+        incoming = message.get("result", latest)
+        if message.get("merge_result"):
+            existing_matches = list(latest.get("matches", []))
+            latest = {**latest, **incoming}
+            latest["matches"] = existing_matches + list(
+                message.get("append_matches", [])
+            )
+        else:
+            latest = incoming
         if message.get("kind") == "fatal":
             fatal = message.get("fatal")
             final = latest
@@ -323,21 +733,21 @@ def _drain(messages: queue.Queue, latest: dict):
     return latest, final, fatal
 
 
-def _fatal_from_exit(returncode: int, path: str) -> Optional[dict]:
+def _fatal_from_exit(returncode: int, path: str, operation: str) -> Optional[dict]:
     code = EXIT_FATAL_CODES.get(returncode)
     if code == "path_not_found":
         message = f"path not found: {path}"
     elif code == "not_directory":
-        message = f"scan requires a directory, not a file: {path}"
+        message = f"{operation} requires a directory, not a file: {path}"
     elif code == "path_validation_error":
-        message = "scan could not validate path"
+        message = f"{operation} could not validate path"
     else:
         return None
     return {"code": code, "message": message}
 
 
-def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
-    """Run a worker under a parent-owned wall-clock deadline."""
+def _run_bounded_worker(request: dict) -> tuple[dict, Optional[dict]]:
+    """Run a discovery worker under a parent-owned wall-clock deadline."""
     max_seconds = float(request["max_seconds"])
     deadline = request["started_at"] + max_seconds
     # Reserve bounded time for termination, pipe draining, and JSON creation.
@@ -475,7 +885,9 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
         timed_out = False
 
     if final is None and fatal is None and process is not None:
-        fatal = _fatal_from_exit(process.returncode, request["path"])
+        fatal = _fatal_from_exit(
+            process.returncode, request["path"], request.get("operation", "scan")
+        )
         if fatal is not None:
             latest["complete"] = False
             latest["stop_reason"] = fatal["code"]
@@ -527,6 +939,18 @@ def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
     final["worker_cleanup"] = "complete" if not worker_alive else "incomplete"
     final["_worker_pid"] = process.pid if process is not None else None
     return final, fatal
+
+
+def run_bounded_scan(request: dict) -> tuple[dict, Optional[dict]]:
+    return _run_bounded_worker({**request, "operation": "scan"})
+
+
+def run_bounded_search(request: dict) -> tuple[dict, Optional[dict]]:
+    return _run_bounded_worker({**request, "operation": "search"})
+
+
+def run_bounded_list(request: dict) -> tuple[dict, Optional[dict]]:
+    return _run_bounded_worker({**request, "operation": "list"})
 
 
 if __name__ == "__main__" and "--worker" in sys.argv:

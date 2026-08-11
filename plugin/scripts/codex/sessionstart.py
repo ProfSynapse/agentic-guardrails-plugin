@@ -39,9 +39,9 @@ every output. Exact mode scans no siblings; observed roots only detect sidecars.
 - Never delete: `archive` ordinary targets; `unlink-link` link objects; \
 `restore`/`undo` recover. Use targeted `office`, style-preserving \
 `checkout`/`publish`, or `publish-file` for staged output; no ad hoc Python/Node mutation.
-- Bound broad discovery. In OneDrive, SharePoint, Google Drive, or Dropbox, run a \
-hard-bounded `scan --fast`, then search only the relevant subtree. Fast scans have \
-limited placeholder detection; never edit cloud-only placeholders or Google stubs.
+- Bound broad discovery. Use plain `agw scan`, then `agw list`/`agw search` only \
+within the relevant subtree; `--deep` is explicit. Never use raw recursive discovery \
+on drive/home/cloud roots or edit cloud-only placeholders and Google stubs.
 - Treat a block or ask as constraint information. Retry only with a simpler, exact \
 operation. If the recovery store needs outside-workspace approval, request it once \
 for that exact operation. Never change ACLs, filesystem permissions, PATH, security \
