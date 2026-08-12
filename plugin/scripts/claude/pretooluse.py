@@ -34,7 +34,7 @@ PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 102
 def main():
     payload = json.load(sys.stdin)
     from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, retention_policy, store
+        preimages, presentation, remediation, retention_policy, store
     from core.decisions import GuardrailDecision
 
     evaluation_payload = payload
@@ -100,6 +100,10 @@ def main():
                         "trigger": "Static source analysis found ambiguous write evidence.",
                     },
                 ))
+                if decision.action == events.DENY \
+                        and decision.rule_id == "builtin:script-write-ambiguous":
+                    decision.safe_next = None
+                    decision.safe_next = remediation.for_events(decision, [event])
                 effective = enforcement.resolve(decision, observe)
             else:
                 invariant_failure = (
@@ -131,6 +135,8 @@ def main():
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
         )
+        decision.safe_next = None
+        decision.safe_next = remediation.for_events(decision, [event])
         effective = enforcement.resolve(decision, observe)
 
     def _audit(kind, data):
@@ -212,8 +218,10 @@ def main():
         if action == events.ASK:
             reason = prompt_request.action + "\n\n" + prompt_request.primary_text()
         elif action == events.DENY:
+            denial_decision = GuardrailDecision.from_legacy(decision)
+            denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
-                GuardrailDecision.from_legacy(decision), approval_outcome
+                denial_decision, approval_outcome
             )
         else:
             reason = decision.reason
@@ -229,7 +237,7 @@ def main():
     out = launcher.attach_rewrite(
         out, payload, rewritten_command, may_run=action != events.DENY
     )
-    if routed_workflow and out.get("hookSpecificOutput"):
+    if routed_workflow and action != events.DENY and out.get("hookSpecificOutput"):
         out["hookSpecificOutput"]["permissionDecisionReason"] = (
             f"Routed this exact script and argument set through trusted workflow "
             f"{routed_workflow}."

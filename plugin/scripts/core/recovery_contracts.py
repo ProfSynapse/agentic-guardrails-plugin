@@ -5,6 +5,8 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+from . import outcomes
+
 
 PRESENT = "PRESENT"
 ABSENT = "ABSENT"
@@ -66,9 +68,15 @@ def recovery_receipt_fields(
         "rollback_available": rollback_available,
         "recovery_record_kind": recovery_record_kind,
         "recovery_record_state": recovery_record_state,
+        "recovery_state": recovery_record_state,
         "transaction_id": transaction_id,
         "undo_argv": (
             ["agw", "undo", "--transaction", undo_transaction_id or transaction_id]
             if rollback_available else []
         ),
     }
+
+
+def outcome_fields(record: Mapping[str, Any]) -> dict:
+    """Project operation axes without conflating recovery with success."""
+    return outcomes.project_record(record)

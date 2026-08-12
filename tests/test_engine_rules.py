@@ -25,6 +25,9 @@ def test_rm_redirect_teaches_agw(evaluate):
     d = evaluate("rm -rf docs/")
     assert d.action == DENY
     assert "agw archive" in d.reason and "agw restore" in d.reason
+    assert d.safe_next.safe_to_retry is True
+    assert d.safe_next.recommended_argv[:2] == ("agw", "archive")
+    assert d.safe_next.source.command_parse == "parsed-literal"
 
 
 def test_windows_delete_verbs_denied(evaluate):

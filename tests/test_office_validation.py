@@ -159,6 +159,22 @@ def test_office_schema_rejects_missing_relationship_target(tmp_path):
     assert issue["resolved_target"] == "xl/worksheets/missing.xml"
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["/xl/worksheets/sheet1.xml", "./worksheets/../worksheets/sheet%31.xml"],
+)
+def test_office_schema_accepts_safe_noncanonical_relationship_target(tmp_path, target):
+    parts = _base_excel_parts()
+    parts["xl/_rels/workbook.xml.rels"] = _relationships(
+        ("rId1", f"{DOCUMENT_RELS}/worksheet", target),
+    )
+    package = _write_package(tmp_path / "noncanonical.xlsx", parts)
+
+    report = office_tx.validate_office_package(str(package), tier="office-schema")
+
+    assert report["valid"] is True
+
+
 def test_office_schema_rejects_duplicate_normalized_part_identity(tmp_path):
     parts = _base_excel_parts()
     parts["XL/WORKBOOK.XML"] = parts["xl/workbook.xml"]

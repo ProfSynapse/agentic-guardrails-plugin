@@ -47,7 +47,7 @@ _OPERATIONS.update({
     for name in {
         "init", "checkout", "convert", "archive", "move", "snapshot",
         "restore", "undo", "publish", "publish-file", "unlink-link",
-        "file", "run", "office", "workflow",
+        "file", "run", "run-plan", "publish-plan", "office", "workflow",
     }
 })
 _OPERATIONS["rename"] = _spec(
@@ -60,6 +60,21 @@ OPERATIONS = dict(sorted(_OPERATIONS.items()))
 
 def operation(name: str) -> OperationSpec | None:
     return OPERATIONS.get(str(name or "").casefold())
+
+
+def operation_effect(name: str, argv=()) -> OperationEffect | None:
+    """Resolve action-sensitive effects without exposing raw argument values."""
+    spec = operation(name)
+    if spec is None:
+        return None
+    tokens = tuple(str(value) for value in argv)
+    if spec.name == "publish-plan" and "recover" in tokens:
+        for index, token in enumerate(tokens[:-1]):
+            if token == "--action" and tokens[index + 1] == "inspect":
+                return OperationEffect.READ_ONLY
+        if "--action=inspect" in tokens:
+            return OperationEffect.READ_ONLY
+    return spec.effect
 
 
 def operation_names() -> frozenset[str]:
@@ -91,5 +106,5 @@ def display_unknown_verb(value: str) -> str:
 
 __all__ = [
     "OPERATIONS", "OperationEffect", "OperationSpec", "display_unknown_verb",
-    "operation", "operation_names", "registration_problem",
+    "operation", "operation_effect", "operation_names", "registration_problem",
 ]

@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from datetime import datetime
 
 from . import archive_transactions as archive_tx
+from . import outcomes
 from . import recovery_contracts
 from . import retention
 from . import retention_policy
@@ -479,14 +480,17 @@ def _append_jsonl_unique(path: str, record: dict) -> tuple[bool, list]:
 
 def oplog_append(op: dict):
     with Lock("oplog"):
-        return _append_jsonl_unique(os.path.join(agw_home(), "oplog.jsonl"), op)
+        return _append_jsonl_unique(
+            os.path.join(agw_home(), "oplog.jsonl"), outcomes.project_record(op)
+        )
 
 
 def oplog_read() -> list:
     path = os.path.join(agw_home(), "oplog.jsonl")
     if not os.path.exists(path):
         return []
-    return _read_jsonl_resilient(path)[0]
+    return [outcomes.project_record(record)
+            for record in _read_jsonl_resilient(path)[0]]
 
 
 def _folder_key(folder: str) -> str:
@@ -1075,25 +1079,34 @@ def undo_transaction(
                             "undo_recovery_transaction_id":
                                 member["undo_recovery_transaction_id"],
                         })
-                failure = {
+                failure = outcomes.completed_record({
                     "op": "transaction-undo-failed", "transaction_id": undo_id,
                     "undid_transaction_id": transaction_id,
                     "state": "NEEDS_ATTENTION", "operations": completed,
                     "error": str(exc), "rolled_back": not rollback_errors,
                     "rollback_errors": rollback_errors,
-                }
+                    "process_outcome": outcomes.ProcessOutcome.NOT_APPLICABLE.value,
+                    "publication_outcome":
+                        outcomes.PublicationOutcome.NOT_APPLICABLE.value,
+                }, operation_outcome=outcomes.CompositeOutcome.PROCESS_FAILED)
                 oplog_append(failure)
                 raise TransactionUndoError(
                     "transaction undo stopped; displaced states remain recoverable",
                     failure,
                 ) from exc
 
-        result = {
+        result = outcomes.completed_record({
             "op": "transaction-undo", "transaction_id": undo_id,
             "undid_transaction_id": transaction_id,
             "undid_op": operation.get("op"), "state": "COMMITTED",
             "operations": completed,
-        }
+            # These axes describe the verified undo operation itself. They do
+            # not infer anything about the mutation being reversed from its
+            # recovery state.
+            "process_outcome": outcomes.ProcessOutcome.NOT_APPLICABLE.value,
+            "contract_outcome": outcomes.ContractOutcome.SATISFIED.value,
+            "publication_outcome": outcomes.PublicationOutcome.NOT_APPLICABLE.value,
+        }, operation_outcome=outcomes.CompositeOutcome.SUCCESS)
         oplog_append(result)
         return result
 

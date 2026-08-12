@@ -33,6 +33,14 @@ def test_undo_file_mutation_by_snapshot_transaction_id(tmp_path):
 
     assert target.read_text() == "original"
     assert result["state"] == "COMMITTED"
+    assert result["recovery_state"] == "COMMITTED"
+    assert result["process_outcome"] == "not_applicable"
+    assert result["contract_outcome"] == "satisfied"
+    assert result["outcome"] == "success"
+    assert result["operation_outcome"] == result["outcome"]
+    assert result["publication_outcome"] == "not_applicable"
+    assert result["outcome_known"] is True
+    assert result["outcome_source"] == "live_evaluation"
     assert result["undid_op"] == "file-mutation"
     recovery_id = result["operations"][0]["undo_recovery_transaction_id"]
     recovery = archive_tx.load(store.agw_home(), recovery_id)

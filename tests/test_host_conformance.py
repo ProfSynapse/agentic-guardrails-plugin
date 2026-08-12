@@ -119,6 +119,12 @@ def test_sessionstart_uses_platform_native_launcher():
         assert "trusted PreToolUse hook" in module.CONTEXT
         assert "exact host-supplied `SKILL.md` location" in module.CONTEXT
         assert "never infer, shorten, search for, or expose" in module.CONTEXT
+        assert "run-plan create/apply" in module.CONTEXT
+        assert "single-use" in module.CONTEXT
+        assert "read-only filesystem" in module.CONTEXT
+        assert "per-file sequential visibility" in module.CONTEXT
+        assert "inspect or all-after finalize-observed" in module.CONTEXT
+        assert "Rollback awaits a crash-resumable journal" in module.CONTEXT
 
 
 def test_short_launcher_expansion_is_exact_and_boundary_aware():

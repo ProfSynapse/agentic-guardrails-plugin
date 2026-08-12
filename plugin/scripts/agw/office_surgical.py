@@ -4,12 +4,13 @@ from __future__ import annotations
 import hashlib
 import math
 import os
-import posixpath
 import re
 import tempfile
 import zipfile
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
+
+import office_opc
 
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -65,21 +66,23 @@ def worksheet_part(path: str, sheet_name: str) -> str:
             _part(package, "xl/_rels/workbook.xml.rels")
         )
         target = ""
+        target_mode = ""
         for relationship in relationships.findall(f"{{{PKG_REL_NS}}}Relationship"):
             if relationship.attrib.get("Id") == relationship_id:
-                if relationship.attrib.get("TargetMode", "").casefold() == "external":
-                    raise SurgicalCellError("worksheet relationship is external")
                 target = relationship.attrib.get("Target", "")
+                target_mode = relationship.attrib.get("TargetMode", "")
                 break
-        if not target or target.startswith(("/", "\\")) and not target.startswith("/xl/"):
-            raise SurgicalCellError("worksheet relationship target is invalid")
-        if target.startswith("/"):
-            resolved = target.lstrip("/")
-        else:
-            resolved = posixpath.normpath(posixpath.join("xl", target.replace("\\", "/")))
-        if resolved.startswith("../") or resolved not in package.namelist():
+        resolution = office_opc.resolve_relationship(
+            package.namelist(), "xl/_rels/workbook.xml.rels", relationship_id,
+            target, target_mode, owner_part="xl/workbook.xml",
+        )
+        if resolution.reason == "external_target_not_opened":
+            raise SurgicalCellError("worksheet relationship is external")
+        if resolution.reason in {"package_root_escape", "target_part_missing"}:
             raise SurgicalCellError("worksheet relationship escapes the workbook package")
-        return resolved
+        if not resolution.usable:
+            raise SurgicalCellError("worksheet relationship target is invalid")
+        return resolution.actual_part
 
 
 def _find_cell(payload: bytes, coordinate: str):

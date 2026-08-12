@@ -19,7 +19,7 @@ import re
 import shutil
 from typing import Optional
 
-from . import agw_contract, launcher, policy_health, powershell_bind, profiles as prof
+from . import agw_contract, launcher, policy_health, powershell_bind, profiles as prof, remediation
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     ToolEvent, worst
@@ -607,6 +607,7 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
     decision.policy_health = policy.health
     if decision.memo_key:
         decision.memo_key = f"policy:{policy.revision}:{decision.memo_key}"
+    decision.safe_next = remediation.for_event(decision, event)
     return decision
 
 
@@ -1570,7 +1571,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                     "target_kind": "unresolved",
                 },
             )
-        if operation_spec.effect == agw_contract.OperationEffect.HUMAN_APPROVAL:
+        operation_effect = agw_contract.operation_effect(verb, args)
+        if operation_effect == agw_contract.OperationEffect.HUMAN_APPROVAL:
             return Decision(
                 ASK, "Permanently pruning stored recovery copies needs confirmation.",
                 "builtin:agw-ask",

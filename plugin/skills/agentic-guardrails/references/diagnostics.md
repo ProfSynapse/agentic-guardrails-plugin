@@ -9,3 +9,9 @@ read, migrate, summarize, or count legacy `audit.jsonl` or quarantine records.
 Never reconstruct commands, paths, filenames, user identifiers, reasons, or
 exceptions from fingerprints or task output. If a requested metric is not
 available, say that Guardrails does not keep it.
+
+Run-plan results report independent `process_outcome`, `contract_outcome`,
+`precondition_outcome`, `policy_outcome`, and `environment_outcome` fields.
+Do not infer process success or contract satisfaction from `COMMITTED` recovery
+state. `outcome_source=live_evaluation` is current evidence; projected legacy
+records remain explicit about unknown or insufficient provenance.

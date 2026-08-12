@@ -124,6 +124,8 @@ so the agent self-corrects instead of fighting the rails:
 | `python -c` openpyxl one-liners | `agw office set-cell` / `replace-text` / `append-rows` |
 | several dependent text edits | `agw file plan` then `agw file apply-plan` |
 | one-off write-capable script | `agw run --output PATH --expected-hash HASH -- command` |
+| hash-bound single-use script execution | `agw run-plan create` then `agw run-plan apply` |
+| publish several staged artifacts | `agw publish-plan create` then `agw publish-plan apply` |
 | discover an existing script contract | `agw workflow match -- command` |
 | draft a contract without trusting or writing it | `agw workflow propose ... -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
@@ -207,7 +209,15 @@ multiple matches remain explicit. Ambiguous source-only write evidence reports
 the triggering line and primitive, requires one-run review in standard mode,
 stays blocked in strict mode, and is shadowed in observe mode.
 JSON matching includes stable per-candidate mismatch reasons. `agw workflow
-propose` returns an inert validated v2 proposal without writing or trusting it.
+match` also ranks verified candidates as `exact`, `parameterizable`, `near`, or
+`incompatible`. It emits `recommended_argv` only when a candidate is revalidated
+against the same command and output contract. `suggested_argv` is a deprecation
+object with `replacement:"recommended_argv"` and `value_included:false`; consumers
+must read that one authoritative array. The input command, normalized arguments,
+and nested diagnostics are omitted
+from the response so candidate values stay hashed and raw values are not multiplied. `agw
+workflow propose` returns an
+inert validated v2 proposal without writing or trusting it.
 Manifest v2 also binds the exact script arguments, so `agw run --workflow ID`
 can reconstruct the reviewed command without agents restating Unicode paths or
 flags. Use `agw workflow init` to generate v2, `validate` before trust, and
@@ -227,6 +237,29 @@ unknown file. See the
 `agw run --dry-run` is deliberately contract-only: it does not execute the
 command or predict its writes. JSON identifies this explicitly as
 `"validation_scope":"contract_only"`.
+
+For a stronger execution boundary, `agw run-plan create` writes a canonical,
+hash-bound plan through the same reversible file-write machinery as other
+Guardrails files. `agw run-plan apply` requires the plan's canonical SHA-256.
+Each plan is single-use and is consumed after its durable claim, including when
+the later process or contract check fails. `stdout-read-only` is refused before
+claim or execution unless the installed provider truly enforces a read-only
+filesystem; the default observed runner never claims that support. JSON reports
+process, contract, precondition, policy, and environment outcomes independently,
+plus whether the composite outcome came from live evaluation or conservative
+legacy projection.
+
+`agw publish-plan` publishes a bounded staged batch as a `recoverable-set` with
+`per-file-sequential` visibility: recovery is durable for the set, but readers
+may observe intermediate mixtures while individual atomic replacements occur.
+Create writes the inert plan recoverably and apply requires its canonical hash.
+`publish-plan recover TRANSACTION_ID --action inspect` authenticates and
+classifies an incomplete PREPARED publication without mutation.
+`finalize-observed` records COMMITTED only when every target is already in its
+exact after-state. PREPARED `rollback` currently returns
+`prepared_rollback_unavailable` without fallback or writes because safe rollback
+requires a future crash-resumable journal. Automatic roll-forward is unavailable;
+omitting `--action` also fails without mutation.
 
 Successful file mutations include an explicit recovery receipt and an exact
 `agw undo --transaction ID` command. Multi-file plans and declared runs share a

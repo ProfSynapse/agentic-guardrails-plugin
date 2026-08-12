@@ -77,6 +77,18 @@ class PublishBusy(FileOperationError):
     error_code = "publish_target_busy"
 
 
+class PublishParentBindingInvalid(FileOperationError):
+    error_code = "publish_parent_binding_invalid"
+
+
+class PreparedRollForwardUnavailable(FileOperationError):
+    error_code = "prepared_roll_forward_unavailable"
+
+
+class PreparedRollbackUnavailable(FileOperationError):
+    error_code = "prepared_rollback_unavailable"
+
+
 class UndeclaredOutput(FileOperationError):
     error_code = "undeclared_output"
 
@@ -1610,94 +1622,71 @@ def publish_staged_file(
     operation: str = "publish-file",
     retry_seconds: float = 5.0,
 ) -> dict:
-    """Validate a stage and atomically publish it with recovery coverage."""
-    target = resolve_target(target)
-    stage = os.path.abspath(os.path.expanduser(stage))
-    if not os.path.isfile(stage) or os.path.islink(stage):
-        raise FileOperationError("staged output is not an ordinary file")
-    after = store.file_sha256(stage)
-    wanted_stage = str(expected_stage_hash or "").strip().lower()
-    if wanted_stage:
-        if not _HASH_RE.fullmatch(wanted_stage):
-            raise FileOperationError("expected staged hash must be a SHA-256")
-        if wanted_stage != after:
-            raise PreimageHashConflict(
-                "CONFLICT: staged file hash does not match expected version",
-                {"path": stage, "expected": wanted_stage, "actual": after},
-            )
-    lock_name = "file-" + hashlib.sha256(
-        os.path.normcase(os.path.realpath(target)).encode("utf-8", "replace")
-    ).hexdigest()[:32]
-    with store.Lock(lock_name, timeout=10.0):
-        before = _check_expected(target, expected_hash)
-        if before == after:
-            return {
-                "path": target, "operation": operation, "changed": 0,
-                "before_hash": before, "after_hash": after,
-            }
-        if dry_run:
-            return {
-                "path": target, "operation": operation, "changed": 1,
-                "dry_run": True, "before_hash": before or "absent",
-                "after_hash": after,
-            }
-        candidate = stage
-        copied_candidate = False
-        if os.path.dirname(stage) != os.path.dirname(target):
-            fd, candidate = tempfile.mkstemp(
-                prefix=".agw-publish-", suffix=os.path.splitext(target)[1],
-                dir=os.path.dirname(target),
-            )
-            os.close(fd)
-            try:
-                shutil.copy2(stage, candidate)
-            except Exception:
-                try:
-                    os.unlink(candidate)
-                except OSError:
-                    pass
-                raise
-            copied_candidate = True
-            if store.file_sha256(candidate) != after:
-                try:
-                    os.unlink(candidate)
-                except OSError:
-                    pass
-                raise FileOperationError("same-directory staged copy failed verification")
+    """Publish one stage through the recoverable-set implementation."""
+    # Lazy import keeps the publication module free to reuse the established
+    # file operation errors and recovery helpers without a module-load cycle.
+    import publication
+
+    plan = publication.build_publish_plan([{
+        "stage": stage,
+        "target": target,
+        "expected_hash": expected_hash,
+        "expected_stage_hash": expected_stage_hash,
+        "validation": "raw",
+    }])
+    try:
+        batch = publication.publish_staged_batch(
+            plan,
+            expected_plan_hash=plan["plan_sha256"],
+            dry_run=dry_run,
+            retry_seconds=retry_seconds,
+        )
+    except FileTransactionError as exc:
+        # Preserve the established single-target busy error contract. The batch
+        # journal still records the handled rollback before this is re-raised.
+        if isinstance(exc.__cause__, PublishBusy):
+            raise exc.__cause__
+        raise
+    item = batch["operations"][0] if batch["operations"] else {
+        "path": resolve_target(target),
+        "before_hash": _current_hash(resolve_target(target)),
+        "after_hash": store.file_sha256(os.path.abspath(os.path.expanduser(stage))),
+        "changed": 0,
+    }
+    # Historical publish-file callers create a same-directory disposable stage
+    # and expect a successful publish to consume it. The batch primitive always
+    # preserves supplied stages; retain this lifecycle detail only at the
+    # compatibility boundary.
+    original_stage = os.path.abspath(os.path.expanduser(stage))
+    resolved_target = resolve_target(target)
+    if not dry_run and item.get("changed") \
+            and os.path.dirname(original_stage) == os.path.dirname(resolved_target) \
+            and os.path.exists(original_stage):
         try:
-            receipt = _snapshot(target, operation)
-            if _current_hash(target) != before:
-                raise PreimageHashConflict("CONFLICT: target changed before publication")
-        except Exception:
-            if copied_candidate and os.path.exists(candidate):
-                try:
-                    os.unlink(candidate)
-                except OSError:
-                    pass
-            raise
-        try:
-            attempts = replace_with_retry(candidate, target, retry_seconds)
-        except Exception:
-            # The caller's original stage is never consumed on a failed publish.
-            # Keep a same-directory stage as retry evidence; remove only our copy.
-            if copied_candidate and os.path.exists(candidate):
-                try:
-                    os.unlink(candidate)
-                except OSError:
-                    pass
-            raise
-        if store.file_sha256(target) != after:
-            raise FileOperationError("published file failed final hash verification")
-        store.oplog_append({
-            "op": "file-mutation", "operation": operation, "src": target,
-            "before_sha256": before or "absent", "after_sha256": after,
-            "snapshot_transaction_id": receipt.transaction_id,
-        })
-        return {
-            "path": target, "operation": operation, "changed": 1,
-            "before_hash": before or "absent", "after_hash": after,
-            "snapshot_transaction_id": receipt.transaction_id,
-            "snapshot_state": receipt.state,
-            "recovery": receipt.to_dict(),
-            "publish_attempts": attempts,
-        }
+            os.unlink(original_stage)
+        except OSError:
+            pass
+    result = {
+        "path": item["path"], "operation": operation,
+        "changed": int(item.get("changed", 0)),
+        "before_hash": item.get("before_hash") or "absent",
+        "after_hash": item["after_hash"],
+    }
+    if dry_run:
+        result["dry_run"] = True
+    for key in (
+        "snapshot_transaction_id", "snapshot_state", "recovery", "publish_attempts",
+    ):
+        if key in item:
+            result[key] = item[key]
+    if batch.get("transaction_id"):
+        result["transaction_id"] = batch["transaction_id"]
+    result["atomicity"] = batch["atomicity"]
+    result["visibility"] = batch["visibility"]
+    for key in (
+        "process_outcome", "publication_outcome", "operation_outcome", "outcome",
+        "outcome_known", "outcome_source",
+    ):
+        if key in batch:
+            result[key] = batch[key]
+    return result

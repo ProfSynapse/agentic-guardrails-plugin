@@ -25,6 +25,19 @@ def test_contract_has_only_reviewed_effects_and_help_routes():
     assert agw_contract.operation("rename").canonical_name == "move"
     assert agw_contract.operation("prune").effect == \
         agw_contract.OperationEffect.HUMAN_APPROVAL
+    assert agw_contract.operation("run-plan").effect == \
+        agw_contract.OperationEffect.RECOVERABLE_MUTATION
+    assert agw_contract.operation("publish-plan").effect == \
+        agw_contract.OperationEffect.RECOVERABLE_MUTATION
+    assert agw_contract.operation_effect(
+        "publish-plan", ["publish-plan", "recover", "tx", "--action", "inspect"]
+    ) == agw_contract.OperationEffect.READ_ONLY
+    assert agw_contract.operation_effect(
+        "publish-plan", ["publish-plan", "recover", "tx", "--action=inspect"]
+    ) == agw_contract.OperationEffect.READ_ONLY
+    assert agw_contract.operation_effect(
+        "publish-plan", ["publish-plan", "recover", "tx", "--action", "rollback"]
+    ) == agw_contract.OperationEffect.RECOVERABLE_MUTATION
     for name, spec in agw_contract.OPERATIONS.items():
         assert spec.name == name
         assert spec.help_route == f"agw {name} --help"

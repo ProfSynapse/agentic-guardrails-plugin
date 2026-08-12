@@ -1,34 +1,26 @@
 # Recovery
 
 Guardrails archives removals and captures pre-images before protected writes.
-Recovery operations are themselves reversible: if a live target exists, it is
-archived before an older version is restored.
+Recovery is reversible: an existing live target is archived before restoration.
+Use status/history for ambiguous versions and verify the recovered path. Never
+copy from the archive, edit its manifests, or delete artifacts manually.
+Automatic retention removes only expired `mutation_preimage` records.
 
-Use status/history to identify ambiguous versions. Undo applies only to the
-latest reversible move/archive. Confirm the recovered path.
+`unlink-link` records a junction/symlink and removes only that link object. It
+refuses ordinary files/directories; use `--expected-target` when known.
 
-Never copy directly from the archive or edit its manifests. If a version is
-absent, say so. Agents never delete artifacts manually. Automatic retention
-prunes only expired `mutation_preimage` records.
+Declare script outputs separately from observed roots. Exact outputs are hashed
+and snapshotted without enumerating siblings. Narrow observed roots detect
+undeclared sidecars after execution; they neither prevent writes nor recover
+unknown files.
 
-No SessionStart pruning: store-growing mutations check admission, and only
-high-water pressure triggers bounded inventory/pruning. Status and doctor are
-read-only; manual prune is optional.
+A run plan uses the recoverable file boundary and its canonical hash. Apply
+revalidates the plan and provider before a durable claim. After claim it is
+consumed even if execution or output validation fails. `stdout-read-only`
+requires true read-only filesystem enforcement; the observed runner lacks it.
 
-Use `unlink-link` for a Windows junction or symbolic link. It inspects the
-reparse point without following the target, records its type and target as a
-recoverable archive artifact, and removes only the link object. Ordinary files
-and directories are refused. Supply `--expected-target` when the intended link
-destination is known.
-
-For write-capable scripts, declare exact outputs separately from observed roots.
-Exact mode hashes and snapshots only those paths; it does not enumerate parents,
-so unrelated updates add no scan cost or false report. A state output may sit
-outside a separate cache root.
-
-Add an explicit, narrow `--output-root` only when strict sidecar enforcement is
-needed, and declare intentional relative sidecar patterns. Root manifests report
-unclaimed observed changes and fail the run when unexpected files are created,
-modified, or removed. This is post-execution detection, not recoverability or
-prevention. It cannot prove which process caused a change, so avoid observing
-broad or actively changing application/sync folders.
+A publish plan is a bounded staged/target set: recovery is set-wide, but changes
+have per-file sequential visibility. For PREPARED state, use `publish-plan recover
+ID --action inspect`. `finalize-observed` records COMMITTED only when every target
+already matches its after-hash. `rollback` is unavailable without a future
+crash-resumable journal and performs no fallback or writes. Roll-forward is unavailable.

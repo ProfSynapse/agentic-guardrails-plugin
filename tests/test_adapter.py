@@ -33,6 +33,7 @@ def test_bash_rm_denied():
     assert _decision(out) == "deny"
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "agw archive" in reason
+    assert "Recommended argv (submit as a new operation" in reason
     assert "Result: The requested action did not run" in reason
     assert "Safe next step:" in reason
     assert "User communication:" in reason
