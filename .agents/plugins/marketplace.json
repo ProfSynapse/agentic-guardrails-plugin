@@ -10,7 +10,7 @@
         "source": "git-subdir",
         "url": "https://github.com/ProfSynapse/agentic-guardrails-plugin.git",
         "path": "./plugin",
-        "ref": "main"
+        "ref": "v0.3.26"
       },
       "interface": {
         "displayName": "Agentic Guardrails"
