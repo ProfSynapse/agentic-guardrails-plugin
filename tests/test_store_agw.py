@@ -844,6 +844,15 @@ def test_cli_prune_refuses_without_human_flag(agw_home):
     assert "human" in result.stderr.lower() or "refusing" in result.stderr.lower()
 
 
+def test_cli_prune_runs_same_bounded_maintenance_policy(agw_home):
+    result = run_agw("prune", "--yes-i-am-a-human", "--json")
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["automatic"] is True
+    assert data["reclaimed_bytes"] == 0
+    assert data["policy"]["max_bytes"] == 4 * 1024 ** 3
+
+
 def test_cli_doctor_runs(agw_home):
     result = run_agw("doctor", "--json")
     data = json.loads(result.stdout)

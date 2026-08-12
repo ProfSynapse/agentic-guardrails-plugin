@@ -56,11 +56,13 @@ def test_unknown_office_operation_keeps_json_error_envelope():
     assert error["details"]["command"] == "agw office"
 
 
-def test_doctor_reports_positive_retention_budget_without_eviction(monkeypatch):
+def test_doctor_reports_typed_automatic_retention_state(monkeypatch):
     monkeypatch.setenv("AGW_ARCHIVE_MAX_BYTES", "1024")
     data = json.loads(_run("--json", "doctor").stdout)
-    assert data["archive_automatic_evictions"] == 0
+    assert data["archive_automatic_prune"] is True
     assert data["archive_required_free_bytes"] >= 0
+    assert data["retention"]["max_bytes"] == 1024
+    assert data["retention"]["schema"] == "agw.retention-state/v1"
 
 
 def test_apply_plan_accepts_named_plan_file(tmp_path):

@@ -230,9 +230,10 @@ command or predict its writes. JSON identifies this explicitly as
 
 Successful file mutations include an explicit recovery receipt and an exact
 `agw undo --transaction ID` command. Multi-file plans and declared runs share a
-parent transaction. Archive budgets are assessment-only; hooks do not
-automatically evict recovery artifacts. `agw checkout close PATH` preserves the
-working copy, and `agw checkout reopen TRANSACTION_ID` restores its tracking.
+parent transaction. Archive maintenance never prunes arbitrary recovery
+artifacts: at the high-water mark it may reclaim only expired records explicitly
+classified as mutation preimages. `agw checkout close PATH` preserves the working
+copy, and `agw checkout reopen TRANSACTION_ID` restores its tracking.
 
 Folder discovery is hard-bounded by a parent process. Plain
 `agw scan <folder> --json` now uses the safe profile by default: 3 seconds,
@@ -338,9 +339,19 @@ evolve.
   for every recursive discovery command.
   See [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md) for the
   full table.
-- **Disk budget:** `AGW_ARCHIVE_MAX_BYTES` caps the store (0 = unlimited);
-  oldest redundant pre-image copies are evicted first, never the sole copy of an
-  archived file.
+- **Recovery-cache budget:** the standard policy is 4 GiB, with automatic
+  maintenance at 90% and a target of 80%. `AGW_ARCHIVE_MAX_BYTES=0` explicitly
+  selects unlimited retention. Every mutation preimage is protected for seven
+  days; days 8–30 retain daily generations, and a path inactive for more than
+  30 days retains its newest usable point. Move/delete archives, manual
+  snapshots, evidence, corrupt records, and unclassified legacy records are
+  never automatic candidates.
+
+Retention does not run at SessionStart. Each operation that would grow the
+recovery store performs a cheap size/admission preflight; the bounded full
+inventory and pruning pass runs only after that operation reaches the
+high-water mark. `agw status` and `agw doctor` are read-only retention reports
+and never invoke maintenance; manual `agw prune` is optional.
 
 ### Activity history and recovery metadata
 

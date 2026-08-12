@@ -11,10 +11,10 @@ optional openpyxl and report exactly what to install when it is missing.
 from __future__ import annotations
 
 import os
-
 from core import store
 import office_ooxml
 import office_tx
+import retention_config
 
 
 class OfficeError(Exception):
@@ -64,8 +64,14 @@ def preservation_info(path: str) -> dict:
 
 
 def _snapshot(path: str, op: str) -> dict:
-    return store.archive_file(path, mode="copy", dedupe=True,
-                              reason=f"pre-image before agw office {op}")
+    policy = retention_config.load()
+    return store.archive_file(
+        path, mode="copy", dedupe=True,
+        reason=f"pre-image before agw office {op}",
+        retention_class="mutation_preimage",
+        protected_until_ns=retention_config.protected_until_ns(policy),
+        retention_config=policy,
+    )
 
 
 def find_matches(path: str, find: str) -> list:

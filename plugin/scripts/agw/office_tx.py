@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
 from core import profiles, store
+import retention_config
 
 MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_ZIP_ENTRIES = 4096
@@ -1511,6 +1512,26 @@ def _target_preflight(
     return path
 
 
+def _archive_mutation_preimage(path: str, operation: str,
+                               expected_sha256: str) -> dict:
+    resolved_retention = retention_config.load()
+    snapshot = store.archive_file(
+        path,
+        mode="copy",
+        dedupe=True,
+        reason=f"pre-image before agw office {operation}",
+        actor=f"agw office {operation}",
+        retention_class="mutation_preimage",
+        protected_until_ns=retention_config.protected_until_ns(
+            resolved_retention
+        ),
+        retention_config=resolved_retention,
+    )
+    if snapshot.get("sha256") != expected_sha256:
+        raise TransactionError("archived pre-image does not match the live source")
+    return snapshot
+
+
 def execute_mutation(
     path: str,
     *,
@@ -1588,15 +1609,7 @@ def execute_mutation(
             if store.file_sha256(path) != before:
                 raise TransactionConflict("CONFLICT: file changed while mutation was staged")
 
-            snapshot = store.archive_file(
-                path,
-                mode="copy",
-                dedupe=True,
-                reason=f"pre-image before agw office {operation}",
-                actor=f"agw office {operation}",
-            )
-            if snapshot.get("sha256") != before:
-                raise TransactionError("archived pre-image does not match the live source")
+            snapshot = _archive_mutation_preimage(path, operation, before)
 
             mutation_id = uuid.uuid4().hex
             receipt = {

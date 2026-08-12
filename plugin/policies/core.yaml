@@ -44,4 +44,10 @@ mcp_tools:
     reason: "Connector trash operations are blocked (CRUA: archive instead)."
 
 settings:
-  archive_max_warn_gb: 20
+  # Automatic pruning is restricted to eligible cache-like recovery copies.
+  # Restore-critical artifacts remain protected by the retention selector.
+  archive_max_bytes: 4294967296
+  archive_min_protected_age_days: 7
+  archive_inactive_collapse_age_days: 30
+  archive_max_candidates: 256
+  archive_max_reclaim_bytes: 1073741824

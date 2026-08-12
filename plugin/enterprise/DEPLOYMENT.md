@@ -100,10 +100,24 @@ the build-dir allowlist, `archive_max_bytes`).
 ### Archive disk budget
 
 The store grows as it keeps pre-image snapshots. `AGW_ARCHIVE_MAX_BYTES` (or
-`settings.archive_max_bytes`) caps it; `0`/unset means unlimited (the safe
-default). When over budget, only the **oldest redundant pre-image copies** are
-evicted — never a move-archive (the sole copy of an rm'd file) and never the
-newest version of anything. `agw doctor` reports current size and budget.
+`settings.archive_max_bytes`) has a 4 GiB standard default; `0` explicitly means
+unlimited. Store-growing operations start automatic maintenance at 90% and
+target 80%, with each pass bounded to 256 artifacts and 1 GiB. Only authoritative
+records explicitly classified as `mutation_preimage` can expire. All points from
+the last seven days are retained; days 8–30 retain daily generations; after a
+path has been inactive for 30 days its newest usable point remains protected.
+Move/delete archives, manual snapshots, evidence/quarantine, corrupt or
+incomplete records, and unclassified legacy records are never automatically
+pruned. If protected data prevents admission at the hard limit, the new mutation
+is blocked before publication. `agw status` and `agw doctor` report the typed
+retention state and thresholds.
+
+No retention work runs at SessionStart. A store-growing mutation or preimage
+capture first performs a cheap size/admission check. Only when that projected
+size reaches the high-water mark does Guardrails run the bounded full inventory
+and pruning pass. `agw status` and `agw doctor` are read-only retention reports
+and never invoke maintenance. `agw prune` is an optional manual request for the
+same bounded maintenance policy.
 
 ## 5. Requirements per machine
 

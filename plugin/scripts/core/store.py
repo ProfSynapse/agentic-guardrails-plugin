@@ -20,14 +20,19 @@ import shutil
 import tempfile
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 
 from . import archive_transactions as archive_tx
 from . import recovery_contracts
+from . import retention
+from . import retention_policy
 
 SCHEMA_VERSION = 1
 _WINDOWS_SHARING_WINERRORS = {32, 33}
 _WINDOWS_MISSING_LOCK_RETRIES = 3
+_MALFORMED_LOCK_STALE_SECONDS = 60.0
+_MALFORMED_LOCK_SETTLE_SECONDS = 0.01
 
 
 class TransactionUndoError(RuntimeError):
@@ -36,6 +41,16 @@ class TransactionUndoError(RuntimeError):
     def __init__(self, message: str, details: dict):
         super().__init__(message)
         self.details = details
+
+
+class ArchiveCapacityError(RuntimeError):
+    """A store-growing operation cannot preserve recovery guarantees."""
+
+    error_code = "archive_capacity_exceeded"
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = dict(details)
 
 
 def _ensure_directory(path: str, retry_seconds: float = 0.5) -> str:
@@ -60,6 +75,101 @@ def _lock_contention(exc: OSError, path: str) -> bool:
         return os.path.lexists(path)
     except OSError:
         return False
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Best-effort liveness check used only to recover abandoned locks."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            query = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            open_process.restype = ctypes.c_void_p
+            handle = open_process(query, False, pid)
+            if not handle:
+                # Access denied means a process exists but is not inspectable.
+                return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
+            try:
+                code = ctypes.c_ulong()
+                get_exit_code = kernel32.GetExitCodeProcess
+                get_exit_code.argtypes = [ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_ulong)]
+                get_exit_code.restype = ctypes.c_int
+                if not get_exit_code(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                close_handle = kernel32.CloseHandle
+                close_handle.argtypes = [ctypes.c_void_p]
+                close_handle.restype = ctypes.c_int
+                close_handle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _lock_owner(path: str) -> tuple[int, str]:
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(256).decode("ascii").strip()
+    except (OSError, UnicodeError):
+        return 0, ""
+    if ":" in raw:
+        pid_raw, token = raw.split(":", 1)
+    else:
+        # Preserve a PID from a write truncated before the separator/token. A
+        # live owner is stronger evidence than malformed content.
+        pid_raw, token = raw, ""
+    try:
+        return int(pid_raw), token
+    except ValueError:
+        return 0, ""
+
+
+def _lock_identity(path: str):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        return (
+            getattr(info, "st_dev", None), getattr(info, "st_ino", None),
+            getattr(info, "st_size", None), getattr(info, "st_mtime_ns", None),
+        )
+    except OSError:
+        return None
+
+
+def _stale_malformed_lock_identity(path: str):
+    """Return a stable stale malformed lock identity, otherwise ``None``.
+
+    Fresh empty/truncated files may be between exclusive creation and the owner
+    write, so they are never recovered. A stale truncated PID is also preserved
+    while that process is alive. Two bounded observations reduce the chance of
+    racing an owner that is still publishing its token.
+    """
+    first = _lock_identity(path)
+    if first is None:
+        return None
+    age = time.time() - int(first[3] or 0) / 1_000_000_000
+    if age <= _MALFORMED_LOCK_STALE_SECONDS:
+        return None
+    owner = _lock_owner(path)
+    if owner[1] or (owner[0] > 0 and _process_is_alive(owner[0])):
+        return None
+    time.sleep(_MALFORMED_LOCK_SETTLE_SECONDS)
+    if _lock_identity(path) != first or _lock_owner(path) != owner:
+        return None
+    return first
 
 
 def agw_home_path() -> str:
@@ -113,62 +223,188 @@ def file_sha256(path: str, limit: int = 0) -> str:
     return h.hexdigest()
 
 
+def _try_gate_lock(fd: int) -> bool:
+    """Try one non-blocking kernel lock on the first byte of a gate file."""
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} \
+                    or getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS:
+                return False
+            raise
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _release_gate_lock(fd: int):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _publish_lock_owner(path: str, pid: int, token: str):
+    """Atomically publish complete owner metadata while the gate is held."""
+    temp = path + "." + token + ".tmp"
+    try:
+        with open(temp, "xb") as handle:
+            handle.write(f"{pid}:{token}".encode("ascii"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Hard-link publication is both complete and exclusive: unlike replace,
+        # it cannot overwrite an owner created by a legacy process that does not
+        # yet participate in the kernel gate.
+        os.link(temp, path)
+    finally:
+        try:
+            if os.path.lexists(temp):
+                os.unlink(temp)
+        except OSError:
+            pass
+
+
 class Lock:
-    """Cross-platform best-effort lock via O_CREAT|O_EXCL lockfile."""
+    """Cross-platform kernel lock with a recoverable owner metadata file.
+
+    The persistent ``.gate`` file is never unlinked. Its OS advisory lock is
+    held for the complete critical section, so stale metadata cleanup cannot
+    race another entrant. ``.lock`` remains an auditable owner record and a
+    compatibility signal for older Guardrails processes.
+    """
 
     def __init__(self, name: str, timeout: float = 10.0):
         self.path = os.path.join(agw_home(), "locks", name + ".lock")
+        self.gate_path = os.path.join(agw_home(), "locks", name + ".gate")
         _ensure_directory(os.path.dirname(self.path))
         self.timeout = timeout
         self.fd = None
+        self.token = uuid.uuid4().hex
+        self.gate_locked = False
+
+    def _close_gate(self):
+        if self.gate_locked and self.fd is not None:
+            try:
+                _release_gate_lock(self.fd)
+            except OSError:
+                # Closing the descriptor below is the kernel-backed fallback
+                # release on both supported platforms.
+                pass
+            finally:
+                self.gate_locked = False
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
 
     def __enter__(self):
         deadline = time.monotonic() + self.timeout
         missing_lock_retries = _WINDOWS_MISSING_LOCK_RETRIES
         while True:
-            try:
-                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, str(os.getpid()).encode())
-                return self
-            except OSError as exc:
-                if not _lock_contention(exc, self.path):
-                    # Windows may report EACCES for O_EXCL contention, then the
-                    # winner can remove the lock before lexists() observes it.
-                    # Retry that narrow TOCTOU window a few times, but keep a
-                    # genuine directory/ACL denial fast and bounded.
-                    transient_access = (
-                        os.name == "nt"
-                        and exc.errno in {errno.EACCES, errno.EAGAIN}
-                        and missing_lock_retries > 0
-                    )
-                    if transient_access:
-                        missing_lock_retries -= 1
-                        time.sleep(0.01)
-                        continue
-                    raise
-                if time.monotonic() > deadline:
-                    # stale-lock recovery: locks older than 60s are abandoned
-                    try:
-                        if time.time() - os.path.getmtime(self.path) > 60:
-                            os.unlink(self.path)
+            if self.fd is None:
+                try:
+                    self.fd = os.open(self.gate_path, os.O_CREAT | os.O_RDWR)
+                    if os.fstat(self.fd).st_size == 0:
+                        os.write(self.fd, b"\0")
+                        os.fsync(self.fd)
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                except OSError as exc:
+                    if self.fd is not None:
+                        os.close(self.fd)
+                        self.fd = None
+                    if not _lock_contention(exc, self.gate_path):
+                        # Windows may report EACCES for a just-removed legacy
+                        # object. Retry only that narrow vanished-object race.
+                        transient_access = (
+                            os.name == "nt"
+                            and exc.errno in {errno.EACCES, errno.EAGAIN}
+                            and missing_lock_retries > 0
+                        )
+                        if transient_access:
+                            missing_lock_retries -= 1
+                            time.sleep(0.01)
                             continue
-                    except OSError:
-                        pass
-                    raise TimeoutError(f"could not acquire lock {self.path}") from exc
+                        raise
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"could not open lock gate {self.gate_path}"
+                        ) from exc
+                    time.sleep(0.05)
+                    continue
+
+            try:
+                acquired = _try_gate_lock(self.fd)
+            except Exception:
+                self._close_gate()
+                raise
+            if not acquired:
+                if time.monotonic() > deadline:
+                    self._close_gate()
+                    raise TimeoutError(f"could not acquire lock {self.path}")
                 time.sleep(0.05)
+                continue
+            self.gate_locked = True
+
+            try:
+                if not os.path.lexists(self.path):
+                    _publish_lock_owner(self.path, os.getpid(), self.token)
+                    return self
+                owner = _lock_owner(self.path)
+                if owner[1] and not _process_is_alive(owner[0]):
+                    os.unlink(self.path)
+                    _publish_lock_owner(self.path, os.getpid(), self.token)
+                    return self
+                malformed_identity = _stale_malformed_lock_identity(self.path)
+                if malformed_identity is not None \
+                        and _lock_identity(self.path) == malformed_identity \
+                        and not _lock_owner(self.path)[1]:
+                    os.unlink(self.path)
+                    _publish_lock_owner(self.path, os.getpid(), self.token)
+                    return self
+            except Exception:
+                self._close_gate()
+                raise
+
+            # A live legacy owner or a fresh initializer is visible. Release the
+            # gate while waiting so that its owner can finish normally.
+            _release_gate_lock(self.fd)
+            self.gate_locked = False
+            if time.monotonic() > deadline:
+                self._close_gate()
+                raise TimeoutError(f"could not acquire lock {self.path}")
+            time.sleep(0.05)
 
     def __exit__(self, *exc):
-        if self.fd is not None:
-            os.close(self.fd)
         try:
-            os.unlink(self.path)
+            if _lock_owner(self.path) == (os.getpid(), self.token):
+                os.unlink(self.path)
         except OSError:
             pass
+        finally:
+            self._close_gate()
 
 
 def _append_jsonl(path: str, record: dict):
     record.setdefault("schema_version", SCHEMA_VERSION)
     record.setdefault("ts", _ts())
+    # Archive projections already carry the authoritative transaction creation
+    # timestamp. Avoid introducing a second, newer activity time for them;
+    # successful restore/undo/mutation records without created_at_ns receive a
+    # durable nanosecond timestamp here.
+    if not record.get("created_at_ns"):
+        record.setdefault("timestamp_ns", time.time_ns())
     line = json.dumps(record, ensure_ascii=False)
     needs_boundary = False
     if os.path.exists(path) and os.path.getsize(path):
@@ -283,7 +519,12 @@ def _next_version(file_dir: str) -> int:
 
 
 def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "agent",
-                 dedupe: bool = False, _crash_after: str = None) -> dict:
+                 dedupe: bool = False, _crash_after: str = None,
+                 retention_class: str = "", protected_until_ns: int = 0,
+                 capture_group_id: str = "",
+                 retention_config: retention_policy.RetentionPolicy | None = None,
+                 lock_context=None,
+                 ) -> dict:
     """Archive one file or directory. mode='move' (delete-replacement) or
     'copy' (pre-image snapshot, leaves the original)."""
     src = os.path.abspath(src)
@@ -291,25 +532,52 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
         raise FileNotFoundError(src)
     link = archive_tx.link_metadata(src)
     digest = file_sha256(src) if link is None and os.path.isfile(src) else ""
+    try:
+        incoming_bytes = int(os.path.getsize(src)) if os.path.isfile(src) \
+            else int(archive_tx.artifact_fingerprint(src)[2])
+    except OSError:
+        incoming_bytes = 0
 
-    with Lock(_folder_key(os.path.dirname(src))):
-        # Directory publication shares parents with every archive from this
-        # source folder, so it belongs inside the same lock as versioning.
-        file_dir = _file_dir(src)
-        if dedupe and digest:
-            last = latest_version(src)
-            if last and last.get("sha256") == digest \
-                    and archive_tx.entry_is_verified(agw_home(), last, src):
-                return {**last, "deduped": True}
-        version = _next_version(file_dir)
-        name = os.path.basename(src)
-        dest = os.path.join(file_dir, f"v{version:03d}_{_ts()}_{name}")
-        entry = archive_tx.create_archive(
-            agw_home(), src, dest, mode, version, reason, actor,
-            crash_after=_crash_after,
+    context = lock_context or Lock("recovery-store", timeout=30.0)
+    with context:
+        maintain_retention(
+            policy=retention_config, incoming_bytes=incoming_bytes,
+            lock_context=nullcontext(),
         )
-    _materialize_committed_transaction(entry["transaction_id"], _crash_after)
-    return entry
+        with Lock(_folder_key(os.path.dirname(src))):
+            # Directory publication shares parents with every archive from this
+            # source folder, so it belongs inside the same lock as versioning.
+            file_dir = _file_dir(src)
+            if dedupe and digest:
+                last = latest_version(src)
+                if last and last.get("sha256") == digest \
+                        and archive_tx.entry_is_verified(agw_home(), last, src) \
+                        and (not retention_class
+                             or last.get("retention_class") == retention_class):
+                    if retention_class == "mutation_preimage":
+                        refreshed = archive_tx.update(
+                            agw_home(), last["transaction_id"],
+                            last_referenced_at_ns=time.time_ns(),
+                            protected_until_ns=max(
+                                int(last.get("protected_until_ns") or 0),
+                                int(protected_until_ns or 0),
+                            ),
+                        )
+                        return {**archive_tx.entry_from_record(refreshed),
+                                "deduped": True}
+                    return {**last, "deduped": True}
+            version = _next_version(file_dir)
+            name = os.path.basename(src)
+            dest = os.path.join(file_dir, f"v{version:03d}_{_ts()}_{name}")
+            entry = archive_tx.create_archive(
+                agw_home(), src, dest, mode, version, reason, actor,
+                crash_after=_crash_after,
+                retention_class=retention_class,
+                protected_until_ns=protected_until_ns,
+                capture_group_id=capture_group_id,
+            )
+        _materialize_committed_transaction(entry["transaction_id"], _crash_after)
+        return entry
 
 
 def latest_version(src: str):
@@ -320,19 +588,42 @@ def latest_version(src: str):
 def list_versions(src: str) -> list:
     file_dir = _file_dir(src)
     manifest = os.path.join(file_dir, "manifest.jsonl")
-    out = []
+    compatibility = []
     if os.path.exists(manifest):
-        out.extend(_read_jsonl_resilient(manifest)[0])
+        compatibility.extend(_read_jsonl_resilient(manifest)[0])
     # A committed transaction remains authoritative and discoverable even if a
     # crash happened before the compatibility JSONL index was appended.
+    authoritative_available = {}
     for item in archive_tx.discover(agw_home()):
         record = item.get("record")
-        if not record or record.get("kind") != "archive" \
-                or record.get("state") != archive_tx.COMMITTED:
+        if not record or record.get("kind") != "archive":
             continue
+        transaction_id = str(record.get("transaction_id") or "")
         if archive_tx.canonical_path(record.get("src", "")) \
-                == archive_tx.canonical_path(src):
-            out.append(archive_tx.entry_from_record(record))
+                != archive_tx.canonical_path(src):
+            continue
+        if record.get("state") != archive_tx.COMMITTED \
+                or record.get("artifact_state", "PRESENT") != "PRESENT":
+            continue
+        entry = archive_tx.entry_from_record(record)
+        if archive_tx.entry_is_verified(agw_home(), entry, src):
+            authoritative_available[transaction_id] = entry
+
+    # Compatibility entries with authoritative transaction ids are only
+    # projections. Never let a stale JSONL row resurrect a PURGED, missing, or
+    # otherwise unavailable authoritative artifact. Transactionless legacy
+    # rows remain visible for explicit verification/refusal by restore().
+    out = []
+    for entry in compatibility:
+        transaction_id = str(entry.get("transaction_id") or "")
+        if transaction_id:
+            if transaction_id in authoritative_available:
+                out.append(authoritative_available[transaction_id])
+            continue
+        destination = str(entry.get("dest") or "")
+        if destination and os.path.lexists(destination):
+            out.append(entry)
+    out.extend(authoritative_available.values())
     unique = {}
     for entry in out:
         key = entry.get("transaction_id") or entry.get("dest")
@@ -623,6 +914,27 @@ def _verified_snapshot(member: dict) -> dict:
     return record
 
 
+def _refresh_selected_snapshot(record: dict, target: str) -> dict:
+    """Hold a selected artifact across nested capacity maintenance."""
+    if record.get("kind") != "archive":
+        return record
+    now_ns = time.time_ns()
+    refreshed = archive_tx.update(
+        agw_home(), record["transaction_id"],
+        last_referenced_at_ns=max(
+            int(record.get("last_referenced_at_ns") or 0), now_ns,
+        ),
+        protected_until_ns=max(
+            int(record.get("protected_until_ns") or 0),
+            now_ns + retention.PLAN_TTL_NS,
+        ),
+    )
+    if not archive_tx.entry_is_verified(
+            agw_home(), archive_tx.entry_from_record(refreshed), target):
+        raise ValueError(f"selected recovery artifact failed verification: {target}")
+    return refreshed
+
+
 def _absent_identity(path: str) -> tuple:
     parent = os.path.dirname(path)
     while parent and not os.path.isdir(parent):
@@ -639,12 +951,16 @@ def _absent_identity(path: str) -> tuple:
     )
 
 
-def _capture_undo_prestate(path: str, undo_id: str) -> dict:
+def _capture_undo_prestate(
+        path: str, undo_id: str, *,
+        retention_config: retention_policy.RetentionPolicy | None = None,
+        lock_context=None) -> dict:
     """Capture the state being displaced by undo and return its transaction."""
     if os.path.lexists(path):
         entry = archive_file(
             path, mode="move", reason=f"pre-image before transaction undo {undo_id}",
-            actor="guardrails-recovery",
+            actor="guardrails-recovery", retention_class="safety_archive",
+            retention_config=retention_config, lock_context=lock_context,
         )
         return {
             "kind": "archive", "transaction_id": entry["transaction_id"],
@@ -670,7 +986,10 @@ def _restore_snapshot(member: dict, snapshot: dict):
     )
 
 
-def _rollback_undo_member(member: dict, undo_id: str):
+def _rollback_undo_member(
+        member: dict, undo_id: str, *,
+        retention_config: retention_policy.RetentionPolicy | None = None,
+        lock_context=None):
     """Restore the after-state captured immediately before an undo member."""
     target = member["path"]
     recovery_id = member["undo_recovery_transaction_id"]
@@ -678,7 +997,8 @@ def _rollback_undo_member(member: dict, undo_id: str):
     if os.path.lexists(target):
         archive_file(
             target, mode="move", reason=f"failed transaction undo {undo_id}",
-            actor="guardrails-recovery",
+            actor="guardrails-recovery", retention_class="safety_archive",
+            retention_config=retention_config, lock_context=lock_context,
         )
     if recovery.get("kind") == "archive":
         entry = archive_tx.entry_from_record(recovery)
@@ -697,7 +1017,9 @@ def _rollback_undo_member(member: dict, undo_id: str):
         raise OSError(f"undo rollback expected absence: {target}")
 
 
-def undo_transaction(transaction_id: str) -> dict:
+def undo_transaction(
+        transaction_id: str,
+        retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
     """Reverse one logged file mutation after strict hash and artifact checks.
 
     The current state displaced by the reversal is itself archived in a
@@ -705,85 +1027,111 @@ def undo_transaction(transaction_id: str) -> dict:
     """
     if not transaction_id:
         raise ValueError("transaction id is required")
-    operation = _mutation_record(transaction_id)
-    members = _undo_members(operation)
-    prior_undos = {
-        item.get("undid_transaction_id") for item in oplog_read()
-        if item.get("op") == "transaction-undo" and item.get("state") == "COMMITTED"
-    }
-    if transaction_id in prior_undos:
-        raise ValueError(f"transaction was already undone: {transaction_id}")
+    with Lock("recovery-store", timeout=30.0):
+        operation = _mutation_record(transaction_id)
+        members = _undo_members(operation)
+        prior_undos = {
+            item.get("undid_transaction_id") for item in oplog_read()
+            if item.get("op") == "transaction-undo"
+            and item.get("state") == "COMMITTED"
+        }
+        if transaction_id in prior_undos:
+            raise ValueError(f"transaction was already undone: {transaction_id}")
 
-    snapshots = []
-    for member in members:
-        _verify_current_after(member)
-        snapshots.append(_verified_snapshot(member))
+        snapshots = []
+        for member in members:
+            _verify_current_after(member)
+            snapshot = _verified_snapshot(member)
+            snapshots.append(_refresh_selected_snapshot(snapshot, member["path"]))
 
-    undo_id = uuid.uuid4().hex
-    completed = []
-    with Lock("transaction-undo"):
-        try:
-            for member, snapshot in zip(members, snapshots):
-                _verify_current_after(member)
-                displaced = _capture_undo_prestate(member["path"], undo_id)
-                result = {**member, "undo_recovery_transaction_id":
-                          displaced["transaction_id"]}
-                completed.append(result)
-                _restore_snapshot(member, snapshot)
-                _verify_restored_before(member, snapshot)
-        except Exception as exc:
-            rollback_errors = []
-            for member in reversed(completed):
-                try:
-                    _rollback_undo_member(member, undo_id)
-                except Exception as rollback_exc:
-                    rollback_errors.append({
-                        "path": member["path"], "error": str(rollback_exc),
-                        "undo_recovery_transaction_id":
-                            member["undo_recovery_transaction_id"],
-                    })
-            failure = {
-                "op": "transaction-undo-failed", "transaction_id": undo_id,
-                "undid_transaction_id": transaction_id,
-                "state": "NEEDS_ATTENTION", "operations": completed,
-                "error": str(exc), "rolled_back": not rollback_errors,
-                "rollback_errors": rollback_errors,
-            }
-            oplog_append(failure)
-            raise TransactionUndoError(
-                "transaction undo stopped; displaced states remain recoverable",
-                failure,
-            ) from exc
+        undo_id = uuid.uuid4().hex
+        completed = []
+        with Lock("transaction-undo"):
+            try:
+                for member, snapshot in zip(members, snapshots):
+                    _verify_current_after(member)
+                    displaced = _capture_undo_prestate(
+                        member["path"], undo_id,
+                        retention_config=retention_config,
+                        lock_context=nullcontext(),
+                    )
+                    result = {**member, "undo_recovery_transaction_id":
+                              displaced["transaction_id"]}
+                    completed.append(result)
+                    _restore_snapshot(member, snapshot)
+                    _verify_restored_before(member, snapshot)
+            except Exception as exc:
+                rollback_errors = []
+                for member in reversed(completed):
+                    try:
+                        _rollback_undo_member(
+                            member, undo_id,
+                            retention_config=retention_config,
+                            lock_context=nullcontext(),
+                        )
+                    except Exception as rollback_exc:
+                        rollback_errors.append({
+                            "path": member["path"], "error": str(rollback_exc),
+                            "undo_recovery_transaction_id":
+                                member["undo_recovery_transaction_id"],
+                        })
+                failure = {
+                    "op": "transaction-undo-failed", "transaction_id": undo_id,
+                    "undid_transaction_id": transaction_id,
+                    "state": "NEEDS_ATTENTION", "operations": completed,
+                    "error": str(exc), "rolled_back": not rollback_errors,
+                    "rollback_errors": rollback_errors,
+                }
+                oplog_append(failure)
+                raise TransactionUndoError(
+                    "transaction undo stopped; displaced states remain recoverable",
+                    failure,
+                ) from exc
 
-    result = {
-        "op": "transaction-undo", "transaction_id": undo_id,
-        "undid_transaction_id": transaction_id,
-        "undid_op": operation.get("op"), "state": "COMMITTED",
-        "operations": completed,
-    }
-    oplog_append(result)
-    return result
+        result = {
+            "op": "transaction-undo", "transaction_id": undo_id,
+            "undid_transaction_id": transaction_id,
+            "undid_op": operation.get("op"), "state": "COMMITTED",
+            "operations": completed,
+        }
+        oplog_append(result)
+        return result
 
 
-def restore(src: str, version: int = 0, overwrite: bool = False) -> dict:
+def restore(src: str, version: int = 0, overwrite: bool = False,
+            retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
     """Restore an archived version of `src` to its original location."""
-    entries = list_versions(src)
-    if not entries:
-        raise FileNotFoundError(f"no archived versions of {src}")
-    entry = entries[-1] if not version else next(
-        (e for e in entries if e.get("version") == version), None)
-    if entry is None:
-        raise FileNotFoundError(f"no version {version} of {src}")
-    if not archive_tx.entry_is_verified(agw_home(), entry, src):
-        raise ValueError("restore refused: the selected archive artifact is not verified")
-    if os.path.lexists(src):
-        # Moving the live target into its own verified transaction eliminates
-        # the former copy-then-unlink crash window.
-        archive_file(src, mode="move", reason="pre-restore safety archive", actor="agw")
-    archive_tx.publish_restore(agw_home(), entry, src)
-    op = {"op": "restore", "src": src, "from": entry["dest"], "version": entry["version"]}
-    oplog_append(op)
-    return op
+    with Lock("recovery-store", timeout=30.0):
+        entries = list_versions(src)
+        if not entries:
+            raise FileNotFoundError(f"no archived versions of {src}")
+        entry = entries[-1] if not version else next(
+            (e for e in entries if e.get("version") == version), None)
+        if entry is None:
+            raise FileNotFoundError(f"no version {version} of {src}")
+        if entry.get("transaction_id"):
+            record = archive_tx.load(agw_home(), entry["transaction_id"])
+            record = _refresh_selected_snapshot(record, src)
+            entry = archive_tx.entry_from_record(record)
+        if not archive_tx.entry_is_verified(agw_home(), entry, src):
+            raise ValueError(
+                "restore refused: the selected archive artifact is not verified"
+            )
+        if os.path.lexists(src):
+            # Moving the live target into its own verified transaction eliminates
+            # the former copy-then-unlink crash window.
+            archive_file(
+                src, mode="move", reason="pre-restore safety archive", actor="agw",
+                retention_class="safety_archive",
+                retention_config=retention_config, lock_context=nullcontext(),
+            )
+        archive_tx.publish_restore(agw_home(), entry, src)
+        op = {
+            "op": "restore", "src": src, "from": entry["dest"],
+            "version": entry["version"],
+        }
+        oplog_append(op)
+        return op
 
 
 def undo_last() -> dict:
@@ -854,6 +1202,224 @@ def archive_size_bytes() -> int:
             except OSError:
                 pass
     return total
+
+
+def resolved_retention_policy(settings=None) -> retention_policy.RetentionPolicy:
+    """Resolve one retention contract for CLI, hooks, and store operations."""
+    return retention_policy.resolve_retention_policy(settings or {})
+
+
+def retention_state(settings=None) -> dict:
+    """Return the typed, non-mutating state of the recovery cache."""
+    policy = resolved_retention_policy(settings)
+    return retention_policy.classify_retention_state(
+        policy, archive_size_bytes()
+    ).as_dict()
+
+
+_MAX_RETENTION_JOURNALS = 10_000
+
+
+def _retention_identifier_valid(value: str) -> bool:
+    return len(value) == 32 and all(char in "0123456789abcdef" for char in value)
+
+
+def _recover_retention_journals_locked() -> dict:
+    """Recover every discoverable interrupted retention apply before planning.
+
+    The caller holds the global recovery-store lock. Unknown, corrupt, or
+    unbounded journal/staging state aborts maintenance rather than allowing a
+    new plan to reason from incomplete evidence.
+    """
+    home = agw_home()
+    journal_root = os.path.join(home, "retention", "transactions")
+    staging_root = os.path.join(home, "retention", "staging")
+    result = {"discovered": 0, "recovered": 0, "already_complete": 0,
+              "plan_ids": []}
+    journals = {}
+    if os.path.lexists(journal_root):
+        if os.path.islink(journal_root) or not os.path.isdir(journal_root):
+            raise retention.InventoryIncompleteError(
+                "retention journal root is not a local directory"
+            )
+        try:
+            with os.scandir(journal_root) as entries:
+                items = sorted(entries, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise retention.InventoryIncompleteError(
+                f"retention journals could not be discovered: {exc}"
+            ) from exc
+        if len(items) > _MAX_RETENTION_JOURNALS:
+            raise retention.InventoryIncompleteError(
+                "retention journal discovery limit exceeded"
+            )
+        for entry in items:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False) \
+                    or not entry.name.endswith(".json"):
+                raise retention.InventoryIncompleteError(
+                    "retention journal directory contains an unknown entry"
+                )
+            plan_id = entry.name[:-5]
+            if not _retention_identifier_valid(plan_id):
+                raise retention.InventoryIncompleteError(
+                    "retention journal has an invalid identity"
+                )
+            try:
+                journal = retention.load_journal(home, plan_id)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise retention.InventoryIncompleteError(
+                    f"retention journal {plan_id} is unreadable"
+                ) from exc
+            if journal.get("plan_id") != plan_id:
+                raise retention.InventoryIncompleteError(
+                    f"retention journal {plan_id} has mismatched identity"
+                )
+            state = journal.get("state")
+            if state not in {retention.PREPARED, retention.STAGED,
+                             retention.PURGED}:
+                raise retention.InventoryIncompleteError(
+                    f"retention journal {plan_id} has unknown state"
+                )
+            journals[plan_id] = journal
+            result["discovered"] += 1
+
+    for plan_id, journal in journals.items():
+        state = journal["state"]
+        if state == retention.PURGED or (
+                state == retention.PREPARED
+                and journal.get("recovery_action") == "rolled_back_staging"):
+            result["already_complete"] += 1
+            continue
+        try:
+            recovered = retention.recover_journal(
+                home, plan_id, lock_context=nullcontext()
+            )
+        except Exception as exc:
+            raise retention.InventoryIncompleteError(
+                f"retention journal {plan_id} could not be recovered"
+            ) from exc
+        if recovered.get("state") == retention.STAGED \
+                or (recovered.get("state") == retention.PREPARED
+                    and recovered.get("recovery_action")
+                    != "rolled_back_staging"):
+            raise retention.InventoryIncompleteError(
+                f"retention journal {plan_id} remains incomplete"
+            )
+        result["recovered"] += 1
+        result["plan_ids"].append(plan_id)
+
+    if os.path.lexists(staging_root):
+        if os.path.islink(staging_root) or not os.path.isdir(staging_root):
+            raise retention.InventoryIncompleteError(
+                "retention staging root is not a local directory"
+            )
+        try:
+            with os.scandir(staging_root) as entries:
+                staged = sorted(entries, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise retention.InventoryIncompleteError(
+                f"retention staging could not be verified: {exc}"
+            ) from exc
+        if len(staged) > _MAX_RETENTION_JOURNALS:
+            raise retention.InventoryIncompleteError(
+                "retention staging discovery limit exceeded"
+            )
+        for entry in staged:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False) \
+                    or not _retention_identifier_valid(entry.name) \
+                    or entry.name not in journals:
+                raise retention.InventoryIncompleteError(
+                    "retention staging contains unjournaled state"
+                )
+            try:
+                with os.scandir(entry.path) as children:
+                    if next(children, None) is not None:
+                        raise retention.InventoryIncompleteError(
+                            f"retention staging {entry.name} remains nonempty"
+                        )
+            except OSError as exc:
+                raise retention.InventoryIncompleteError(
+                    f"retention staging {entry.name} is unreadable"
+                ) from exc
+    return result
+
+
+def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None,
+                       incoming_bytes: int = 0, lock_context=None) -> dict:
+    """Automatically reclaim only expired, classified cache preimages.
+
+    The caller may provide an already-held global-store lock via
+    ``lock_context``.  Unknown, manual, move, evidence, corrupt, and recent
+    records are never candidates.  If those protections leave insufficient
+    room, the new store-growing operation is refused before publication.
+    """
+    context = lock_context or Lock("recovery-store", timeout=30.0)
+    with context:
+        return _maintain_retention_locked(
+            policy=policy, incoming_bytes=incoming_bytes
+        )
+
+
+def _maintain_retention_locked(*,
+        policy: retention_policy.RetentionPolicy | None = None,
+        incoming_bytes: int = 0) -> dict:
+    """Implementation requiring the recovery-store mutation lock."""
+    policy = policy or resolved_retention_policy()
+    incoming = max(0, int(incoming_bytes or 0))
+    journal_recovery = _recover_retention_journals_locked()
+    before = archive_size_bytes()
+    projected = before + incoming
+    state = retention_policy.classify_retention_state(policy, projected)
+    migration = {"migrated": 0, "transaction_ids": [],
+                 "protected_days": policy.min_protected_age_days}
+    if state.prune_recommended:
+        migration = retention.migrate_legacy_cache_records(
+            agw_home(), protected_days=policy.min_protected_age_days
+        )
+    result = {
+        "automatic": True,
+        "before_bytes": before,
+        "incoming_bytes": incoming,
+        "projected_bytes": projected,
+        "policy": policy.as_dict(),
+        "state": state.as_dict(),
+        "journal_recovery": journal_recovery,
+        "legacy_migration": migration,
+        "applied": False,
+        "reclaimed_bytes": 0,
+    }
+    if state.prune_recommended and before:
+        plan = retention.build_plan(
+            agw_home(), policy=policy, current_bytes=projected,
+        )
+        result["plan"] = plan
+        if plan.get("applicable") and plan.get("candidates"):
+            applied = retention.apply_plan(
+                agw_home(), plan, expected_plan_hash=plan["plan_sha256"],
+                policy=policy, lock_context=nullcontext(),
+            )
+            result["applied"] = True
+            result["apply"] = applied
+            result["reclaimed_bytes"] = int(applied.get("reclaimed_bytes") or 0)
+
+    after = archive_size_bytes()
+    final_projected = after + incoming
+    result["after_bytes"] = after
+    result["final_projected_bytes"] = final_projected
+    if not policy.unlimited and final_projected > policy.max_bytes:
+        raise ArchiveCapacityError(
+            "The recovery cache cannot safely make room for this operation.",
+            {
+                **result,
+                "maximum_bytes": policy.max_bytes,
+                "required_free_bytes": final_projected - policy.max_bytes,
+                "protected_or_unavailable_bytes": max(
+                    0, final_projected - policy.low_water_bytes
+                    - int(result.get("reclaimed_bytes") or 0),
+                ),
+            },
+        )
+    return result
 
 
 # --- session approval memory --------------------------------------------------
