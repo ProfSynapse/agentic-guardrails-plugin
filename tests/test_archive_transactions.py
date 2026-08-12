@@ -242,6 +242,49 @@ def test_compatibility_entry_binds_source_version_creation_and_fingerprint(tmp_p
         assert not archive_tx.entry_is_verified(store.agw_home(), tampered, str(source)), field
 
 
+def test_archive_entry_binds_explicit_retention_metadata(tmp_path):
+    source = tmp_path / "retained.txt"
+    source.write_text("retained")
+    entry = store.archive_file(
+        str(source), mode="copy", retention_class="mutation_preimage",
+        protected_until_ns=123456789, capture_group_id="capture-1",
+    )
+    assert entry["retention_class"] == "mutation_preimage"
+    assert entry["protected_until_ns"] == 123456789
+    assert entry["capture_group_id"] == "capture-1"
+    assert entry["artifact_state"] == "PRESENT"
+    assert archive_tx.entry_is_verified(store.agw_home(), entry, str(source))
+
+    tampered = dict(entry)
+    tampered["retention_class"] = "manual_snapshot"
+    assert not archive_tx.entry_is_verified(store.agw_home(), tampered, str(source))
+
+
+def test_dedupe_refreshes_only_matching_mutation_preimage(tmp_path, monkeypatch):
+    source = tmp_path / "deduped.txt"
+    source.write_text("same")
+    first = store.archive_file(
+        str(source), mode="copy", dedupe=True,
+        retention_class="mutation_preimage", protected_until_ns=100,
+    )
+    monkeypatch.setattr(store.time, "time_ns", lambda: 777)
+    second = store.archive_file(
+        str(source), mode="copy", dedupe=True,
+        retention_class="mutation_preimage", protected_until_ns=200,
+    )
+    assert second["deduped"] is True
+    assert second["transaction_id"] == first["transaction_id"]
+    refreshed = archive_tx.load(store.agw_home(), first["transaction_id"])
+    assert refreshed["last_referenced_at_ns"] == 777
+    assert refreshed["protected_until_ns"] == 200
+
+    manual = store.archive_file(
+        str(source), mode="copy", dedupe=True,
+        retention_class="manual_snapshot",
+    )
+    assert manual["transaction_id"] != first["transaction_id"]
+
+
 def test_entry_pointing_to_different_valid_transaction_is_rejected(tmp_path):
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"

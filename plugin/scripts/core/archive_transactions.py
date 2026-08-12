@@ -315,7 +315,10 @@ def _crash(crash_after: str | None, point: str):
 def create_archive(home: str, src: str, dest: str, mode: str, version: int,
                    reason: str = "", actor: str = "agent",
                    crash_after: str | None = None,
-                   policy_revision: str = "") -> dict:
+                   policy_revision: str = "",
+                   retention_class: str = "",
+                   protected_until_ns: int = 0,
+                   capture_group_id: str = "") -> dict:
     """Create and commit one archive transaction.
 
     The source is never removed until a published artifact has been verified
@@ -355,6 +358,10 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
         "reason": reason,
         "actor": actor,
         "policy_revision": policy_revision,
+        "retention_class": str(retention_class or ""),
+        "protected_until_ns": max(0, int(protected_until_ns or 0)),
+        "capture_group_id": str(capture_group_id or ""),
+        "artifact_state": "PRESENT",
         "excluded_paths": excluded_paths,
     }
     _persist(home, record)
@@ -444,6 +451,10 @@ def entry_from_record(record: dict) -> dict:
         "reason": record.get("reason", ""),
         "actor": record.get("actor", "agent"),
         "policy_revision": record.get("policy_revision", ""),
+        "retention_class": record.get("retention_class", ""),
+        "protected_until_ns": int(record.get("protected_until_ns") or 0),
+        "capture_group_id": record.get("capture_group_id", ""),
+        "artifact_state": record.get("artifact_state", "PRESENT"),
         "transaction_id": record.get("transaction_id"),
         "created_at_ns": record.get("created_at_ns"),
         "source_identity": record.get("source_identity"),
@@ -477,7 +488,8 @@ def entry_is_verified(home: str, entry: dict, requested_src: str = None) -> bool
             return False
         bound_fields = (
             "transaction_id", "created_at_ns", "version", "mode", "artifact_kind",
-            "policy_revision", "sha256", "size",
+            "policy_revision", "retention_class", "protected_until_ns",
+            "capture_group_id", "artifact_state", "sha256", "size",
         )
         if any(entry.get(field) != record.get(field) for field in bound_fields):
             return False

@@ -5,9 +5,12 @@ from dataclasses import dataclass, field
 import os
 import shutil
 import stat
+import time
+import uuid
 
 from . import archive_transactions as archive_tx
 from . import recovery_contracts
+from . import retention_policy
 from . import store
 
 
@@ -96,15 +99,35 @@ def _plain_failure(path: str, detail: str) -> PreimageResult:
     )
 
 
-def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0,
-            policy_revision: str = "") -> PreimageResult:
+def prepare(targets, label: str, max_file_bytes: int,
+            max_archive_bytes: int | None = None,
+            policy_revision: str = "",
+            retention_config: retention_policy.RetentionPolicy | None = None
+            ) -> PreimageResult:
     """Capture and immediately verify PRESENT artifacts and ABSENT tombstones."""
     if not policy_revision:
         return PreimageResult(
             False,
             reason="Safety preauthorization failed because the policy revision was unavailable.",
         )
+    try:
+        retention_config = retention_config or retention_policy.resolve_retention_policy(
+            ({"archive_max_bytes": max_archive_bytes}
+             if max_archive_bytes is not None else {})
+        )
+    except retention_policy.RetentionPolicyError as exc:
+        return PreimageResult(
+            False,
+            reason=("Safety preauthorization failed because the recovery-cache "
+                    f"policy is invalid ({exc})."),
+        )
+    max_archive_bytes = retention_config.max_bytes
     receipts = []
+    capture_group_id = uuid.uuid4().hex
+    protected_until_ns = (
+        time.time_ns()
+        + retention_config.min_protected_age_days * 24 * 60 * 60 * 1_000_000_000
+    )
     required_bytes = 0
     present = []
 
@@ -147,9 +170,10 @@ def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0
             return _plain_failure(path, f"The file could not be read safely ({exc}).")
 
     try:
-        if max_archive_bytes > 0 and store.archive_size_bytes() + required_bytes > max_archive_bytes:
-            target = present[0][0] if present else (targets[0] if targets else "")
-            return _plain_failure(target, "The recovery store does not have enough configured capacity.")
+        store.maintain_retention(
+            policy=retention_config, incoming_bytes=required_bytes,
+            lock_context=store.Lock("recovery-store", timeout=30.0),
+        )
         if required_bytes:
             capacity_root = _nearest_existing_parent(
                 os.path.join(store.agw_home(), "archive", "probe")
@@ -158,6 +182,13 @@ def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0
                 return _plain_failure(
                     present[0][0], "The recovery store does not have enough free disk space."
                 )
+    except store.ArchiveCapacityError:
+        target = present[0][0] if present else (targets[0] if targets else "")
+        return _plain_failure(
+            target,
+            "The recovery store does not have enough configured capacity; "
+            "its protected rollback points cannot be pruned safely.",
+        )
     except OSError as exc:
         target = present[0][0] if present else (targets[0] if targets else "")
         return _plain_failure(target, f"Recovery-store capacity could not be verified ({exc}).")
@@ -168,6 +199,10 @@ def prepare(targets, label: str, max_file_bytes: int, max_archive_bytes: int = 0
             entry = store.archive_file(
                 path, mode="copy", dedupe=False,
                 reason=f"verified pre-image before {label}", actor="guardrails-hook",
+                retention_class="mutation_preimage",
+                protected_until_ns=protected_until_ns,
+                capture_group_id=capture_group_id,
+                retention_config=retention_config,
             )
             artifact = str(entry.get("dest") or "")
             transaction_id = str(entry.get("transaction_id") or "")

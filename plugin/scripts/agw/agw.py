@@ -37,12 +37,14 @@ from core import profiles as prof          # noqa: E402
 from core import store                      # noqa: E402
 from core import archive_transactions as archive_tx  # noqa: E402
 from core import launcher                   # noqa: E402
+from core import retention_policy           # noqa: E402
 from core import workflows                  # noqa: E402
 import converters                           # noqa: E402
 import cli_schema                           # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
+import retention_config                    # noqa: E402
 import scan_worker                          # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
@@ -730,12 +732,19 @@ def cmd_archive(args):
     paths = [_resolve(path) for path in args.paths]
     _require_archive_store()
     results = []
-    for p in paths:
-        entry = store.archive_file(p, mode="move", reason=args.reason or "agw archive",
-                                   actor="agw")
-        results.append(entry)
-        if not getattr(args, "json", False):
-            print(f"archived {p} -> {entry['dest']}")
+    try:
+        resolved_retention = retention_config.load(PLUGIN_ROOT)
+        for p in paths:
+            entry = store.archive_file(
+                p, mode="move", reason=args.reason or "agw archive", actor="agw",
+                retention_class="safety_archive",
+                retention_config=resolved_retention,
+            )
+            results.append(entry)
+            if not getattr(args, "json", False):
+                print(f"archived {p} -> {entry['dest']}")
+    except Exception as exc:
+        _file_err(args, exc, default_code=4)
     if getattr(args, "json", False):
         print(json.dumps(results, ensure_ascii=False, default=str,
                          separators=(",", ":")))
@@ -775,10 +784,15 @@ def cmd_unlink_link(args):
         data = {"path": path, "dry_run": True, "changed": 1, **metadata}
     else:
         _require_archive_store()
-        entry = store.archive_file(
-            path, mode="move", reason=args.reason or "agw unlink-link",
-            actor="agw unlink-link",
-        )
+        try:
+            resolved_retention = retention_config.load(PLUGIN_ROOT)
+            entry = store.archive_file(
+                path, mode="move", reason=args.reason or "agw unlink-link",
+                actor="agw unlink-link", retention_class="safety_archive",
+                retention_config=resolved_retention,
+            )
+        except Exception as exc:
+            _file_err(args, exc, default_code=4)
         data = {"path": path, "changed": 1, **metadata, "archive": entry}
     _out(
         args,
@@ -1213,21 +1227,38 @@ def cmd_snapshot(args):
         _err(f"folder is {total / 1e9:.1f} GB (> {SNAPSHOT_MAX_BYTES / 1e9:.0f} GB "
              "preflight limit). Re-run with --force if you really want this.", code=3)
     _require_archive_store()
-    entry = store.archive_file(folder, mode="copy", reason=args.reason or "agw snapshot",
-                               actor="agw")
+    try:
+        resolved_retention = retention_config.load(PLUGIN_ROOT)
+        entry = store.archive_file(
+            folder, mode="copy", reason=args.reason or "agw snapshot", actor="agw",
+            retention_class="manual_snapshot",
+            retention_config=resolved_retention,
+        )
+    except Exception as exc:
+        _file_err(args, exc, default_code=4)
     _out(args, f"snapshot of {folder} -> {entry['dest']} ({total / 1e6:.1f} MB)", entry)
 
 
 def cmd_restore(args):
     target = os.path.abspath(os.path.expanduser(args.path))
-    op = store.restore(target, version=args.version or 0)
+    try:
+        resolved_retention = retention_config.load(PLUGIN_ROOT)
+        op = store.restore(
+            target, version=args.version or 0,
+            retention_config=resolved_retention,
+        )
+    except Exception as exc:
+        _file_err(args, exc, default_code=4)
     _out(args, f"restored {target} from v{op['version']}", op)
 
 
 def cmd_undo(args):
     try:
         if getattr(args, "transaction", ""):
-            op = store.undo_transaction(args.transaction)
+            resolved_retention = retention_config.load(PLUGIN_ROOT)
+            op = store.undo_transaction(
+                args.transaction, retention_config=resolved_retention
+            )
             human = (
                 f"undid transaction {op['undid_transaction_id']}; "
                 f"restored {len(op['operations'])} target(s)"
@@ -1235,14 +1266,24 @@ def cmd_undo(args):
         else:
             op = store.undo_last()
             human = f"undid {op['undone']}: {op['restored']} is back"
-    except (LookupError, ValueError, store.TransactionUndoError) as exc:
-        _file_err(args, exc)
+    except Exception as exc:
+        _file_err(args, exc, default_code=4)
     _out(args, human, op)
 
 
 def cmd_status(args):
+    from core import engine
     state = store.state_load()
-    size = store.archive_size_bytes()
+    try:
+        resolved_retention = retention_policy.resolve_retention_policy(
+            engine.load_policy(PLUGIN_ROOT).settings
+        )
+        size = store.archive_size_bytes()
+        retention_state = retention_policy.classify_retention_state(
+            resolved_retention, size
+        ).as_dict()
+    except (retention_policy.RetentionPolicyError, OSError) as exc:
+        _file_err(args, exc, default_code=4)
     all_checkouts = state.get("checkouts", {})
     cwd_filter = os.path.realpath(os.path.abspath(os.path.expanduser(args.cwd))) \
         if getattr(args, "cwd", "") else ""
@@ -1277,6 +1318,9 @@ def cmd_status(args):
         entry["stale_reasons"] = reasons
         checkouts[src] = entry
     lines = [f"archive store: {store.agw_home()} ({size / 1e6:.1f} MB)",
+             ("retention: " + retention_state["classification"]
+              + f" (high {retention_state['high_water_bytes'] / 1e9:.2f} GB, "
+              + f"max {retention_state['max_bytes'] / 1e9:.2f} GB)"),
              f"open checkouts: {len(checkouts)}"
              + (f" (filtered from {len(all_checkouts)})" if cwd_filter else "")]
     for src, entry in list(checkouts.items())[:20]:
@@ -1291,7 +1335,8 @@ def cmd_status(args):
             f"{item.get('operation', '')}"
         )
     _out(args, "\n".join(lines),
-         {"archive_bytes": size, "checkouts": checkouts,
+         {"archive_bytes": size, "retention": retention_state,
+          "checkouts": checkouts,
           "checkout_count_total": len(all_checkouts),
           "checkout_filter_cwd": cwd_filter,
           "stale_days": stale_days,
@@ -1312,15 +1357,18 @@ def cmd_doctor(args):
     home = store.agw_home_path()
     writable = store.archive_store_writable()
     profile = prof.detect(os.getcwd())
-    cfg = engine.resolve_settings(engine.load_policy(PLUGIN_ROOT))
+    loaded_policy = engine.load_policy(PLUGIN_ROOT)
+    cfg = engine.resolve_settings(loaded_policy)
     try:
+        resolved_retention = retention_policy.resolve_retention_policy(
+            loaded_policy.settings
+        )
         size = store.archive_size_bytes()
-    except OSError:
-        size = 0
-    budget = int(os.environ.get("AGW_ARCHIVE_MAX_BYTES", 0) or 0)
-    retention = store.enforce_budget(budget) if budget else {
-        "over_budget": False, "required_free_bytes": 0, "evicted": 0,
-    }
+        retention = retention_policy.classify_retention_state(
+            resolved_retention, size
+        ).as_dict()
+    except (retention_policy.RetentionPolicyError, OSError) as exc:
+        _file_err(args, exc, default_code=4)
     office_caps = office.capabilities()
     validation_caps = office_tx.office_validation_capabilities()
     checks = {
@@ -1330,10 +1378,11 @@ def cmd_doctor(args):
         "session_memory": cfg.get("session_memory"),
         "regenerable_rm": cfg.get("regenerable_rm"),
         "archive_bytes": size,
-        "archive_budget": budget or "unlimited",
-        "archive_over_budget": retention["over_budget"],
-        "archive_required_free_bytes": retention["required_free_bytes"],
-        "archive_automatic_evictions": retention["evicted"],
+        "archive_budget": retention["max_bytes"] or "unlimited",
+        "archive_retention_state": retention["classification"],
+        "archive_over_budget": retention["capacity_exceeded"],
+        "archive_required_free_bytes": retention["over_capacity_bytes"],
+        "archive_automatic_prune": not resolved_retention.unlimited,
         **{f"converter_{k}": v for k, v in caps.items()},
         **{f"office_{k}": v for k, v in office_caps.items()},
         "office_validation_tiers": ",".join(validation_caps["tiers"]),
@@ -1352,9 +1401,13 @@ def cmd_doctor(args):
             "note: dependency-free Excel set-cell is available; install openpyxl "
             "only for advanced workbook reads and table/row mutations"
         )
-    if budget and size > budget:
-        lines.append(f"note: archive ({size} B) exceeds budget ({budget} B); "
-                     "recovery artifacts are preserved; review a retention plan manually.")
+    if retention["capacity_exceeded"]:
+        lines.append(
+            f"note: archive ({size} B) exceeds capacity "
+            f"({retention['max_bytes']} B); only expired classified cache "
+            "preimages can be reclaimed automatically."
+        )
+    checks["retention"] = retention
     _out(args, "\n".join(lines), checks)
 
 
@@ -1578,13 +1631,25 @@ def cmd_office(args):
 
 
 def cmd_prune(args):
-    # Human-only by policy: the guard hook always asks before this verb, and we
-    # require an explicit interactive confirmation on top.
-    print("prune permanently deletes archived versions. This is the ONLY destructive "
-          "verb in agw.", file=sys.stderr)
+    # Manual maintenance is still acknowledged explicitly; normal store-growing
+    # operations invoke this same bounded selector automatically under pressure.
+    print("prune permanently reclaims only expired classified cache preimages.",
+          file=sys.stderr)
     if not args.yes_i_am_a_human:
         _err("refusing: pass --yes-i-am-a-human after reviewing `agw status`", code=4)
-    _err("prune is not implemented in v0.1 (retention is keep-everything)", code=4)
+    try:
+        policy = retention_config.load(PLUGIN_ROOT)
+        result = store.maintain_retention(
+            policy=policy, lock_context=store.Lock("recovery-store", timeout=30.0)
+        )
+    except Exception as exc:
+        _file_err(args, exc, default_code=4)
+    _out(
+        args,
+        (f"retention maintenance reclaimed {result['reclaimed_bytes']} byte(s); "
+         f"cache now uses {result['after_bytes']} byte(s)"),
+        result,
+    )
 
 
 def cmd_schema(args):

@@ -34,7 +34,7 @@ PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 102
 def main():
     payload = json.load(sys.stdin)
     from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, store
+        preimages, presentation, retention_policy, store
     from core.decisions import GuardrailDecision
 
     evaluation_payload = payload
@@ -108,15 +108,23 @@ def main():
                     "this operation. Use a file-specific editing operation and try again."
                 )
         else:
-            archive_budget = int(os.environ.get(
-                "AGW_ARCHIVE_MAX_BYTES", policy.settings.get("archive_max_bytes", 0)
-            ) or 0)
-            receipt = preimages.prepare(
-                mutation_plan.targets, event.tool or "modification", PRESNAP_MAX_BYTES,
-                archive_budget, policy_revision=policy.revision,
-            )
-            if not receipt.ok:
-                invariant_failure = receipt.reason
+            try:
+                retention_config = retention_policy.resolve_retention_policy(
+                    policy.settings
+                )
+            except retention_policy.RetentionPolicyError as exc:
+                invariant_failure = (
+                    "Guardrails blocked this change because the recovery-cache "
+                    f"policy is invalid ({exc.error_code}). Nothing was changed."
+                )
+            else:
+                receipt = preimages.prepare(
+                    mutation_plan.targets, event.tool or "modification",
+                    PRESNAP_MAX_BYTES, policy_revision=policy.revision,
+                    retention_config=retention_config,
+                )
+                if not receipt.ok:
+                    invariant_failure = receipt.reason
     if invariant_failure:
         decision = engine.Decision(
             events.DENY, invariant_failure, "invariant:prestate-unavailable",

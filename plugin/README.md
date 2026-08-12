@@ -257,10 +257,11 @@ command; its JSON result reports `"validation_scope":"contract_only"`.
 Successful file mutations include an explicit recovery receipt stating whether
 the target existed, whether a pre-image was captured, whether rollback is
 available, and the exact `agw undo --transaction ID` command. Multi-file plans
-and declared runs share one parent transaction ID. Archive budgets are
-assessment-only: hooks do not automatically evict recovery artifacts. `agw
-checkout close PATH` removes only checkout tracking and preserves the working
-copy; its receipt can be reversed with `agw checkout reopen TRANSACTION_ID`.
+and declared runs share one parent transaction ID. Archive maintenance never
+prunes arbitrary recovery artifacts: at the high-water mark it may reclaim only
+expired records explicitly classified as mutation preimages. `agw checkout close
+PATH` removes only checkout tracking and preserves the working copy; its receipt
+can be reversed with `agw checkout reopen TRANSACTION_ID`.
 
 Approval prompts for sensitive reads and credential searches show a sanitized
 filename or search scope, the detected risk category, and the specific reason
@@ -370,9 +371,19 @@ evolve.
   one knob. `AGW_STRICT_DISCOVERY` can independently require bounded Guardrails
   for every recursive discovery command.
   See [enterprise/DEPLOYMENT.md](enterprise/DEPLOYMENT.md) for the full table.
-- **Disk budget:** `AGW_ARCHIVE_MAX_BYTES` caps the store (0 = unlimited);
-  oldest redundant pre-image copies are evicted first, never the sole copy of an
-  archived file.
+- **Recovery-cache budget:** the standard policy is 4 GiB, with automatic
+  maintenance at 90% and a target of 80%. `AGW_ARCHIVE_MAX_BYTES=0` explicitly
+  selects unlimited retention. Every mutation preimage is protected for seven
+  days; days 8–30 retain daily generations, and a path inactive for more than
+  30 days retains its newest usable point. Move/delete archives, manual
+  snapshots, evidence, corrupt records, and unclassified legacy records are
+  never automatic candidates.
+
+Retention does not run at SessionStart. Each operation that would grow the
+recovery store performs a cheap size/admission preflight; the bounded full
+inventory and pruning pass runs only after that operation reaches the
+high-water mark. `agw status` and `agw doctor` are read-only retention reports
+and never invoke maintenance; manual `agw prune` is optional.
 
 ### Activity history and recovery metadata
 

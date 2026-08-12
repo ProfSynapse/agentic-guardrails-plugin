@@ -244,6 +244,12 @@ def test_present_and_absent_preimage_receipts(tmp_path, monkeypatch):
     assert absent_contract["preimage_captured"] is False
     assert absent_contract["rollback_available"] is True
     assert absent_contract["recovery_record_kind"] == "absent_tombstone"
+    present_record = preimages.archive_tx.load(
+        preimages.store.agw_home(), present_contract["transaction_id"]
+    )
+    assert present_record["retention_class"] == "mutation_preimage"
+    assert present_record["protected_until_ns"] > present_record["created_at_ns"]
+    assert present_record["capture_group_id"]
 
 
 def test_preimage_capture_requires_policy_revision(tmp_path, monkeypatch):
