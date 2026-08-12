@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -141,7 +142,12 @@ def test_diagnostics_report_runtime_path_hash_and_argument_mismatches(tmp_path):
     assert argument_reason["expected_count"] == 1
     assert argument_reason["actual_count"] == 1
     assert "private-value" not in json.dumps(argument_reason)
-    assert argument_diagnostic["normalized"]["args"] == ["private-value"]
+    assert "args" not in argument_diagnostic["normalized"]
+    assert argument_diagnostic["normalized"]["argument_hashes"] == [{
+        "index": 0,
+        "sha256": hashlib.sha256(b"private-value").hexdigest(),
+    }]
+    assert "private-value" not in json.dumps(argument_diagnostic)
 
     runtime_diagnostic = workflows.diagnose_matching_workflows(
         ["node", str(script), "trusted-value"], str(tmp_path),
@@ -220,3 +226,126 @@ def test_diagnostics_preserve_ambiguity_for_legacy_match_helpers(tmp_path):
     assert diagnostic["matches"] == ["example.alpha", "example.beta"]
     assert workflows.matching_workflows(command, str(tmp_path)) == diagnostic["matches"]
     assert workflows.matching_workflow(command, str(tmp_path)) == ""
+    assert diagnostic["recommended_argv"] == []
+    assert diagnostic["suggested_argv"] == {
+        "deprecated": True,
+        "replacement": "recommended_argv",
+        "value_included": False,
+    }
+
+
+def test_diagnostics_classify_and_rank_candidates_deterministically(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    other = tmp_path / "other.py"
+    other.write_text("print('other')\n", encoding="utf-8")
+    _trust_manifest(
+        tmp_path, script, workflow_id="z.exact", args=["approved"],
+    )
+    _trust_manifest(
+        tmp_path, script, workflow_id="a.parameterizable",
+        schema=workflows.PARAMETERIZED_SCHEMA,
+        args=[{"parameter": "mode"}],
+        parameters={"mode": {"type": "enum", "values": ["approved"]}},
+    )
+    _trust_manifest(
+        tmp_path, script, workflow_id="a.near", args=["different"],
+    )
+    _trust_manifest(
+        tmp_path, other, workflow_id="a.incompatible", args=["approved"],
+    )
+
+    diagnostic = workflows.diagnose_matching_workflows(
+        [sys.executable, str(script), "approved"], str(tmp_path),
+    )
+
+    assert [item["id"] for item in diagnostic["candidates"]] == [
+        "z.exact", "a.parameterizable", "a.near", "a.incompatible",
+    ]
+    assert [item["candidate_class"] for item in diagnostic["candidates"]] == [
+        "exact", "parameterizable", "near", "incompatible",
+    ]
+    assert [item["rank"] for item in diagnostic["candidates"]] == [1, 2, 3, 4]
+    assert [item["rank_key"] for item in diagnostic["candidates"]] == [
+        [0, 0, "z.exact"],
+        [1, 0, "a.parameterizable"],
+        [2, 1, "a.near"],
+        [3, 2, "a.incompatible"],
+    ]
+    assert [item["confidence"] for item in diagnostic["candidates"]] == [
+        "high", "high", "medium", "none",
+    ]
+    near = diagnostic["candidates"][2]
+    assert near["remaining_differences"] == ["arguments_mismatch"]
+    assert near["remaining_difference_count"] == 1
+    # Two equally valid candidates remain explicit; ranking is not authorization.
+    assert diagnostic["recommended_argv"] == []
+    assert diagnostic["suggested_argv"]["replacement"] == "recommended_argv"
+
+
+def test_parameterized_recommendation_is_revalidated_and_candidate_is_private(tmp_path):
+    script = tmp_path / "writer.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    private_value = "private-approved-value"
+    _trust_manifest(
+        tmp_path, script, workflow_id="example.parameterized",
+        schema=workflows.PARAMETERIZED_SCHEMA,
+        args=["--mode", {"parameter": "mode"}],
+        parameters={"mode": {"type": "enum", "values": [private_value]}},
+    )
+    command = [
+        sys.executable, str(script), "--mode", private_value,
+    ]
+
+    diagnostic = workflows.diagnose_matching_workflows(command, str(tmp_path))
+
+    candidate = diagnostic["candidates"][0]
+    assert candidate["candidate_class"] == "parameterizable"
+    assert candidate["confidence"] == "high"
+    assert candidate["remaining_differences"] == []
+    assert candidate["inferred_parameters"] == [{
+        "name": "mode",
+        "source_indexes": [1],
+        "constraints": {"type": "enum", "allowed_count": 1},
+        "value_sha256": hashlib.sha256(private_value.encode("utf-8")).hexdigest(),
+    }]
+    assert private_value not in json.dumps(candidate)
+    assert diagnostic["recommended_argv"] == [
+        "agw", "run", "--workflow", "example.parameterized", "--", *command,
+    ]
+    assert diagnostic["suggested_argv"] == {
+        "deprecated": True,
+        "replacement": "recommended_argv",
+        "value_included": False,
+    }
+    assert json.dumps(diagnostic).count(private_value) == 1
+
+
+def test_recommendation_requires_equivalent_second_resolution(tmp_path, monkeypatch):
+    script = tmp_path / "writer.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    _trust_manifest(tmp_path, script, args=["approved"])
+    command = [sys.executable, str(script), "approved"]
+    original = workflows.resolve_run
+    calls = 0
+
+    def changing_resolver(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        resolved = original(*args, **kwargs)
+        if calls == 2:
+            resolved = dict(resolved)
+            resolved["output_patterns"] = ["unexpected-*.txt"]
+        return resolved
+
+    monkeypatch.setattr(workflows, "resolve_run", changing_resolver)
+    diagnostic = workflows.diagnose_matching_workflows(command, str(tmp_path))
+
+    candidate = diagnostic["candidates"][0]
+    assert calls == 2
+    assert candidate["matched"] is True  # diagnostic-v1 compatibility
+    assert candidate["candidate_class"] == "exact"
+    assert candidate["confidence"] == "none"
+    assert candidate["remaining_differences"] == ["identity_changed"]
+    assert diagnostic["recommended_argv"] == []
+    assert diagnostic["suggested_argv"]["value_included"] is False

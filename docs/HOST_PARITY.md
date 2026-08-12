@@ -35,6 +35,14 @@ Claude Code and Codex releases must both pass:
 8. Windows hook manifests invoke `py.exe -3` with a plugin-root-qualified
    dispatcher path. Missing Python Launcher guidance is written for people and
    never proposes PATH edits or file-association execution.
+9. Final deny decisions derive structured `safe_next` only after rewrite and
+   approval resolution. Claude and Codex use the same remediation seam and the
+   presentation module is the sole text renderer; advice is never executed or
+   written to the decision audit record.
+10. Both hosts expose the same `run-plan` and `publish-plan` CLI/schema
+    contracts, outcome axes and provenance, workflow candidate classes, and
+    revalidated `recommended_argv` behavior. Neither host claims read-only
+    filesystem enforcement when the installed provider lacks it.
 
 A planned host becomes supported only after it has an explicit manifest and
 adapter, lifecycle fixtures, platform launcher coverage, and inclusion in the

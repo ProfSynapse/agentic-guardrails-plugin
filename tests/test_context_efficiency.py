@@ -61,6 +61,8 @@ def test_always_on_context_is_small_and_has_no_operation_catalog():
         assert "exact host-supplied `SKILL.md` location" in context
         assert "plugin-cache path" in context
         assert "agw workflow match -- <command>" in context
+        assert "credential or confidential reads" in context
+        assert "separate from network operations" in context
 
 
 def test_session_workflow_discovery_is_bounded_and_workspace_relevant(tmp_path):

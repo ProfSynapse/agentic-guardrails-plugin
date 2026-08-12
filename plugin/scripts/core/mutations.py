@@ -573,6 +573,49 @@ def routable_trusted_workflows(command: str, cwd: str,
     return matching_trusted_workflows(command, cwd, dialect=dialect)
 
 
+def workflow_recommended_argv(command: str, cwd: str,
+                              dialect: str = None) -> list[str]:
+    """Return Node C's inert, authenticated, revalidated workflow advice.
+
+    Candidate ranking is intentionally ignored. Only an unambiguous top-level
+    recommendation from the public diagnostics contract is consumable.
+    """
+    if not isinstance(command, str) or not command or not isinstance(cwd, str) or not cwd:
+        return []
+    try:
+        parsed = extract_commands(command, dialect=dialect)
+    except ParseUncertain:
+        return []
+    if len(parsed.commands) != 1 or parsed.flags:
+        return []
+    argv = parsed.commands[0].argv
+    if not argv or not all(isinstance(value, str) and value for value in argv):
+        return []
+    try:
+        diagnostic = workflows.diagnose_matching_workflows(argv, cwd)
+    except (OSError, TypeError, ValueError, workflows.WorkflowError):
+        return []
+    if diagnostic.get("schema") != workflows.DIAGNOSTIC_SCHEMA \
+            or diagnostic.get("ok") is not True:
+        return []
+    candidate = diagnostic.get("recommended_argv") or []
+    if "suggested_argv" in diagnostic:
+        migration = diagnostic["suggested_argv"]
+        if not isinstance(migration, dict) or migration != {
+                "deprecated": True,
+                "replacement": "recommended_argv",
+                "value_included": False,
+        }:
+            return []
+    if not isinstance(candidate, list) or not candidate \
+            or not all(isinstance(value, str) and value for value in candidate):
+        return []
+    if len(candidate) < 6 or candidate[:3] != ["agw", "run", "--workflow"] \
+            or "--" not in candidate[4:]:
+        return []
+    return list(candidate)
+
+
 @dataclass
 class MutationPlan:
     targets: list[str] = field(default_factory=list)

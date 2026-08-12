@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.3.26"
+VERSION = "0.4.0"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -33,7 +33,28 @@ def _ignore(_directory, names):
 def packed_plugin(tmp_path):
     artifact = tmp_path / "packed" / "plugin"
     artifact.parent.mkdir()
-    shutil.copytree(SOURCE_PLUGIN, artifact, ignore=_ignore)
+    artifact.mkdir()
+    allowlist = [
+        line.strip() for line in (SOURCE_PLUGIN / ".plugin-pack").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    # Match the authoritative packager contract: the Claude manifest is always
+    # included in addition to the explicit allowlist.
+    allowlist.append(".claude-plugin/plugin.json")
+    for relative in allowlist:
+        source = SOURCE_PLUGIN / relative
+        target = artifact / relative
+        # The packager treats legacy optional entries as selectors: an absent
+        # path contributes nothing to the artifact.
+        if not source.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, target, ignore=_ignore)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     print(f"PACKED_ARTIFACT={artifact}")
     yield artifact
     print(f"PACKED_ARTIFACT_PRESERVED={artifact.parent}")
@@ -213,6 +234,11 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
         packed_plugin / "scripts" / "core" / "powershell_bind.py",
         packed_plugin / "scripts" / "core" / "common-controls-v6.manifest",
         packed_plugin / "scripts" / "agw" / "office_ooxml.py",
+        packed_plugin / "scripts" / "agw" / "office_opc.py",
+        packed_plugin / "scripts" / "agw" / "publication.py",
+        packed_plugin / "scripts" / "agw" / "run_plans.py",
+        packed_plugin / "scripts" / "core" / "outcomes.py",
+        packed_plugin / "scripts" / "core" / "remediation.py",
         packed_plugin / "bin" / "agw",
         packed_plugin / "bin" / "agw.cmd",
     ]
@@ -229,6 +255,30 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
     assert "host-history" in audit_shim
     if os.name != "nt":
         assert (packed_plugin / "bin" / "agw").stat().st_mode & stat.S_IXUSR
+
+
+def test_authoritative_pack_imports_new_runtime_only_from_artifact(
+        packed_plugin, tmp_path):
+    imported = json.loads(_packed_core(
+        packed_plugin,
+        "import json, sys; sys.path.insert(0, 'agw'); "
+        "import office_opc, publication, run_plans; "
+        "from core import outcomes, remediation; "
+        "print(json.dumps([m.__file__ for m in "
+        "(office_opc, publication, run_plans, outcomes, remediation)]))",
+    ))
+    artifact_root = packed_plugin.resolve()
+    source_root = SOURCE_PLUGIN.resolve()
+    for filename in imported:
+        resolved = Path(filename).resolve()
+        assert resolved.is_relative_to(artifact_root)
+        assert not resolved.is_relative_to(source_root)
+
+    for command in (("run-plan", "--help"), ("publish-plan", "--help")):
+        output = _run_packed_agw_without_site_packages(
+            packed_plugin, tmp_path, *command
+        )
+        assert "create" in output and "apply" in output
 
 
 def test_packed_docx_read_and_mutation_work_without_site_packages(
@@ -407,7 +457,7 @@ def test_packed_project_keyword_search_is_ordinary_diagnostic(
 
 def test_packed_discovery_commands_and_contract_are_available_without_site_packages(
         packed_plugin, tmp_path):
-    for operation in ("list", "search"):
+    for operation in ("list", "search", "run-plan", "publish-plan"):
         output = _run_packed_agw_without_site_packages(
             packed_plugin, tmp_path, operation, "--help"
         )
@@ -417,7 +467,7 @@ def test_packed_discovery_commands_and_contract_are_available_without_site_packa
         "from core import agw_contract; import json; "
         "print(json.dumps(sorted(agw_contract.operation_names())))",
     ))
-    assert "list" in names and "search" in names
+    assert {"list", "search", "run-plan", "publish-plan"}.issubset(names)
     assert "apply" not in names and "hydrate" not in names
 
 

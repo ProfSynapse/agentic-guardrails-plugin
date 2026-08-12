@@ -117,6 +117,8 @@ class Decision:
     # Closed, engine-generated labels for an approval prompt. Never place file
     # content or raw command text here; presentation sanitizes display strings.
     presentation_details: dict = field(default_factory=dict)
+    # Inert structured remediation; never an authorization to execute.
+    safe_next: object = None
 
     def __post_init__(self):
         self.enforcement_class = normalize_enforcement_class(
@@ -140,6 +142,7 @@ class Decision:
             ),
             winner.presentation_context,
             dict(winner.presentation_details),
+            winner.safe_next,
         )
         return merged
 

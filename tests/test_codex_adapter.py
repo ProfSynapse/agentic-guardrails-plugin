@@ -101,6 +101,7 @@ def test_bash_rm_denied():
                     "cwd": "/tmp", "session_id": "c1"})
     assert _decision(out) == "deny"
     assert "agw archive" in _reason(out)
+    assert "Recommended argv (submit as a new operation" in _reason(out)
 
 
 def test_active_agw_python_help_is_not_treated_as_opaque_script():

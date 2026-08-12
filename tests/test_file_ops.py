@@ -644,6 +644,9 @@ def test_publish_staged_file_cross_directory_is_atomic_and_recoverable(tmp_path)
     assert target.read_bytes() == b"new"
     assert stage.read_bytes() == b"new"
     assert result["publish_attempts"] == 1
+    assert result["atomicity"] == "recoverable-set"
+    assert result["visibility"] == "per-file-sequential"
+    assert result["transaction_id"]
     assert Path(store.list_versions(str(target))[0]["dest"]).read_bytes() == b"old"
 
 
@@ -666,6 +669,42 @@ def test_publish_busy_preserves_live_and_stage(tmp_path, monkeypatch):
         )
     assert target.read_bytes() == b"old"
     assert stage.read_bytes() == b"new"
+
+
+def test_publish_staged_file_dry_run_preserves_compatibility_fields(tmp_path):
+    target = tmp_path / "book.xlsx"
+    stage = tmp_path / ".stage.xlsx"
+    target.write_bytes(b"old")
+    stage.write_bytes(b"new")
+
+    result = file_ops.publish_staged_file(
+        str(target), str(stage),
+        expected_hash=store.file_sha256(str(target)), dry_run=True,
+    )
+
+    assert result["path"] == str(target)
+    assert result["changed"] == 1
+    assert result["dry_run"] is True
+    assert result["before_hash"] == store.file_sha256(str(target))
+    assert result["after_hash"] == store.file_sha256(str(stage))
+    assert target.read_bytes() == b"old"
+    assert result["process_outcome"] == "not_applicable"
+    assert result["publication_outcome"] == "validated"
+    assert result["operation_outcome"] == result["outcome"] == "success"
+
+
+def test_publish_staged_file_consumes_legacy_same_directory_stage(tmp_path):
+    target = tmp_path / "book.xlsx"
+    stage = tmp_path / ".stage.xlsx"
+    target.write_bytes(b"old")
+    stage.write_bytes(b"new")
+
+    file_ops.publish_staged_file(
+        str(target), str(stage), expected_hash=store.file_sha256(str(target)),
+    )
+
+    assert target.read_bytes() == b"new"
+    assert not stage.exists()
 
 
 def test_cli_publish_file_validates_stage_and_publishes(tmp_path, agw_home):

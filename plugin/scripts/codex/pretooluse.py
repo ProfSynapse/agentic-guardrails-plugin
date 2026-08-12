@@ -50,7 +50,7 @@ ASK_MODAL_TIMEOUT = int(os.environ.get("AGW_ASK_MODAL_TIMEOUT", 100))
 def main(approval_provider=None):
     payload = json.load(sys.stdin)
     from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, retention_policy, store
+        preimages, presentation, remediation, retention_policy, store
     from core.decisions import GuardrailDecision
 
     evaluation_payload = payload
@@ -111,6 +111,10 @@ def main(approval_provider=None):
                 presentation_context=events.DecisionContext.PATCH_UNKNOWN))
         decisions.append(d)
     decision = events.worst(decisions)
+    if decision.action == events.DENY \
+            and decision.rule_id == "builtin:patch-delete":
+        decision.safe_next = None
+        decision.safe_next = remediation.for_events(decision, evlist)
     effective = enforcement.resolve(decision, observe)
 
     will_run = effective.action != events.DENY
@@ -144,6 +148,10 @@ def main(approval_provider=None):
                         "trigger": "Static source analysis found ambiguous write evidence.",
                     },
                 ))
+                if decision.action == events.DENY \
+                        and decision.rule_id == "builtin:script-write-ambiguous":
+                    decision.safe_next = None
+                    decision.safe_next = remediation.for_events(decision, evlist)
                 effective = enforcement.resolve(decision, observe)
             else:
                 invariant_failure = (
@@ -175,6 +183,8 @@ def main(approval_provider=None):
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
         )
+        decision.safe_next = None
+        decision.safe_next = remediation.for_events(decision, evlist)
         effective = enforcement.resolve(decision, observe)
 
     def _audit(kind, data):
@@ -281,8 +291,10 @@ def main(approval_provider=None):
     out = {}
     if action in (events.ALLOW, events.ASK, events.DENY):
         if action == events.DENY:
+            denial_decision = GuardrailDecision.from_legacy(decision)
+            denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
-                GuardrailDecision.from_legacy(decision), approval_outcome
+                denial_decision, approval_outcome
             )
         else:
             reason = decision.reason
@@ -298,7 +310,7 @@ def main(approval_provider=None):
     out = launcher.attach_rewrite(
         out, payload, rewritten_command, may_run=action != events.DENY
     )
-    if routed_workflow and out.get("hookSpecificOutput"):
+    if routed_workflow and action != events.DENY and out.get("hookSpecificOutput"):
         out["hookSpecificOutput"]["permissionDecisionReason"] = (
             f"Routed this exact script and argument set through trusted workflow "
             f"{routed_workflow}."

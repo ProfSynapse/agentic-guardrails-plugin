@@ -6,7 +6,7 @@ import json
 import os
 import re
 
-from . import events
+from . import events, remediation
 from .decisions import GuardrailDecision, PromptRequest, TARGET_CATEGORY, \
     TARGET_EXACT, TARGET_UNRESOLVED
 
@@ -126,86 +126,80 @@ _SERVICE_LABELS = {
 }
 
 
-_ARCHIVE_DENIALS = {
-    "builtin:rm", "builtin:find-delete", "builtin:move-null",
-    "builtin:pwsh-delete", "builtin:interpreter-delete",
-    "builtin:patch-delete", "builtin:git-clean", "builtin:mcp-delete",
-}
-_DIRECT_DENIALS = {
-    "builtin:monitor-opaque", "builtin:mcp-shell-opaque",
-    "builtin:unparseable-mutation", "builtin:indirect-mutation",
-    "builtin:patch-targets-unknown", "builtin:patch-opaque",
-}
-_MACHINE_DENIALS = {
-    "builtin:dd", "builtin:disk", "builtin:sudo", "builtin:chmod",
-}
-
-
-def _safe_next_step(rule_id: str) -> str:
+def render_safe_next(advice: remediation.SafeNext) -> str:
     """Return closed, actionable recovery copy for a denied operation.
 
-    The instruction is selected only from the trusted rule identifier. Raw
-    commands, paths, content, and exception strings never enter this field.
+    The instruction is selected only from the closed structured reason code.
     """
-    if rule_id in _ARCHIVE_DENIALS or rule_id in {
-            "core.yaml:mcp[0]", "core.yaml:mcp[1]"}:
+    reason_code = advice.reason_code
+    if reason_code == remediation.REASON_ARCHIVE:
         return (
             "Use a reversible archive, move, or soft-delete operation for each "
             "explicit target. If the service has no reversible option, leave the "
             "item in place."
         )
-    if rule_id in _DIRECT_DENIALS or rule_id == "invariant:prestate-unavailable":
+    if reason_code == remediation.REASON_WORKFLOW:
+        return "Use the authenticated workflow that declares and verifies this script's outputs."
+    if reason_code == remediation.REASON_DIRECT:
         return (
             "Retry with one direct, file-specific operation that names every target "
             "so Guardrails can verify and protect it."
         )
-    if rule_id in {"builtin:decode-pipe", "builtin:download-pipe"}:
+    if reason_code == remediation.REASON_INSPECT:
         return (
             "Separate retrieval, inspection, and execution into distinct steps; "
             "inspect the content before proposing any execution."
         )
-    if rule_id == "builtin:secret-exfil":
+    if reason_code == remediation.REASON_SECRET:
         return (
             "Continue without transmitting credential content. Use a destination's "
             "supported credential reference or secret-store integration instead."
         )
-    if rule_id == "builtin:sql-drop":
+    if reason_code == remediation.REASON_READ_ONLY:
         return "Use a read-only query or a reversible migration plan that preserves existing data."
-    if rule_id == "builtin:sql-delete":
+    if reason_code == remediation.REASON_FILTERED_DELETE:
         return (
             "Identify the exact records first, then use an archive or soft-delete "
             "workflow with an explicit filter."
         )
-    if rule_id in _MACHINE_DENIALS:
+    if reason_code == remediation.REASON_MACHINE_SCOPE:
         return "Revise the task to avoid privileged, recursive, or machine-wide changes."
-    if rule_id == "builtin:git-force":
+    if reason_code == remediation.REASON_REMOTE_REVIEW:
         return "Review the remote state and use force-with-lease only if replacement is still required."
-    if rule_id == "builtin:git-reset-hard":
+    if reason_code == remediation.REASON_PRESERVE_WORK:
         return "Preserve the work with a Guardrails snapshot or Git stash before proposing a reset."
-    if rule_id in {"builtin:protected-path", "policy:zone"}:
+    if reason_code == remediation.REASON_AUTHORIZED_COPY:
         return (
             "Work on an authorized workspace copy, or ask the user to revise the "
             "access policy before trying again."
         )
-    if rule_id == "builtin:gdoc-stub":
+    if reason_code == remediation.REASON_CLOUD_DOCUMENT:
         return "Use the Google Drive connector to edit or export the actual cloud document."
-    if rule_id == "builtin:placeholder":
+    if reason_code == remediation.REASON_OFFLINE:
         return "Make the file available offline, verify the local copy, and then retry."
-    if rule_id == "builtin:agw-impostor":
+    if reason_code == remediation.REASON_LAUNCHER:
         return "Use the packaged Guardrails launcher reported at session start."
-    if rule_id in {
-            "builtin:agw-empty", "builtin:agw-search-empty",
-            "builtin:agw-unknown", "builtin:agw-workflow-unknown"}:
+    if reason_code == remediation.REASON_AGW_HELP:
         return (
             "Use `agw --help`, choose a documented operation, and retry with "
             "literal arguments and explicit targets."
         )
-    if rule_id.startswith("policy:health-"):
+    if reason_code == remediation.REASON_POLICY_HEALTH:
         return "Repair or reinstall the Guardrails policy package, verify its health, and retry."
-    if ":snippets[" in rule_id:
+    if reason_code == remediation.REASON_REMOVE_SECRET:
         return (
             "Remove credential or private-key material and use a secret-store or "
             "environment reference instead."
+        )
+    if reason_code == remediation.REASON_DECLINED:
+        return (
+            "Do not retry the same operation. Continue without it or propose a "
+            "safer alternative that still serves the user's request."
+        )
+    if reason_code == remediation.REASON_PROVIDER:
+        return (
+            "Continue without the operation, or retry later when an approval "
+            "provider is available."
         )
     return (
         "Propose a narrower, reversible operation with explicit targets that "
@@ -220,30 +214,30 @@ def build_denial_feedback(decision: GuardrailDecision,
     A declined approval is deliberately non-retriable so an agent cannot nag by
     immediately presenting the same operation again.
     """
+    advice = decision.safe_next or remediation.incomplete(decision.rule_id)
     if approval_outcome in {"cancelled", "denied"}:
         blocked = "The requested operation was not approved."
-        next_step = (
-            "Do not retry the same operation. Continue without it or propose a "
-            "safer alternative that still serves the user's request."
-        )
+        advice = remediation.approval_outcome(advice, approval_outcome)
     elif approval_outcome == "prompt-incomplete":
         blocked = (
             "Guardrails could not identify enough structured information to "
             "request informed approval."
         )
-        next_step = (
-            "Retry with one documented, direct operation that provides a "
-            "meaningful target or bounded target category."
+        advice = remediation.SafeNext(
+            remediation.REASON_DIRECT, source=advice.source,
+            missing_fields=("recommended_argv", "approval_target"),
         )
     elif approval_outcome:
         blocked = "Guardrails could not safely obtain approval for the requested operation."
-        next_step = (
-            "Continue without the operation, or retry later when an approval "
-            "provider is available."
-        )
+        advice = remediation.approval_outcome(advice, approval_outcome)
     else:
         blocked = decision.reason or "The requested operation did not meet the active safety policy."
-        next_step = _safe_next_step(decision.rule_id)
+    next_step = render_safe_next(advice)
+    if advice.safe_to_retry:
+        next_step += (
+            "\n\nRecommended argv (submit as a new operation for policy evaluation): "
+            + json.dumps(list(advice.recommended_argv), ensure_ascii=False)
+        )
     return (
         f"Blocked: {blocked}\n\n"
         "Result: The requested action did not run; no requested target was changed.\n\n"

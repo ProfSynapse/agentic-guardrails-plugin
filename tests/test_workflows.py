@@ -697,7 +697,7 @@ def test_engine_requires_confirmation_to_install_trust_but_allows_inspection(pol
     assert matching.action == ALLOW
 
 
-def test_workflow_match_cli_returns_description_and_suggested_argv(tmp_path):
+def test_workflow_match_cli_returns_one_authoritative_recommendation(tmp_path):
     script = tmp_path / "writer.py"
     script.write_text(
         "from pathlib import Path\nPath('out.txt').write_text('x')\n",
@@ -719,9 +719,14 @@ def test_workflow_match_cli_returns_description_and_suggested_argv(tmp_path):
     assert payload["count"] == 1
     assert payload["matches"][0]["id"] == "example.cli-match"
     assert payload["matches"][0]["description"] == "test writer"
-    assert payload["suggested_argv"] == [
+    assert payload["recommended_argv"] == [
         "agw", "run", "--workflow", "example.cli-match", "--", *command,
     ]
+    assert payload["suggested_argv"] == {
+        "deprecated": True, "replacement": "recommended_argv",
+        "value_included": False,
+    }
+    assert "command" not in payload
 
     listing = subprocess.run(
         [sys.executable, AGW_SOURCE, "workflow", "list"],
@@ -742,8 +747,9 @@ def test_workflow_match_cli_reports_zero_matches(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["matches"] == []
     assert payload["count"] == 0
-    assert payload["suggested_argv"] == []
-    assert payload["command"] == command
+    assert payload["recommended_argv"] == []
+    assert payload["suggested_argv"]["value_included"] is False
+    assert "command" not in payload
 
 
 def test_workflow_match_cli_preserves_unicode_arguments(tmp_path):
@@ -767,8 +773,10 @@ def test_workflow_match_cli_preserves_unicode_arguments(tmp_path):
     )
     payload = json.loads(result.stdout)
     assert payload["count"] == 1
-    assert payload["command"] == command
-    assert payload["suggested_argv"][-len(command):] == command
+    assert payload["recommended_argv"][-len(command):] == command
+    assert payload["suggested_argv"]["replacement"] == "recommended_argv"
+    assert "command" not in payload
+    assert json.dumps(payload, ensure_ascii=False).count(unicode_arg) == 1
 
 
 def test_workflow_match_cli_keeps_multiple_matches_explicit(tmp_path):
@@ -795,7 +803,9 @@ def test_workflow_match_cli_keeps_multiple_matches_explicit(tmp_path):
         "example.cli-alpha", "example.cli-beta",
     }
     assert payload["count"] == 2
-    assert payload["suggested_argv"] == []
+    assert payload["recommended_argv"] == []
+    assert payload["suggested_argv"]["value_included"] is False
+    assert "command" not in payload
 
 
 def test_workflow_match_cli_rejects_missing_command(tmp_path):

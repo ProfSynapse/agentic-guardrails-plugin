@@ -3,8 +3,9 @@
 destructive primitives. Every verb is reversible by construction, dual-output
 (human line + JSON via --json), and self-logging.
 
-Verbs: init scan list search checkout convert diff publish publish-file archive unlink-link
-       move rename snapshot restore undo status log doctor prune office
+Verbs: init scan list search checkout convert diff publish publish-file publish-plan
+       run-plan archive unlink-link move rename snapshot restore undo status log
+       doctor prune office
 """
 from __future__ import annotations
 
@@ -44,7 +45,9 @@ import cli_schema                           # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
+import publication                          # noqa: E402
 import retention_config                    # noqa: E402
+import run_plans                            # noqa: E402
 import scan_worker                          # noqa: E402
 
 SNAPSHOT_MAX_BYTES = int(os.environ.get("AGW_SNAPSHOT_MAX_BYTES", 2 * 1024 ** 3))
@@ -213,6 +216,43 @@ def _load_json_payload(inline: str, file_path: str, label: str, expected):
     except ValueError as exc:
         _err(f"{label}: {exc}")
     return value
+
+
+def _write_plan_file(plan: dict, path: str, expected_file_hash: str,
+                     operation: str) -> dict:
+    """Publish an inert plan through the ordinary recoverable file boundary."""
+    serialized = json.dumps(
+        plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    written = file_ops.write_text(
+        path, serialized, expected_hash=expected_file_hash,
+        operation=operation,
+    )
+    return {
+        **plan,
+        "plan_file": written["path"],
+        "plan_file_sha256": written["after_hash"],
+        "plan_file_changed": written["changed"],
+        "plan_file_recovery": written.get("recovery", {}),
+    }
+
+
+def _plan_error(args, exc):
+    error_code = getattr(exc, "error_code", "plan_error")
+    details = dict(getattr(exc, "details", {}) or {})
+    if "conflict" in error_code or error_code in {
+            "run_plan_consumed", "run_plan_expired"}:
+        details.setdefault("precondition_outcome", "stale")
+    code = 3 if "precondition_outcome" in details else 1
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "ok": False,
+            "error": {
+                "code": error_code, "message": str(exc), "details": details,
+            },
+        }, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+        raise SystemExit(code)
+    _err(str(exc), code=code, error_code=error_code, details=details)
 
 
 def _resolve(path: str) -> str:
@@ -996,6 +1036,172 @@ def cmd_run(args):
         raise SystemExit(2)
 
 
+def _plan_payload(path: str, label: str) -> dict:
+    return _load_json_payload("", path, label, dict)
+
+
+def _publication_candidate_validator(candidate: str, item: dict):
+    validation = item.get("validation", "raw")
+    if not isinstance(validation, dict) or validation.get("kind") != "office":
+        return {"valid": True, "mode": "raw"}
+    extension = os.path.splitext(item.get("target", ""))[1].lower()
+    tier = validation.get("tier") or "office-schema"
+    validation_tier = (
+        "excel-strict" if tier == "auto" and extension in {".xlsx", ".xlsm"}
+        else "office-schema" if tier == "auto" else tier
+    )
+    office_tx.validate_office_package(candidate, tier=validation_tier)
+    preserve = str(validation.get("preserve_against") or "")
+    preserve_hash = str(validation.get("preserve_against_sha256") or "")
+    if extension == ".xlsm" and not (preserve and preserve_hash):
+        raise file_ops.FileOperationError(
+            ".xlsm publication requires an authenticated preserve-against baseline"
+        )
+    preservation_verified = False
+    if preserve:
+        if not preserve_hash:
+            raise file_ops.FileOperationError(
+                "preserve-against requires its authenticated SHA-256"
+            )
+        office_tx.validate_package_preservation(
+            preserve, candidate, expected_original_sha256=preserve_hash,
+        )
+        preservation_verified = True
+    return {
+        "valid": True, "candidate_sha256": store.file_sha256(candidate),
+        "tier": tier, "package_validation": True,
+        "baseline_path": preserve,
+        "baseline_expected_sha256": preserve_hash,
+        "baseline_actual_sha256": store.file_sha256(preserve) if preserve else "",
+        "preservation_validation": preservation_verified,
+    }
+
+
+def _plan_human(data: dict) -> str:
+    outcome = data.get("outcome")
+    if outcome == "environment_failure":
+        if data.get("error_code") == "immutable_execution_unavailable":
+            return "execution not started: no provider can prove immutable script execution"
+        return "execution not started: " + str(data.get("error") or "environment unavailable")
+    if outcome == "policy_blocked":
+        return "execution blocked by policy"
+    if outcome == "stale_precondition":
+        return "plan refused because a precondition is stale"
+    if outcome == "process_failed":
+        return "process did not succeed; declared outputs were not published"
+    if outcome == "success_extra_outputs":
+        return "process succeeded but produced undeclared observed outputs"
+    if outcome == "success_output_mismatch":
+        return "process succeeded but its declared output contract was not satisfied"
+    if outcome == "success":
+        return "plan completed successfully"
+    if data.get("dry_run"):
+        return "plan validated; no execution or publication occurred"
+    return "plan operation completed"
+
+
+def cmd_run_plan(args):
+    try:
+        if args.plan_op == "create":
+            spec = _plan_payload(args.spec_file, "run-plan specification")
+            allowed = {
+                "command", "mode", "cwd", "artifacts", "observed_roots",
+                "timeout_seconds", "isolation", "network", "provider",
+                "issued_at_utc", "expires_at_utc", "plan_id",
+            }
+            unknown = sorted(set(spec) - allowed)
+            if unknown:
+                raise run_plans.RunPlanError(
+                    "run-plan specification contains unknown fields",
+                    {"fields": unknown},
+                )
+            if not isinstance(spec.get("command"), list):
+                raise run_plans.RunPlanError(
+                    "run-plan specification command must be a JSON array"
+                )
+            plan = run_plans.create_run_plan(
+                spec.get("command"), mode=spec.get("mode"),
+                cwd=spec.get("cwd", ""), artifacts=spec.get("artifacts"),
+                observed_roots=spec.get("observed_roots"),
+                timeout_seconds=spec.get("timeout_seconds", 300.0),
+                isolation=spec.get("isolation", "observed"),
+                network=spec.get("network", "inherit"),
+                provider=spec.get("provider", "installed"),
+                issued_at_utc=spec.get("issued_at_utc"),
+                expires_at_utc=spec.get("expires_at_utc"),
+                plan_id=spec.get("plan_id", ""),
+            )
+            data = _write_plan_file(
+                plan, args.plan_file, args.expected_plan_file_hash,
+                "run-plan-create",
+            )
+            human = (
+                f"created single-use run plan {data['freshness']['plan_id']} at "
+                f"{data['plan_file']} ({data['plan_sha256']})"
+            )
+        else:
+            plan = _plan_payload(args.plan_file, "run plan")
+            data = run_plans.apply_run_plan(
+                plan, expected_plan_hash=args.expected_plan_hash,
+                dry_run=args.dry_run,
+                candidate_validator=_publication_candidate_validator,
+            )
+            human = _plan_human(data)
+    except (OSError, file_ops.FileOperationError, run_plans.RunPlanError) as exc:
+        _plan_error(args, exc)
+    _out(args, human, data)
+    if args.plan_op == "apply" and not data.get("ok", True):
+        raise SystemExit(4 if data.get("outcome") == "environment_failure" else 2)
+
+
+def cmd_publish_plan(args):
+    try:
+        if args.plan_op == "create":
+            operations = _load_json_payload(
+                "", args.operations_file, "publish operations", list,
+            )
+            plan = publication.build_publish_plan(operations, cwd=args.cwd)
+            data = _write_plan_file(
+                plan, args.plan_file, args.expected_plan_file_hash,
+                "publish-plan-create",
+            )
+            human = (
+                f"created publish plan for {len(plan['operations'])} file(s) at "
+                f"{data['plan_file']} ({data['plan_sha256']})"
+            )
+        elif args.plan_op == "apply":
+            plan = _plan_payload(args.plan_file, "publish plan")
+            data = publication.publish_staged_batch(
+                plan, expected_plan_hash=args.expected_plan_hash,
+                candidate_validator=_publication_candidate_validator,
+                dry_run=args.dry_run,
+            )
+            human = (
+                ("publication validated; no process ran" if data.get("dry_run")
+                 else "publication committed; no process outcome applies")
+                + f"; {len(data.get('operations', []))} staged file(s); "
+                + f"atomicity={data['atomicity']}, visibility={data['visibility']}"
+            )
+        elif args.recovery_action == "inspect":
+            data = publication.inspect_prepared_transaction(args.transaction_id)
+            human = (
+                f"publication {args.transaction_id}: "
+                f"{data.get('state', 'unknown')}; "
+                f"classification={data.get('classification', 'terminal')}"
+            )
+        else:
+            data = publication.recover_prepared_transaction(
+                args.transaction_id, action=args.recovery_action,
+            )
+            human = (
+                f"publication {args.transaction_id}: {data.get('state', 'unknown')} "
+                f"after explicit {args.recovery_action} recovery"
+            )
+    except (OSError, LookupError, file_ops.FileOperationError) as exc:
+        _plan_error(args, exc)
+    _out(args, human, data)
+
+
 def cmd_workflow(args):
     try:
         if args.workflow_op == "trust":
@@ -1044,22 +1250,38 @@ def cmd_workflow(args):
                 item.get("id"): item for item in workflows.list_trusted()
                 if item.get("verified") and item.get("id")
             }
-            matches = [available[item] for item in workflow_ids if item in available]
+            matches = [{
+                "id": item,
+                "description": str(available.get(item, {}).get("description") or ""),
+            } for item in workflow_ids]
+            recommended = diagnostics.get("recommended_argv", [])
             data = {
-                "matches": matches, "count": len(matches), "command": command,
+                "matches": matches, "count": len(matches),
                 "cwd": os.path.realpath(os.path.abspath(args.cwd or os.getcwd())),
-                "suggested_argv": (
-                    ["agw", "run", "--workflow", workflow_ids[0], "--", *command]
-                    if len(workflow_ids) == 1 else []
-                ),
-                "diagnostics": diagnostics,
+                "recommended_argv": recommended,
+                "suggested_argv": diagnostics.get("suggested_argv", {
+                    "deprecated": True,
+                    "replacement": "recommended_argv",
+                    "value_included": False,
+                }),
+                "candidates": diagnostics.get("candidates", []),
+                "candidate_count": diagnostics.get("candidate_count", 0),
             }
-            human = (
+            headline = (
                 f"exact trusted workflow match: {workflow_ids[0]}"
                 if len(workflow_ids) == 1 else
                 ("multiple exact workflow matches: " + ", ".join(workflow_ids)
                  if workflow_ids else "no exact trusted workflow match")
             )
+            candidate_lines = [
+                f"{item.get('candidate_class', 'incompatible')}: "
+                f"{item.get('id') or item.get('record', 'unverified')}"
+                for item in diagnostics.get("candidates", [])
+            ]
+            recommendation = diagnostics.get("recommended_argv", [])
+            if recommendation:
+                candidate_lines.append("one revalidated recommendation is available in JSON")
+            human = "\n".join([headline, *candidate_lines])
         elif args.workflow_op == "propose":
             command = list(args.command)
             if command and command[0] == "--":
@@ -1719,7 +1941,7 @@ def main(argv=None):
             "default": "auto",
             "help": "validated folder profile override (default: auto)",
         }),
-        help="hard-bounded metadata inventory for safe folder discovery")
+        help="bounded folder inventory")
     add("search", cmd_search,
         (["query"], {"help": "literal text to find (use --regex for a pattern)"}),
         (["path"], {"nargs": "?", "default": "."}),
@@ -1755,7 +1977,7 @@ def main(argv=None):
             "default": "auto",
             "help": "validated folder profile override (default: auto)",
         }),
-        help="killable, bounded content/filename search")
+        help="bounded content/name search")
     add("list", cmd_list,
         (["path"], {"nargs": "?", "default": "."}),
         (["--kind"], {"choices": ["all", "file", "directory"],
@@ -1784,7 +2006,7 @@ def main(argv=None):
             "default": "auto",
             "help": "validated folder profile override (default: auto)",
         }),
-        help="killable, bounded file/directory listing")
+        help="bounded file listing")
     add("checkout", cmd_checkout, (["path"], {}),
         (["control_target"], {
             "nargs": "?", "default": "", "metavar": "PATH_OR_TRANSACTION",
@@ -1856,7 +2078,7 @@ def main(argv=None):
     )
     file_parser = sub.add_parser(
         "file", parents=[common],
-        help="bounded reads and recoverable text-file writes",
+        help="bounded file operations",
         description=("Exact text-file operations. Choose an operation, then run "
                      "`agw file <operation> --help` for only its arguments."),
     )
@@ -2003,11 +2225,101 @@ def main(argv=None):
                           "help": "validate only; no execution"}),
         (["command"], {"nargs": argparse.REMAINDER, "metavar": "...",
                         "help": "command after --"}),
-        help="run a command with declared, recoverable outputs",
+        help="run with declared recoverable outputs",
     )
+    run_plan_parser = sub.add_parser(
+        "run-plan", parents=[common], help="create or apply a hash-bound run plan",
+        description="Fresh, canonical, single-use plans for bounded local scripts.",
+    )
+    run_plan_sub = run_plan_parser.add_subparsers(
+        dest="plan_op", required=True, metavar="operation",
+    )
+    run_plan_create = run_plan_sub.add_parser(
+        "create", parents=[common], help="create an inert single-use run plan",
+        description=("Create a canonical run plan from duplicate-key-safe JSON and "
+                     "write it through the recoverable Guardrails file boundary."),
+    )
+    run_plan_create.add_argument(
+        "--spec-file", required=True,
+        help="JSON object describing command, mode, artifacts, and isolation",
+    )
+    run_plan_create.add_argument("--plan-file", required=True, help="plan output path")
+    run_plan_create.add_argument(
+        "--expected-plan-file-hash", default="absent",
+        help="expected current SHA-256 of the plan file, or absent",
+    )
+    run_plan_create.set_defaults(fn=cmd_run_plan)
+    run_plan_apply = run_plan_sub.add_parser(
+        "apply", parents=[common], help="validate, claim once, and apply a run plan",
+        description=("Require the canonical plan hash, then validate provider support "
+                     "before the single-use claim and any execution."),
+    )
+    run_plan_apply.add_argument("--plan-file", required=True, help="run-plan JSON file")
+    run_plan_apply.add_argument(
+        "--expected-plan-hash", required=True,
+        help="exact canonical plan_sha256 recorded inside the plan",
+    )
+    run_plan_apply.add_argument(
+        "--dry-run", action="store_true",
+        help="validate only; do not claim, execute, or publish",
+    )
+    run_plan_apply.set_defaults(fn=cmd_run_plan)
+
+    publish_plan_parser = sub.add_parser(
+        "publish-plan", parents=[common],
+        help="staged batch publication plans",
+        description=("Hash-bound recoverable-set publication with sequential "
+                     "per-file visibility."),
+    )
+    publish_plan_sub = publish_plan_parser.add_subparsers(
+        dest="plan_op", required=True, metavar="operation",
+    )
+    publish_plan_create = publish_plan_sub.add_parser(
+        "create", parents=[common], help="create an inert staged publication plan",
+    )
+    publish_plan_create.add_argument(
+        "--operations-file", required=True,
+        help="duplicate-key-safe JSON array of staged/target operations",
+    )
+    publish_plan_create.add_argument("--plan-file", required=True, help="plan output path")
+    publish_plan_create.add_argument("--cwd", default="", help="base for relative paths")
+    publish_plan_create.add_argument(
+        "--expected-plan-file-hash", default="absent",
+        help="expected current SHA-256 of the plan file, or absent",
+    )
+    publish_plan_create.set_defaults(fn=cmd_publish_plan)
+    publish_plan_apply = publish_plan_sub.add_parser(
+        "apply", parents=[common], help="apply an exact staged publication plan",
+    )
+    publish_plan_apply.add_argument("--plan-file", required=True, help="publish-plan JSON file")
+    publish_plan_apply.add_argument(
+        "--expected-plan-hash", required=True,
+        help="exact canonical plan_sha256 recorded inside the plan",
+    )
+    publish_plan_apply.add_argument(
+        "--dry-run", action="store_true",
+        help="validate candidates and preconditions without publication",
+    )
+    publish_plan_apply.set_defaults(fn=cmd_publish_plan)
+    publish_plan_recover = publish_plan_sub.add_parser(
+        "recover", parents=[common],
+        help="inspect or finalize one PREPARED publication",
+        description=("No automatic roll-forward. Inspect is read-only; rollback "
+                     "fails until a crash-resumable journal exists; finalize-observed "
+                     "records only an authenticated all-after state."),
+    )
+    publish_plan_recover.add_argument(
+        "transaction_id", help="prepared publication transaction id",
+    )
+    publish_plan_recover.add_argument(
+        "--action", dest="recovery_action", required=True,
+        choices=["inspect", "rollback", "finalize-observed"],
+        help="inspect, unavailable rollback, or all-after finalization",
+    )
+    publish_plan_recover.set_defaults(fn=cmd_publish_plan)
     workflow_parser = sub.add_parser(
         "workflow", parents=[common],
-        help="inspect or explicitly trust script output contracts",
+        help="trusted script contracts",
         description="Hash-bound script contracts; choose an operation for leaf help.",
     )
     workflow_sub = workflow_parser.add_subparsers(
@@ -2132,7 +2444,7 @@ def main(argv=None):
         (["--cwd"], {"default": "", "help": "show only checkouts under this folder"}),
         (["--stale-days"], {"type": float, "default": 30.0,
                              "help": "age threshold used for stale warnings"}),
-        help="show scoped checkouts and incomplete transactions")
+        help="show checkout/recovery status")
     add("log", cmd_log, (["-n"], {"type": int, "default": 20}),
         help="show recent recovery operations")
     add("doctor", cmd_doctor, help="check environment, policy, and recovery health")
@@ -2142,7 +2454,7 @@ def main(argv=None):
         help="argument schema")
     office_parser = sub.add_parser(
         "office", parents=[common],
-        help="guarded Office reads and atomic edits",
+        help="guarded Office operations",
         description="Guarded Office operations; choose one for leaf help.",
     )
     office_sub = office_parser.add_subparsers(

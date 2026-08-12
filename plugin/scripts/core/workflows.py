@@ -40,6 +40,12 @@ DIAGNOSTIC_REASON_CODES = frozenset({
     "arguments_mismatch",
     "parameters_mismatch",
 })
+_DIAGNOSTIC_CLASS_ORDER = {
+    "exact": 0,
+    "parameterizable": 1,
+    "near": 2,
+    "incompatible": 3,
+}
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_WORKFLOWS = 256
 MAX_OUTPUTS = 128
@@ -1341,9 +1347,15 @@ def _normalized_command_diagnostic(normalized: dict) -> dict:
         "runtime": normalized["runtime"],
         "script": normalized["script"],
         "script_sha256": normalized["script_sha256"],
-        "args": list(normalized["args"]),
         "argument_count": len(normalized["args"]),
         "arguments_sha256": _arguments_sha256(normalized["args"]),
+        "argument_hashes": [
+            {
+                "index": index,
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            }
+            for index, value in enumerate(normalized["args"])
+        ],
     }
 
 
@@ -1359,6 +1371,102 @@ def _candidate_metadata(manifest: dict) -> dict:
         "argument_count": len(command.get("args", [])),
         "parameter_count": len(manifest.get("parameters", {})),
     }
+
+
+def _parameter_constraint_metadata(spec: dict) -> dict:
+    """Return useful parameter constraints without copying approved values."""
+    kind = spec["type"]
+    if kind == "enum":
+        result = {"type": kind, "allowed_count": len(spec["values"])}
+        if spec.get("source_sha256"):
+            result["source_sha256"] = spec["source_sha256"]
+        return result
+    if kind == "regex":
+        return {"type": kind, "pattern": spec["pattern"]}
+    if kind == "integer":
+        return {
+            "type": kind, "minimum": spec["minimum"], "maximum": spec["maximum"],
+        }
+    return {
+        "type": kind, "root": spec["root"],
+        "must_exist": spec["must_exist"], "kind": spec["kind"],
+    }
+
+
+def _inferred_parameter_metadata(manifest: dict, values: dict) -> list[dict]:
+    """Describe inferred values without placing their plaintext in a candidate."""
+    contract = manifest["command"].get("args", [])
+    result = []
+    for name in sorted(values):
+        source_indexes = [
+            index for index, item in enumerate(contract)
+            if isinstance(item, dict) and item.get("parameter") == name
+        ]
+        result.append({
+            "name": name,
+            "source_indexes": source_indexes,
+            "constraints": _parameter_constraint_metadata(manifest["parameters"][name]),
+            "value_sha256": hashlib.sha256(values[name].encode("utf-8")).hexdigest(),
+        })
+    return result
+
+
+def _candidate_class(manifest: dict, normalized: Optional[dict],
+                     reasons: list[dict]) -> str:
+    if normalized is None:
+        return "incompatible"
+    if not reasons:
+        return "parameterizable" \
+            if manifest.get("schema") == PARAMETERIZED_SCHEMA else "exact"
+    identity_codes = {
+        "runtime_mismatch", "script_path_mismatch", "script_hash_mismatch",
+    }
+    if not any(reason["code"] in identity_codes for reason in reasons):
+        return "near"
+    return "incompatible"
+
+
+def _resolved_identity(resolved: dict, cwd: str) -> dict:
+    """Select the complete run identity that recommendation revalidation binds."""
+    command = normalize_command(resolved["command"], cwd)
+    return {
+        "command": {
+            "runtime": command["runtime"],
+            "script": os.path.normcase(command["script"]),
+            "script_sha256": command["script_sha256"],
+            "args": command["args"],
+        },
+        "script_sha256": resolved["script_sha256"],
+        "parameters": resolved["parameters"],
+        "outputs": resolved["outputs"],
+        "roots": resolved["output_roots"],
+        "patterns": resolved["output_patterns"],
+        "states": resolved["expected_hashes"],
+        "optional_outputs": resolved["optional_outputs"],
+    }
+
+
+def _revalidated_recommendation(workflow_id: str, manifest: dict,
+                                command: list[str], cwd: str) -> tuple[list[str], dict, str]:
+    """Resolve twice around canonical reconstruction; never execute either argv."""
+    try:
+        first = resolve_run(workflow_id, command, cwd)
+    except WorkflowError:
+        return [], {}, "resolution_failed"
+    if manifest.get("schema") == MANIFEST_SCHEMA_V1:
+        return [], {}, "reconstruction_unavailable"
+    try:
+        second = resolve_run(
+            workflow_id, [], cwd,
+            parameters=first["parameters"] if manifest.get("schema") == PARAMETERIZED_SCHEMA
+            else None,
+        )
+        if _resolved_identity(first, cwd) != _resolved_identity(second, cwd):
+            return [], {}, "identity_changed"
+    except WorkflowError:
+        return [], {}, "revalidation_failed"
+    return ["agw", "run", "--workflow", workflow_id, "--", *second["command"]], \
+        first["parameters"], ""
 
 
 def _candidate_mismatch_reasons(manifest: dict, normalized: dict, cwd: str) -> list[dict]:
@@ -1416,7 +1524,7 @@ def _candidate_mismatch_reasons(manifest: dict, normalized: dict, cwd: str) -> l
 def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
     """Explain how every trusted-store candidate compares with one command.
 
-    Raw argument values are present only once in ``normalized``.  Candidate
+    Serialized normalized arguments are represented only by counts and hashes.  Candidate
     mismatch records use counts and hashes so diagnostics do not duplicate
     potentially confidential argument or parameter values.
     """
@@ -1437,6 +1545,11 @@ def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
                 "record": item.get("record", ""),
                 "verified": False,
                 "matched": False,
+                "candidate_class": "incompatible",
+                "confidence": "none",
+                "remaining_differences": ["unverified_record"],
+                "remaining_difference_count": 1,
+                "inferred_parameters": [],
                 "mismatch_reasons": [_diagnostic_reason(
                     "unverified_record", "trusted workflow record could not be verified",
                 )],
@@ -1449,6 +1562,11 @@ def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
                 "id": item["id"],
                 "verified": False,
                 "matched": False,
+                "candidate_class": "incompatible",
+                "confidence": "none",
+                "remaining_differences": ["invalid_record"],
+                "remaining_difference_count": 1,
+                "inferred_parameters": [],
                 "mismatch_reasons": [_diagnostic_reason(
                     "invalid_record", "trusted workflow record failed verification",
                     cause_code=exc.error_code,
@@ -1466,9 +1584,50 @@ def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
             reasons = _candidate_mismatch_reasons(manifest, normalized, cwd)
         candidate["matched"] = not reasons
         candidate["mismatch_reasons"] = reasons
+        candidate["candidate_class"] = _candidate_class(manifest, normalized, reasons)
+        candidate["confidence"] = "medium" \
+            if candidate["candidate_class"] == "near" else "none"
+        candidate["remaining_differences"] = [reason["code"] for reason in reasons]
+        candidate["remaining_difference_count"] = len(reasons)
+        candidate["inferred_parameters"] = []
+        candidate["_manifest"] = manifest
         candidates.append(candidate)
         if candidate["matched"]:
             matches.append(candidate["id"])
+
+    revalidated = []
+    if normalized is not None:
+        for candidate in candidates:
+            if candidate.get("candidate_class") not in {"exact", "parameterizable"}:
+                continue
+            argv, parameters, difference = _revalidated_recommendation(
+                candidate["id"], candidate["_manifest"], command, cwd,
+            )
+            if difference:
+                candidate["remaining_differences"].append(difference)
+                candidate["remaining_difference_count"] += 1
+                continue
+            candidate["confidence"] = "high"
+            if candidate["candidate_class"] == "parameterizable":
+                candidate["inferred_parameters"] = _inferred_parameter_metadata(
+                    candidate["_manifest"], parameters,
+                )
+            revalidated.append((candidate["id"], argv))
+
+    candidates.sort(key=lambda candidate: (
+        _DIAGNOSTIC_CLASS_ORDER[candidate["candidate_class"]],
+        candidate["remaining_difference_count"],
+        candidate.get("id", candidate.get("record", "")),
+    ))
+    for rank, candidate in enumerate(candidates, 1):
+        candidate["rank"] = rank
+        candidate["rank_key"] = [
+            _DIAGNOSTIC_CLASS_ORDER[candidate["candidate_class"]],
+            candidate["remaining_difference_count"],
+            candidate.get("id", candidate.get("record", "")),
+        ]
+        candidate.pop("_manifest", None)
+    recommended_argv = revalidated[0][1] if len(revalidated) == 1 else []
     return {
         "schema": DIAGNOSTIC_SCHEMA,
         "ok": normalization_error is None,
@@ -1477,6 +1636,12 @@ def diagnose_matching_workflows(command: list[str], cwd: str) -> dict:
         "candidate_count": len(candidates),
         "candidates": candidates,
         "matches": matches,
+        "recommended_argv": recommended_argv,
+        "suggested_argv": {
+            "deprecated": True,
+            "replacement": "recommended_argv",
+            "value_included": False,
+        },
     }
 
 

@@ -4,7 +4,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 import file_ops
+import publication
 from core import store
 
 
@@ -38,6 +41,28 @@ def test_schema_serializes_list_defaults_for_run():
     by_name = {item["name"]: item for item in data["arguments"]}
     assert by_name["output"]["default"] == []
     assert by_name["timeout_seconds"]["default"] == 300.0
+
+
+def test_schema_projects_plan_create_and_apply_contracts():
+    created = json.loads(_run("--json", "schema", "run-plan", "create").stdout)
+    by_name = {item["name"]: item for item in created["arguments"]}
+    assert created["schema"] == "agw-command-schema/v1"
+    assert by_name["spec_file"]["required"] is True
+    assert by_name["expected_plan_file_hash"]["default"] == "absent"
+
+    applied = json.loads(_run("--json", "schema", "publish-plan", "apply").stdout)
+    by_name = {item["name"]: item for item in applied["arguments"]}
+    assert by_name["expected_plan_hash"]["required"] is True
+    assert by_name["dry_run"]["default"] is False
+
+    recovery = json.loads(_run(
+        "--json", "schema", "publish-plan", "recover"
+    ).stdout)
+    by_name = {item["name"]: item for item in recovery["arguments"]}
+    assert by_name["recovery_action"]["required"] is True
+    assert by_name["recovery_action"]["choices"] == [
+        "inspect", "rollback", "finalize-observed",
+    ]
 
 
 def test_json_argument_errors_have_a_stable_envelope():
@@ -80,6 +105,204 @@ def test_apply_plan_accepts_named_plan_file(tmp_path):
     assert data["changed"] == 1
     assert target.read_text(encoding="utf-8") == "safe\n"
     assert data["operations"][0]["recovery"]["rollback_available"] is True
+
+
+def test_publish_plan_create_and_apply_are_hash_bound_and_recoverable(tmp_path):
+    staged = tmp_path / "staged.bin"
+    target = tmp_path / "target.bin"
+    operations = tmp_path / "operations.json"
+    plan_file = tmp_path / "publish-plan.json"
+    staged.write_bytes(b"new bytes")
+    operations.write_text(json.dumps([{
+        "staged": str(staged), "target": str(target),
+        "expected_hash": "absent", "validation": "raw",
+    }]), encoding="utf-8")
+
+    created = json.loads(_run(
+        "--json", "publish-plan", "create",
+        "--operations-file", operations, "--plan-file", plan_file,
+        "--expected-plan-file-hash", "absent",
+    ).stdout)
+    assert created["plan_file_recovery"]["rollback_available"] is True
+
+    applied = json.loads(_run(
+        "--json", "publish-plan", "apply", "--plan-file", plan_file,
+        "--expected-plan-hash", created["plan_sha256"],
+    ).stdout)
+    assert applied["state"] == "COMMITTED"
+    assert applied["atomicity"] == "recoverable-set"
+    assert applied["visibility"] == "per-file-sequential"
+    assert target.read_bytes() == b"new bytes"
+
+
+def test_publish_plan_recovery_requires_explicit_safe_action(tmp_path):
+    result = _run(
+        "--json", "publish-plan", "recover", "prepared-id", check=False,
+    )
+    assert result.returncode == 2
+    assert "--action" in result.stderr
+
+
+def test_publish_plan_recovery_dispatches_inspect_and_explicit_actions(
+        monkeypatch, capsys):
+    import agw as agw_cli
+
+    calls = []
+    monkeypatch.setattr(
+        agw_cli.publication, "inspect_prepared_transaction",
+        lambda transaction_id: {
+            "transaction_id": transaction_id, "state": "PREPARED",
+            "classification": "mixed", "recoverable": True,
+        },
+    )
+    monkeypatch.setattr(
+        agw_cli.publication, "recover_prepared_transaction",
+        lambda transaction_id, action: calls.append((transaction_id, action)) or {
+            "transaction_id": transaction_id,
+            "state": "ROLLED_BACK" if action == "rollback" else "COMMITTED",
+        },
+    )
+    for action in ("inspect", "finalize-observed"):
+        args = type("Args", (), {
+            "plan_op": "recover", "transaction_id": "prepared-id",
+            "recovery_action": action, "json": True,
+        })()
+        agw_cli.cmd_publish_plan(args)
+        assert json.loads(capsys.readouterr().out)["transaction_id"] == "prepared-id"
+    assert calls == [("prepared-id", "finalize-observed")]
+
+
+def test_publish_plan_cli_rollback_unavailable_preserves_all_state(
+        tmp_path, monkeypatch, capsys):
+    import agw as agw_cli
+
+    stages = [tmp_path / "stage-a.bin", tmp_path / "stage-b.bin"]
+    targets = [tmp_path / "target-a.bin", tmp_path / "target-b.bin"]
+    for index, (stage, target) in enumerate(zip(stages, targets)):
+        stage.write_bytes(f"new-{index}".encode())
+        target.write_bytes(f"old-{index}".encode())
+    plan = publication.build_publish_plan([{
+        "stage": str(stage), "target": str(target),
+        "expected_hash": store.file_sha256(str(target)), "validation": "raw",
+    } for stage, target in zip(stages, targets)])
+    original_replace = file_ops.replace_with_retry
+    calls = 0
+
+    def interrupt_second(source, target, retry_seconds=5.0):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt()
+        return original_replace(source, target, retry_seconds)
+
+    monkeypatch.setattr(file_ops, "replace_with_retry", interrupt_second)
+    with pytest.raises(KeyboardInterrupt):
+        publication.publish_staged_batch(
+            plan, expected_plan_hash=plan["plan_sha256"],
+        )
+    prepared = next(
+        item for item in reversed(store.oplog_read())
+        if item.get("op") == "file-transaction-prepared"
+    )
+
+    home = Path(store.agw_home())
+    target_before = [path.read_bytes() for path in targets]
+    store_before = {
+        path.relative_to(home).as_posix(): path.read_bytes()
+        for path in home.rglob("*") if path.is_file()
+    }
+    args = type("Args", (), {
+        "plan_op": "recover", "transaction_id": prepared["transaction_id"],
+        "recovery_action": "rollback", "json": True,
+    })()
+    with pytest.raises(SystemExit) as caught:
+        agw_cli.cmd_publish_plan(args)
+    assert caught.value.code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "prepared_rollback_unavailable"
+    assert error["details"]["required_capability"] == \
+        "crash_resumable_prepared_rollback_journal"
+    assert error["details"]["fallback"] is False
+    assert error["details"]["recovery_state"] == "PREPARED"
+    assert [path.read_bytes() for path in targets] == target_before
+    assert {
+        path.relative_to(home).as_posix(): path.read_bytes()
+        for path in home.rglob("*") if path.is_file()
+    } == store_before
+
+
+def test_run_plan_immutable_execution_unavailable_is_structured_and_unclaimed(tmp_path):
+    script = tmp_path / "reader.py"
+    spec_file = tmp_path / "run-spec.json"
+    plan_file = tmp_path / "run-plan.json"
+    script.write_text("print('read only')\n", encoding="utf-8")
+    spec_file.write_text(json.dumps({
+        "command": [sys.executable, str(script)],
+        "mode": "stdout-read-only", "cwd": str(tmp_path),
+        "isolation": "read-only", "provider": "installed",
+    }), encoding="utf-8")
+    created = json.loads(_run(
+        "--json", "run-plan", "create", "--spec-file", spec_file,
+        "--plan-file", plan_file, "--expected-plan-file-hash", "absent",
+    ).stdout)
+
+    result = _run(
+        "--json", "run-plan", "apply", "--plan-file", plan_file,
+        "--expected-plan-hash", created["plan_sha256"], check=False,
+    )
+    assert result.returncode == 4
+    data = json.loads(result.stdout)
+    assert data["outcome"] == "environment_failure"
+    assert data["error_code"] == "immutable_execution_unavailable"
+    assert data["execution_started"] is False
+    assert "claim_id" not in data
+
+
+def test_workflow_match_omits_nested_raw_diagnostic_duplicates(monkeypatch, capsys):
+    import agw as agw_cli
+
+    private = "private-runtime-value"
+    diagnostics = {
+        "matches": ["example.private"], "candidate_count": 1,
+        "recommended_argv": ["agw", "run", "--workflow", "example.private",
+                             "--", "python", "script.py", private],
+        "candidates": [{
+            "id": "example.private", "candidate_class": "parameterizable",
+            "inferred_parameters": [{"name": "mode", "value_sha256": "a" * 64}],
+        }],
+    }
+    monkeypatch.setattr(
+        agw_cli.workflows, "diagnose_matching_workflows",
+        lambda command, cwd: diagnostics,
+    )
+    args = type("Args", (), {
+        "workflow_op": "match", "command": ["--", "python", "script.py", private],
+        "cwd": "", "json": True,
+    })()
+    agw_cli.cmd_workflow(args)
+    data = json.loads(capsys.readouterr().out)
+    assert data["recommended_argv"][-1] == private
+    assert data["suggested_argv"] == {
+        "deprecated": True,
+        "replacement": "recommended_argv",
+        "value_included": False,
+    }
+    assert "command" not in data
+    assert "normalized" not in data
+    assert "diagnostics" not in data
+    assert json.dumps(data["candidates"]).count(private) == 0
+    assert json.dumps(data).count(private) == 1
+
+
+def test_plan_json_rejects_duplicate_keys(tmp_path):
+    operations = tmp_path / "operations.json"
+    operations.write_text('[{"staged":"a","staged":"b","target":"c"}]', encoding="utf-8")
+    result = _run(
+        "--json", "publish-plan", "create", "--operations-file", operations,
+        "--plan-file", tmp_path / "plan.json", check=False,
+    )
+    assert result.returncode != 0
+    assert "duplicate JSON key" in json.loads(result.stderr)["error"]["message"]
 
 
 def test_transaction_undo_cli_restores_exact_file_mutation(tmp_path):

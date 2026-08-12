@@ -335,6 +335,23 @@ def test_hard_denial_feedback_is_actionable_and_tells_agent_to_explain():
     assert "Do not quote the raw command" in feedback
 
 
+def test_denial_feedback_renders_structured_argv_as_new_inert_operation(tmp_path):
+    from core import remediation
+
+    event = events.ToolEvent(
+        kind=events.EXEC, tool="Bash", command="rm report.txt", cwd=str(tmp_path),
+    )
+    legacy = events.Decision(events.DENY, rule_id="builtin:rm")
+    legacy.safe_next = remediation.for_event(legacy, event)
+    feedback = presentation.build_denial_feedback(
+        GuardrailDecision.from_legacy(legacy)
+    )
+    assert 'Recommended argv' in feedback
+    assert '"agw", "archive"' in feedback
+    assert "submit as a new operation for policy evaluation" in feedback
+    assert "rm report.txt" not in feedback
+
+
 def test_declined_approval_tells_agent_not_to_nag():
     decision = GuardrailDecision(
         events.ASK, reason="Sensitive read", rule_id="builtin:secret-file",

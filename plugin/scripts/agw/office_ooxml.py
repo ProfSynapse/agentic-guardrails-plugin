@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import posixpath
 import tempfile
 import zipfile
 from xml.etree import ElementTree
+
+import office_opc
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -72,29 +73,26 @@ def rewrite_parts(path: str, replacements: dict[str, bytes]) -> None:
                 pass
 
 
-def _resolve_relationship(base_part: str, target: str) -> str:
-    value = str(target or "").replace("\\", "/")
-    if not value or value.startswith(("/", "\\")):
-        raise OoxmlError("OOXML relationship target is invalid")
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(base_part), value))
-    if resolved.startswith("../") or "/../" in f"/{resolved}/":
-        raise OoxmlError("OOXML relationship escapes the package")
-    return resolved
-
-
 def _relationship_map(package: zipfile.ZipFile, base_part: str) -> dict[str, str]:
-    directory, name = posixpath.split(base_part)
-    rels_part = posixpath.join(directory, "_rels", name + ".rels")
+    rels_part = office_opc.relationship_part_for(base_part)
     root = _xml(package, rels_part)
     result = {}
     for relationship in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
-        if relationship.attrib.get("TargetMode", "").casefold() == "external":
-            continue
         rel_id = relationship.attrib.get("Id", "")
         if rel_id:
-            result[rel_id] = _resolve_relationship(
-                base_part, relationship.attrib.get("Target", "")
+            resolution = office_opc.resolve_relationship(
+                package.namelist(), rels_part, rel_id,
+                relationship.attrib.get("Target", ""),
+                relationship.attrib.get("TargetMode", ""),
+                owner_part=base_part,
             )
+            if resolution.reason == "external_target_not_opened":
+                continue
+            if not resolution.usable:
+                if resolution.reason == "package_root_escape":
+                    raise OoxmlError("OOXML relationship escapes the package")
+                raise OoxmlError("OOXML relationship target is invalid")
+            result[rel_id] = resolution.actual_part
     return result
 
 

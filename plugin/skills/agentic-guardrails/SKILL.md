@@ -8,42 +8,42 @@ description: >
 
 # Agentic Guardrails
 
-Use `agw`; `agw.cmd` is compatibility-only. Load only exact host-supplied paths;
+Use `agw`; `agw.cmd` is compatibility-only. Use exact host-supplied paths;
 never infer or search plugin-cache paths. If `agw` is unrecognized, ask the user
 to approve Guardrails hooks in the host UI and start a new task.
 Never use a cache path or change PATH.
 
-## Discover commands progressively
+## Progressive discovery
 
 CLI help is authoritative. Request only the narrowest unknown scope: `agw
 --help`, `<verb> --help`, or `office <operation> --help`.
 
-Prefer compact JSON and bounded reads. On PowerShell, pass fragile JSON by stdin
-or file. For `file read`, omit `--max-bytes` normally and use exact returned
-continuations; never guess a larger budget.
+Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
 ## Route by intent
 
-| Intent | Route | Read only if needed |
+| Intent | Route | Reference |
 |---|---|---|
-| Remove, unlink a junction, recover, undo, or inspect history | Relevant filesystem verb help | [recovery.md](references/recovery.md) |
-| Read, create, or change text | Exact `file <operation> --help` | [text-files.md](references/text-files.md) |
-| Change dependent text files together | `file plan --help`, then `file apply-plan --help` | None |
-| Run a local script | `workflow match -- <command>`; otherwise `run --help` | [recovery.md](references/recovery.md) |
-| Run a matched workflow | `run --workflow ID`; add reviewed `--param NAME=VALUE` | [trusted-workflows.md](references/trusted-workflows.md) |
-| Targeted Office read or edit | Exact `office <operation> --help` | [office.md](references/office.md) |
-| Large Office rewrite | Style-preserving checkout/publish verb help | [office.md](references/office.md) |
-| Publish a validated staged artifact | `publish-file --help` | [synced-folders.md](references/synced-folders.md) |
-| Scan, list, or search a folder | Relevant verb help | [synced-folders.md](references/synced-folders.md) |
-| `.gdoc`, `.gsheet`, or `.gslides` | Connector/export workflow | [google-stubs.md](references/google-stubs.md) |
-| Environment, recovery, or policy report | `doctor --help` and status help | [diagnostics.md](references/diagnostics.md) |
+| Remove, recover, undo, history | Relevant verb help | [recovery](references/recovery.md) |
+| Read or change text | `file <operation> --help` | [text](references/text-files.md) |
+| Dependent text changes | `file plan`, then `file apply-plan` | — |
+| Local script | `workflow match -- <command>`; else `run --help` | [workflows](references/trusted-workflows.md) |
+| Single-use script plan | `run-plan create`, then `apply` | [recovery](references/recovery.md) |
+| Office work | Exact `office <operation> --help` | [Office](references/office.md) |
+| Large Office rewrite | Checkout/publish help | [Office](references/office.md) |
+| Staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
+| Folder discovery | Scan/list/search help | [synced](references/synced-folders.md) |
+| Google stub | Connector/export | [Google stubs](references/google-stubs.md) |
+| Health/report | `doctor` and `status` help | [diagnostics](references/diagnostics.md) |
 
-Exact run outputs do not enumerate siblings. Repeated scripts need an approved,
-hash-bound workflow; observed roots detect sidecars but are not pre-images.
-Parameterized workflows accept values only in typed, reviewed argument slots;
-never append unbound flags or query text after the trusted command.
-`run --dry-run` is contract-only. For multi-file work, retain and apply the exact
-plan hash instead of issuing independent mutations.
+Exact outputs do not enumerate siblings. Observed roots detect sidecars but are
+not pre-images. Trusted parameters belong only in reviewed typed slots.
+`run --dry-run` is contract-only. Retain and apply exact plan hashes.
+
+Run plans are single-use and consumed after claim. Read-only execution requires
+real provider enforcement. Publish batches are recoverable sets with per-file
+sequential visibility. PREPARED supports inspect or finalize-observed. Rollback
+awaits a crash-resumable journal and fails without writes; roll-forward is unavailable.
 
 ## Invariants
 

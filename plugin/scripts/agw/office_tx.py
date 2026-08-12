@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
 from core import profiles, store
+import office_opc
 import retention_config
 
 MAX_PACKAGE_BYTES = 32 * 1024 * 1024
@@ -806,6 +807,9 @@ class _Relationship:
     target: str
     target_mode: str
     resolved_target: str = ""
+    actual_target: str = ""
+    classification: str = ""
+    resolution_reason: str = ""
 
 
 @dataclass
@@ -882,36 +886,7 @@ def _part_identity(name: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def _relationship_owner(relationship_part: str) -> Optional[str]:
-    if relationship_part.casefold() == "_rels/.rels":
-        return None
-    directory, filename = posixpath.split(relationship_part)
-    if posixpath.basename(directory).casefold() != "_rels" or not filename.endswith(".rels"):
-        return ""
-    owner_directory = posixpath.dirname(directory)
-    owner_name = filename[:-5]
-    return posixpath.join(owner_directory, owner_name) if owner_directory else owner_name
-
-
-def _resolve_relationship_target(
-    owner_part: Optional[str], target: str,
-) -> tuple[str, Optional[str]]:
-    parsed = urlsplit(target)
-    if parsed.scheme or parsed.netloc:
-        return "", "internal relationship target must not contain a URI authority"
-    raw_path = unquote(parsed.path)
-    if not raw_path or "\\" in raw_path or "\x00" in raw_path:
-        return "", "internal relationship target is empty or unsafe"
-    if any(ord(character) < 32 for character in raw_path):
-        return "", "internal relationship target contains a control character"
-    if raw_path.startswith("/"):
-        candidate = raw_path.lstrip("/")
-    else:
-        base = posixpath.dirname(owner_part) if owner_part else ""
-        candidate = posixpath.join(base, raw_path)
-    normalized = posixpath.normpath(candidate)
-    if normalized in {"", ".", ".."} or normalized.startswith("../"):
-        return "", "internal relationship target escapes the package root"
-    return normalized, None
+    return office_opc.relationship_owner(relationship_part)
 
 
 def _validate_part_identities(context: _ValidationContext) -> list[dict]:
@@ -1102,10 +1077,11 @@ def _validate_relationships(context: _ValidationContext) -> list[dict]:
                     "relationships part contains an unsupported element", part=part,
                 ))
                 continue
-            relationship_id = node.attrib.get("Id", "").strip()
+            raw_relationship_id = node.attrib.get("Id", "")
+            relationship_id = raw_relationship_id.strip()
             relationship_type = node.attrib.get("Type", "").strip()
-            target = node.attrib.get("Target", "").strip()
-            target_mode = node.attrib.get("TargetMode", "").strip()
+            target = node.attrib.get("Target", "")
+            target_mode = node.attrib.get("TargetMode", "")
             if not relationship_id:
                 issues.append(_validation_issue(
                     "opc_relationship_id_missing",
@@ -1136,29 +1112,41 @@ def _validate_relationships(context: _ValidationContext) -> list[dict]:
                     "relationship TargetMode must be External when present",
                     part=part, relationship_id=relationship_id,
                 ))
-            resolved_target = ""
-            if target and target_mode != "External":
-                resolved_target, reason = _resolve_relationship_target(owner, target)
-                if reason:
-                    issues.append(_validation_issue(
-                        "opc_relationship_target_unsafe", reason, part=part,
-                        relationship_id=relationship_id, target=target,
-                    ))
-                elif resolved_target not in context.part_names:
-                    issues.append(_validation_issue(
-                        "opc_relationship_target_missing_part",
-                        "relationship target does not exist in the package",
-                        part=part, relationship_id=relationship_id,
-                        target=target, resolved_target=resolved_target,
-                    ))
+            resolution = office_opc.resolve_relationship(
+                context.part_names, part, raw_relationship_id, target, target_mode,
+                owner_part=owner,
+            )
+            resolved_target = resolution.resolved_part
+            actual_target = resolution.actual_part
+            classification = resolution.classification
+            resolution_reason = resolution.reason
+            if (target and classification == office_opc.UNSAFE
+                    and resolution_reason != "invalid_target_mode"):
+                issues.append(_validation_issue(
+                    "opc_relationship_target_unsafe",
+                    "internal relationship target is unsafe", part=part,
+                    relationship_id=relationship_id, target=target,
+                    reason=resolution_reason,
+                ))
+            elif target and classification == office_opc.UNRESOLVED:
+                issues.append(_validation_issue(
+                    "opc_relationship_target_missing_part",
+                    "relationship target does not exist in the package",
+                    part=part, relationship_id=relationship_id,
+                    target=target, resolved_target=resolved_target,
+                    reason=resolution_reason,
+                ))
             context.relationships.append(_Relationship(
                 relationship_part=part,
                 owner_part=owner,
-                relationship_id=relationship_id,
+                relationship_id=raw_relationship_id,
                 relationship_type=relationship_type,
                 target=target,
                 target_mode=target_mode,
                 resolved_target=resolved_target,
+                actual_target=actual_target,
+                classification=classification,
+                resolution_reason=resolution_reason,
             ))
     if root_relationships and not any(
             relationship.owner_part is None
@@ -1312,7 +1300,8 @@ def _validate_macro_coherence(context: _ValidationContext) -> list[dict]:
         if name.casefold() == "xl/vbaproject.bin"
     )
     office_document = next((
-        relationship.resolved_target for relationship in context.relationships
+        relationship.actual_target or relationship.resolved_target
+        for relationship in context.relationships
         if relationship.owner_part is None
         and relationship.relationship_type.endswith(_OFFICE_DOCUMENT_REL)
     ), "xl/workbook.xml")
@@ -1331,7 +1320,7 @@ def _validate_macro_coherence(context: _ValidationContext) -> list[dict]:
                 "VBA project part is missing its required content type", part=part,
             ))
         if not any(
-                relationship.resolved_target == part
+                (relationship.actual_target or relationship.resolved_target) == part
                 for relationship in vba_relationships):
             issues.append(_validation_issue(
                 "excel_macro_relationship_missing",
