@@ -89,6 +89,18 @@ class PreparedRollbackUnavailable(FileOperationError):
     error_code = "prepared_rollback_unavailable"
 
 
+class PreparedRecoveryBlocked(FileOperationError):
+    error_code = "prepared_recovery_blocked"
+
+
+class PreparedFinalizeNotAllAfter(FileOperationError):
+    error_code = "prepared_finalize_not_all_after"
+
+
+class PreparedFinalizeAfterRollbackStarted(FileOperationError):
+    error_code = "prepared_finalize_after_rollback_started"
+
+
 class UndeclaredOutput(FileOperationError):
     error_code = "undeclared_output"
 

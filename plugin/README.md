@@ -285,9 +285,19 @@ during individual atomic replacements. Create writes the inert plan reversibly;
 apply requires its canonical hash. `publish-plan recover TRANSACTION_ID --action
 inspect` authenticates and classifies PREPARED targets without mutation.
 `finalize-observed` records COMMITTED only if every target already has its exact
-after-hash. PREPARED `rollback` returns `prepared_rollback_unavailable` without
-fallback or writes until a crash-resumable rollback journal exists. There is no
-automatic roll-forward, and omitting `--action` fails without mutation.
+after-hash. `rollback` restores authenticated exact before-state and creates its
+bounded process-crash-resumable journal lazily only when needed (up to 64 members
+and 64 KiB); all-before needs no journal or copies. Progressed failures remain a
+pinned, retryable `BLOCKED` recovery requiring attention. Mixed/before finalize
+refusal stays nonterminal. Recovery never runs staged content or commands, never
+rolls forward, and promises neither simultaneous visibility nor full power-loss
+durability. Its guarantee covers accidental AGW process termination on a
+functioning local OS/filesystem with cooperating AGW locks and acknowledged
+writes—not malicious or non-cooperating same-user filesystem race/substitution.
+Path collisions, links/hardlinks, or changes to recorded filesystem identity
+fail closed when detected. Inode reuse caused by non-cooperating same-user
+unlink/recreate is outside this process-crash guarantee. Omitting `--action`
+fails without mutation.
 
 Successful file mutations include an explicit recovery receipt stating whether
 the target existed, whether a pre-image was captured, whether rollback is

@@ -18,6 +18,7 @@ from typing import Callable, Mapping, Optional
 from core import outcomes, recovery_contracts, store
 import file_ops
 import path_safety
+import publication_recovery
 
 
 PUBLISH_PLAN_SCHEMA = "agw-publish-plan/v1"
@@ -600,6 +601,7 @@ def _terminal_record(
     prepared_id: str, state: str, operations: list[dict], *, error: str = "",
     rollback_errors: Optional[list[dict]] = None, recovered: bool = False,
     binding: Optional[Mapping] = None, plan_sha256: str = "",
+    transaction_id: str = "",
 ) -> dict:
     publication = {
         "COMMITTED": outcomes.PublicationOutcome.COMMITTED.value,
@@ -611,7 +613,7 @@ def _terminal_record(
         else outcomes.CompositeOutcome.PROCESS_FAILED.value
     record = outcomes.completed_record({
         "op": "file-transaction-state",
-        "transaction_id": uuid.uuid4().hex,
+        "transaction_id": transaction_id or uuid.uuid4().hex,
         "prepared_transaction_id": prepared_id,
         "state": state,
         "operations": operations,
@@ -630,8 +632,21 @@ def _terminal_record(
     if rollback_errors is not None:
         record["rollback_errors"] = rollback_errors
         record["rolled_back"] = state == "ROLLED_BACK"
-    store.oplog_append(record)
-    return record
+    appended, issues = store.oplog_append(record)
+    if issues:
+        raise file_ops.FileTransactionError(
+            "publication terminal oplog contains malformed evidence"
+        )
+    if appended:
+        return record
+    _prepared, existing = _prepared_transaction(prepared_id)
+    if existing is None or any(
+        existing.get(key) != value for key, value in record.items()
+    ):
+        raise file_ops.FileTransactionError(
+            "publication terminal identifier collision is not an exact duplicate"
+        )
+    return existing
 
 
 def _result(
@@ -843,18 +858,38 @@ def publish_staged_batch(
 
 
 def _prepared_transaction(transaction_id: str) -> tuple[dict, Optional[dict]]:
-    prepared = None
-    terminal = None
+    prepared_records = []
+    terminal_records = []
     for record in store.oplog_read():
         if record.get("op") == "file-transaction-prepared" \
                 and record.get("transaction_id") == transaction_id:
-            prepared = record
+            prepared_records.append(record)
         elif record.get("op") == "file-transaction-state" \
                 and record.get("prepared_transaction_id") == transaction_id:
-            terminal = record
-    if prepared is None:
+            terminal_records.append(record)
+    if not prepared_records:
         raise LookupError(f"no staged publication transaction found: {transaction_id}")
-    return prepared, terminal
+    prepared_hashes = {
+        recovery_contracts.canonical_sha256(record) for record in prepared_records
+    }
+    if len(prepared_hashes) != 1:
+        raise file_ops.FileTransactionError(
+            "prepared publication evidence is conflicting or ambiguous"
+        )
+    prepared = prepared_records[0]
+    if terminal_records:
+        terminal_hashes = {
+            recovery_contracts.canonical_sha256(record) for record in terminal_records
+        }
+        terminal_states = {str(record.get("state") or "") for record in terminal_records}
+        if len(terminal_hashes) != 1 or len(terminal_states) != 1 \
+                or not all(recovery_contracts.publication_terminal_valid(prepared, record)
+                           for record in terminal_records):
+            raise file_ops.FileTransactionError(
+                "publication terminal evidence is conflicting or invalid"
+            )
+        return prepared, terminal_records[0]
+    return prepared, None
 
 
 def _prepared_binding(prepared: Mapping) -> dict:
@@ -870,58 +905,6 @@ def _prepared_binding(prepared: Mapping) -> dict:
     return {key: prepared[key] for key in fields if key in prepared}
 
 
-def _authenticated_prepared_members(prepared: Mapping) -> list[dict]:
-    operations = prepared.get("operations")
-    if not isinstance(operations, list) or not operations:
-        raise file_ops.FileTransactionError("prepared publication has no operations")
-    members = []
-    seen = set()
-    for number, item in enumerate(operations, 1):
-        if not isinstance(item, Mapping) or item.get("number") != number:
-            raise file_ops.FileTransactionError("prepared publication numbering is invalid")
-        target = _absolute_literal(item.get("path"), "prepared target")
-        identity = path_safety.identify(target).unicode_key
-        if target != item.get("path") or identity in seen:
-            raise file_ops.FileTransactionError("prepared target identity is invalid")
-        seen.add(identity)
-        before = _hash_label(item.get("before_hash"), "prepared before hash",
-                             allow_absent=True)
-        after = _hash_label(item.get("after_hash"), "prepared after hash")
-        changed = bool(item.get("changed"))
-        snapshot_id = str(item.get("snapshot_transaction_id") or "")
-        member = {
-            "number": number, "path": target, "before_sha256": before,
-            "after_sha256": after, "snapshot_transaction_id": snapshot_id,
-            "changed": changed, "record": dict(item),
-        }
-        if changed:
-            if not snapshot_id:
-                raise file_ops.FileTransactionError(
-                    "changed prepared member lacks a recovery snapshot"
-                )
-            # This authenticates the committed archive/tombstone, exact source,
-            # and exact before hash without consulting stage/candidate paths.
-            member["snapshot"] = store._verified_snapshot(member)
-        elif before != after:
-            raise file_ops.FileTransactionError(
-                "unchanged prepared member has different before and after hashes"
-            )
-        members.append(member)
-    return members
-
-
-def _classify_target(member: Mapping) -> tuple[str, str]:
-    try:
-        actual = _current_label(member["path"])
-    except Exception as exc:
-        return "unknown", str(exc)
-    if actual == member["before_sha256"]:
-        return "before", actual
-    if actual == member["after_sha256"]:
-        return "after", actual
-    return "other", actual
-
-
 def inspect_prepared_transaction(transaction_id: str) -> dict:
     """Authenticate and classify PREPARED targets without consulting candidates."""
     prepared, terminal = _prepared_transaction(transaction_id)
@@ -932,32 +915,18 @@ def inspect_prepared_transaction(transaction_id: str) -> dict:
         }
     try:
         binding = _prepared_binding(prepared)
-        members = _authenticated_prepared_members(prepared)
+        inspected = publication_recovery.inspect(prepared)
     except Exception as exc:
         return {
             "transaction_id": transaction_id, "state": "PREPARED",
             "classification": "invalid", "members": [], "recoverable": False,
             "error": str(exc),
         }
-    classifications = []
-    for member in members:
-        state, evidence = _classify_target(member)
-        classifications.append({
-            "number": member["number"], "path": member["path"],
-            "classification": state,
-            "actual_hash": evidence if state != "unknown" else "",
-            "error": evidence if state == "unknown" else "",
-            "before_hash": member["before_sha256"],
-            "after_hash": member["after_sha256"],
-        })
-    states = {item["classification"] for item in classifications}
-    overall = next(iter(states)) if len(states) == 1 else (
-        "mixed" if states <= {"before", "after"} else "ambiguous"
-    )
     return {
         "transaction_id": transaction_id, "state": "PREPARED",
-        "classification": overall, "members": classifications,
-        "recoverable": overall in {"before", "after", "mixed"},
+        "classification": inspected["classification"],
+        "members": inspected["members"],
+        "recoverable": inspected["classification"] in {"before", "after", "mixed"},
         "atomicity": ATOMICITY, "visibility": VISIBILITY, **binding,
     }
 
@@ -974,6 +943,9 @@ def _recovery_terminal(
         error=error, rollback_errors=rollback_errors, recovered=True,
         binding=binding,
         plan_sha256=str(prepared.get("plan_sha256") or ""),
+        transaction_id=recovery_contracts.publication_terminal_transaction_id(
+            prepared["transaction_id"], state,
+        ),
     )
 
 
@@ -983,71 +955,72 @@ def recover_prepared_transaction(transaction_id: str, action: str = "rollback") 
         raise file_ops.FileOperationError(
             "prepared recovery action must be rollback or finalize-observed"
         )
+    try:
+        transaction_id = recovery_contracts.exact_transaction_id(
+            transaction_id, field="prepared transaction id",
+        )
+    except ValueError as exc:
+        raise file_ops.FileOperationError(str(exc)) from exc
     prepared, terminal = _prepared_transaction(transaction_id)
     if terminal is not None:
         return terminal
-    if action == "rollback":
-        raise file_ops.PreparedRollbackUnavailable(
-            "PREPARED rollback requires a crash-resumable rollback journal and "
-            "is unavailable; no fallback was attempted",
-            {
-                "transaction_id": prepared["transaction_id"],
-                "required_capability":
-                    "crash_resumable_prepared_rollback_journal",
-                "available": "none",
-                "fallback": False,
-                "process_outcome": outcomes.ProcessOutcome.NOT_APPLICABLE.value,
-                "publication_outcome":
-                    outcomes.PublicationOutcome.NOT_ATTEMPTED.value,
-                "recovery_state": "PREPARED",
-                "operation_outcome": outcomes.CompositeOutcome.PROCESS_FAILED.value,
-                "outcome": outcomes.CompositeOutcome.PROCESS_FAILED.value,
-                "outcome_known": True,
-            },
-        )
     try:
-        initial = inspect_prepared_transaction(transaction_id)
-    except Exception as exc:
-        return _recovery_terminal(
-            prepared, "NEEDS_ATTENTION", error=str(exc), rollback_errors=[],
-        )
-    if initial["classification"] in {"invalid", "ambiguous", "other", "unknown"}:
-        return _recovery_terminal(
-            prepared, "NEEDS_ATTENTION",
-            error="prepared transaction has ambiguous or unauthenticated target state",
-            rollback_errors=[],
-        )
-    try:
-        members = _authenticated_prepared_members(prepared)
-    except Exception as exc:
-        return _recovery_terminal(
-            prepared, "NEEDS_ATTENTION", error=str(exc), rollback_errors=[],
-        )
-    lock_paths = {member["path"] for member in members}
-    with ExitStack() as held_locks:
-        for _, name in sorted(_lock_name(path) for path in lock_paths if path):
-            held_locks.enter_context(store.Lock(name, timeout=10.0))
-        # Re-authenticate snapshots and reclassify under target locks.
+        publication_recovery.preflight(prepared, action)
+    except Exception:
+        # Unlocked evidence is advisory. The authoritative re-read under the
+        # transaction boundary below alone may authorize mutation or terminal
+        # publication.
+        pass
+    # The transaction lock serializes the authoritative oplog re-read, all
+    # target mutation, and the deterministic terminal append.
+    with store.Lock("publication-recovery-" + transaction_id, timeout=10.0):
+        prepared, terminal = _prepared_transaction(transaction_id)
+        if terminal is not None:
+            return terminal
         try:
-            members = _authenticated_prepared_members(prepared)
+            if action == "rollback":
+                recovered = publication_recovery.rollback(
+                    prepared, transaction_lock_held=True,
+                    terminal_writer=lambda state: _recovery_terminal(
+                        prepared, state, rollback_errors=[],
+                    ),
+                    authority_reader=lambda: _prepared_transaction(transaction_id),
+                )
+                return recovered["terminal"]
+            finalized = publication_recovery.finalize_observed(
+                prepared, transaction_lock_held=True,
+                terminal_writer=lambda state: _recovery_terminal(prepared, state),
+                authority_reader=lambda: _prepared_transaction(transaction_id),
+            )
+            return finalized["terminal"]
+        except (file_ops.PreparedRecoveryBlocked,
+                file_ops.PreparedFinalizeNotAllAfter,
+                file_ops.PreparedFinalizeAfterRollbackStarted):
+            raise
         except Exception as exc:
+            # Before a valid recovery journal exists, invalid evidence retains
+            # the legacy deterministic NEEDS_ATTENTION terminal behavior.
+            try:
+                journal = publication_recovery.load_manifest(prepared)
+            except Exception:
+                journal = True
+            if journal:
+                raise file_ops.PreparedRecoveryBlocked(
+                    "prepared recovery evidence or journal is invalid",
+                    {"transaction_id": prepared["transaction_id"],
+                     "recovery_state": "BLOCKED", "cause": str(exc),
+                     "blocked": None, "manifest_revision": 0,
+                     "process_outcome": outcomes.ProcessOutcome.NOT_APPLICABLE.value,
+                     "publication_outcome":
+                         outcomes.PublicationOutcome.NEEDS_ATTENTION.value,
+                     "operation_outcome":
+                         outcomes.CompositeOutcome.PROCESS_FAILED.value,
+                     "outcome": outcomes.CompositeOutcome.PROCESS_FAILED.value,
+                     "outcome_known": True},
+                ) from exc
             return _recovery_terminal(
                 prepared, "NEEDS_ATTENTION", error=str(exc), rollback_errors=[],
             )
-        classified = [_classify_target(member)[0] for member in members]
-        if any(state not in {"before", "after"} for state in classified):
-            return _recovery_terminal(
-                prepared, "NEEDS_ATTENTION",
-                error="prepared target state changed or became ambiguous under lock",
-                rollback_errors=[],
-            )
-        if not all(state == "after" for state in classified):
-            return _recovery_terminal(
-                prepared, "NEEDS_ATTENTION",
-                error="finalize-observed requires every target in exact after-state",
-                rollback_errors=[],
-            )
-        return _recovery_terminal(prepared, "COMMITTED")
 
 
 def recover_staged_batch_publication(transaction_id: str, **_kwargs) -> dict:

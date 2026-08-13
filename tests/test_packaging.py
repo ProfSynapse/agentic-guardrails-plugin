@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -238,6 +238,7 @@ def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugi
         packed_plugin / "scripts" / "agw" / "office_ooxml.py",
         packed_plugin / "scripts" / "agw" / "office_opc.py",
         packed_plugin / "scripts" / "agw" / "publication.py",
+        packed_plugin / "scripts" / "agw" / "publication_recovery.py",
         packed_plugin / "scripts" / "agw" / "run_plans.py",
         packed_plugin / "scripts" / "core" / "outcomes.py",
         packed_plugin / "scripts" / "core" / "remediation.py",
@@ -504,6 +505,31 @@ def test_authoritative_packager_excludes_experimental_audit_v2():
     assert "scripts" not in entries
     assert "scripts/core/auditlog.py" in entries
     assert "scripts/core/auditlog_v2.py" not in entries
+    assert "scripts/agw/publication_recovery.py" in entries
+
+
+def test_shipped_recovery_docs_state_process_crash_threat_boundary():
+    documents = [
+        ROOT / "README.md",
+        SOURCE_PLUGIN / "README.md",
+        SOURCE_PLUGIN / "skills" / "agentic-guardrails" / "references" /
+        "recovery.md",
+    ]
+    for path in documents:
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "accidental AGW" in text
+        assert "functioning local OS/filesystem" in text
+        assert "cooperating AGW locks" in text
+        assert "acknowledged writes" in text
+        assert "same-user filesystem race/substitution" in text
+        assert "full power-loss durability" in text
+        assert "simultaneous" in text
+        assert "links/hardlinks" in text or "links, hardlinks" in text
+        assert "recorded filesystem identity" in text
+        assert "fail closed" in text
+        assert "Inode reuse" in text
+        assert "non-cooperating same-user unlink/recreate" in text
+        assert "outside this process-crash guarantee" in text
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])

@@ -1108,6 +1108,24 @@ def _plan_human(data: dict) -> str:
     return "plan operation completed"
 
 
+def _publication_recovery_human(transaction_id: str, action: str, data: dict) -> str:
+    """Describe observed recovery state without overstating durability."""
+    state = str(data.get("state") or "unknown")
+    if state == "ROLLED_BACK":
+        return (
+            f"publication {transaction_id}: ROLLED_BACK; exact before-state restored "
+            "with per-file-sequential visibility"
+        )
+    if state == "COMMITTED":
+        return (
+            f"publication {transaction_id}: COMMITTED; authenticated all-after "
+            "state recorded"
+        )
+    if state == "NEEDS_ATTENTION":
+        return f"publication {transaction_id}: NEEDS_ATTENTION; manual review required"
+    return f"publication {transaction_id}: {state} after explicit {action} recovery"
+
+
 def cmd_run_plan(args):
     try:
         if args.plan_op == "create":
@@ -1201,11 +1219,36 @@ def cmd_publish_plan(args):
             data = publication.recover_prepared_transaction(
                 args.transaction_id, action=args.recovery_action,
             )
-            human = (
-                f"publication {args.transaction_id}: {data.get('state', 'unknown')} "
-                f"after explicit {args.recovery_action} recovery"
+            human = _publication_recovery_human(
+                args.transaction_id, args.recovery_action, data,
             )
-    except (OSError, LookupError, file_ops.FileOperationError) as exc:
+    except file_ops.PreparedRecoveryBlocked as exc:
+        if getattr(args, "json", False):
+            _plan_error(args, exc)
+        _err(
+            "publication recovery is durably BLOCKED; manual attention or a "
+            f"later authenticated retry is required: {exc}",
+            error_code=exc.error_code, details=exc.details,
+        )
+    except (file_ops.PreparedFinalizeNotAllAfter,
+            file_ops.PreparedFinalizeAfterRollbackStarted) as exc:
+        if getattr(args, "json", False):
+            _plan_error(args, exc)
+        _err(
+            f"publication remains PREPARED; finalize-observed refused: {exc}",
+            error_code=exc.error_code, details=exc.details,
+        )
+    except OSError as exc:
+        if args.plan_op != "recover":
+            _plan_error(args, exc)
+        if getattr(args, "json", False):
+            _plan_error(args, exc)
+        _err(
+            f"publication recovery did not complete; inspect before retrying: {exc}",
+            error_code=getattr(exc, "error_code", "plan_error"),
+            details=getattr(exc, "details", None),
+        )
+    except (LookupError, file_ops.FileOperationError) as exc:
         _plan_error(args, exc)
     _out(args, human, data)
 
@@ -2311,10 +2354,11 @@ def main(argv=None):
     publish_plan_apply.set_defaults(fn=cmd_publish_plan)
     publish_plan_recover = publish_plan_sub.add_parser(
         "recover", parents=[common],
-        help="inspect or finalize one PREPARED publication",
-        description=("No automatic roll-forward. Inspect is read-only; rollback "
-                     "fails until a crash-resumable journal exists; finalize-observed "
-                     "records only an authenticated all-after state."),
+        help="inspect, roll back, or finalize one PREPARED publication",
+        description=("No roll-forward. Inspect is read-only; rollback lazily creates "
+                     "a process-crash-resumable journal; finalize-observed records "
+                     "only an authenticated all-after state. Visibility is "
+                     "per-file-sequential."),
     )
     publish_plan_recover.add_argument(
         "transaction_id", help="prepared publication transaction id",
@@ -2322,7 +2366,7 @@ def main(argv=None):
     publish_plan_recover.add_argument(
         "--action", dest="recovery_action", required=True,
         choices=["inspect", "rollback", "finalize-observed"],
-        help="inspect, unavailable rollback, or all-after finalization",
+        help="inspect, restore exact before-state, or finalize exact all-after state",
     )
     publish_plan_recover.set_defaults(fn=cmd_publish_plan)
     workflow_parser = sub.add_parser(

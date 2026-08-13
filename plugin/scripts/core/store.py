@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -528,6 +529,9 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                  capture_group_id: str = "",
                  retention_config: retention_policy.RetentionPolicy | None = None,
                  lock_context=None,
+                 _transaction_id: str = "",
+                 _admission_checked: bool = False,
+                 _recovery_source_identity=None,
                  ) -> dict:
     """Archive one file or directory. mode='move' (delete-replacement) or
     'copy' (pre-image snapshot, leaves the original)."""
@@ -544,10 +548,11 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
 
     context = lock_context or Lock("recovery-store", timeout=30.0)
     with context:
-        maintain_retention(
-            policy=retention_config, incoming_bytes=incoming_bytes,
-            lock_context=nullcontext(),
-        )
+        if not _admission_checked:
+            maintain_retention(
+                policy=retention_config, incoming_bytes=incoming_bytes,
+                lock_context=nullcontext(),
+            )
         with Lock(_folder_key(os.path.dirname(src))):
             # Directory publication shares parents with every archive from this
             # source folder, so it belongs inside the same lock as versioning.
@@ -579,6 +584,8 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                 retention_class=retention_class,
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
+                transaction_id=_transaction_id,
+                recovery_source_identity=_recovery_source_identity,
             )
         _materialize_committed_transaction(entry["transaction_id"], _crash_after)
         return entry
@@ -977,6 +984,314 @@ def _capture_undo_prestate(
         "kind": "absent_tombstone",
         "transaction_id": tombstone["transaction_id"],
     }
+
+
+def _admit_publication_rollback_locked(
+        incoming_bytes: int, *,
+        retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
+    """Perform one aggregate capacity check while recovery-store lock is held."""
+    required = int(incoming_bytes)
+    if required < 0:
+        raise ValueError("publication rollback admission bytes cannot be negative")
+    return _maintain_retention_locked(
+        policy=retention_config, incoming_bytes=required,
+    )
+
+
+def _publication_stage_path(target: str, stage_basename: str) -> str:
+    """Return one validated same-parent publication recovery stage path."""
+    target = os.path.abspath(target)
+    basename = str(stage_basename or "")
+    if len(basename) > 160 or not basename.startswith(
+            ".agw-publication-rollback-") \
+            or basename in {".", ".."} or os.path.basename(basename) != basename \
+            or any(character not in (
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+            ) for character in basename):
+        raise ValueError("publication restore stage basename is invalid")
+    stage = os.path.abspath(os.path.join(os.path.dirname(target), basename))
+    if stage == target or os.path.dirname(stage) != os.path.dirname(target):
+        raise ValueError("publication restore stage must be beside its target")
+    return stage
+
+
+def _meaningful_ordinary_file_identity(value) -> tuple[int, int, int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4 \
+            or any(isinstance(item, bool) or not isinstance(item, int)
+                   for item in value):
+        raise ValueError("publication after identity must contain four integers")
+    identity = tuple(value)
+    device, inode, size, modified_ns = identity
+    if device < 0 or inode <= 0 or size < 0 or modified_ns <= 0:
+        raise ValueError("publication after identity is not meaningful")
+    return identity
+
+
+def _current_ordinary_file_identity(path: str) -> tuple[int, int, int, int]:
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise ValueError("publication displaced target is not an ordinary file")
+    info = os.stat(path, follow_symlinks=False)
+    return (
+        int(getattr(info, "st_dev", 0)), int(getattr(info, "st_ino", 0)),
+        int(info.st_size), int(info.st_mtime_ns),
+    )
+
+
+def _verify_publication_after_state(
+        target: str, expected_sha256: str,
+        expected_after_identity: tuple[int, int, int, int]) -> None:
+    before = _current_ordinary_file_identity(target)
+    if before != expected_after_identity:
+        raise ValueError("publication displaced target identity changed before hashing")
+    if file_sha256(target) != expected_sha256:
+        raise ValueError("publication displaced target hash does not match after-state")
+    after = _current_ordinary_file_identity(target)
+    if after != expected_after_identity:
+        raise ValueError("publication displaced target identity changed while hashing")
+
+
+def _publication_displaced_record_matches(
+        record: dict, target: str, transaction_id: str, capture_group_id: str,
+        expected_sha256: str, expected_after_identity: tuple[int, int, int, int]
+        ) -> bool:
+    target = os.path.abspath(target)
+    archive_root = os.path.abspath(os.path.join(agw_home(), "archive"))
+    destination = os.path.abspath(str(record.get("dest") or ""))
+    try:
+        destination_is_safe = os.path.commonpath(
+            (archive_root, destination)
+        ) == archive_root
+    except (OSError, ValueError):
+        destination_is_safe = False
+    return bool(
+        record.get("transaction_id") == transaction_id
+        and record.get("kind") == "archive"
+        and record.get("mode") == "move"
+        and os.path.abspath(str(record.get("src") or "")) == target
+        and record.get("source_identity") == archive_tx.canonical_path(target)
+        and record.get("actor") == "guardrails-recovery"
+        and record.get("retention_class") == "mutation_preimage"
+        and record.get("capture_group_id") == capture_group_id
+        and record.get("artifact_kind") == "file"
+        and record.get("source_kind", "file") == "file"
+        and record.get("sha256") == expected_sha256
+        and tuple(record.get("recovery_source_identity") or ())
+            == expected_after_identity
+        and destination_is_safe
+        and str(record.get("artifact_state") or "PRESENT") == "PRESENT"
+    )
+
+
+def _capture_publication_displaced_locked(
+        target: str, prepared_transaction_id: str, member_number: int,
+        expected_sha256: str, expected_after_identity, *,
+        retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
+    """Capture or reconcile one deterministic displaced after-state archive.
+
+    The caller must hold the recovery-store and target locks and must have
+    completed one aggregate admission check for all captures in the rollback.
+    """
+    target = os.path.abspath(target)
+    expected_sha256 = str(expected_sha256 or "")
+    if len(expected_sha256) != 64 \
+            or any(character not in "0123456789abcdef" for character in expected_sha256):
+        raise ValueError("publication displaced hash must be lowercase SHA-256")
+    expected_after_identity = _meaningful_ordinary_file_identity(
+        expected_after_identity
+    )
+    target_identity = archive_tx.canonical_path(target)
+    transaction_id = recovery_contracts.publication_displaced_transaction_id(
+        prepared_transaction_id, member_number, target_identity
+    )
+    capture_group_id = recovery_contracts.publication_rollback_capture_group(
+        prepared_transaction_id
+    )
+    try:
+        record = archive_tx.load(agw_home(), transaction_id)
+    except FileNotFoundError:
+        _verify_publication_after_state(
+            target, expected_sha256, expected_after_identity
+        )
+        return archive_file(
+            target, mode="move",
+            reason=f"displaced state before publication rollback {prepared_transaction_id}",
+            actor="guardrails-recovery", retention_class="mutation_preimage",
+            capture_group_id=capture_group_id,
+            retention_config=retention_config, lock_context=nullcontext(),
+            _transaction_id=transaction_id, _admission_checked=True,
+            _recovery_source_identity=expected_after_identity,
+        )
+    if not _publication_displaced_record_matches(
+            record, target, transaction_id, capture_group_id, expected_sha256,
+            expected_after_identity):
+        raise ValueError(
+            "publication rollback displaced archive binding does not match"
+        )
+    if record.get("state") == archive_tx.PREPARING \
+            and os.path.lexists(target):
+        _verify_publication_after_state(
+            target, expected_sha256, expected_after_identity
+        )
+    result = archive_tx._resume_preparing_archive(agw_home(), record)
+    reconciled = result.get("record") or archive_tx.load(agw_home(), transaction_id)
+    if reconciled.get("state") != archive_tx.COMMITTED:
+        raise OSError(
+            "publication rollback displaced archive remains incomplete: "
+            + str(result.get("error") or result.get("status") or "unknown")
+        )
+    entry = archive_tx.entry_from_record(reconciled)
+    if not archive_tx.entry_is_verified(agw_home(), entry, target):
+        raise ValueError("publication rollback displaced archive is not verified")
+    _materialize_committed_transaction(transaction_id)
+    return entry
+
+
+def _publication_stage_identity(value) -> dict:
+    if not isinstance(value, dict) or set(value) != {"st_dev", "st_ino"}:
+        raise ValueError("publication restore stage identity is invalid")
+    device, inode = value.get("st_dev"), value.get("st_ino")
+    if any(isinstance(item, bool) or not isinstance(item, int)
+           for item in (device, inode)) or device < 0 or inode <= 0:
+        raise ValueError("publication restore stage identity is not meaningful")
+    return {"st_dev": device, "st_ino": inode}
+
+
+def _publication_stage_info(path: str) -> tuple[os.stat_result, dict]:
+    info = os.lstat(path)
+    if os.path.islink(path) or not stat.S_ISREG(info.st_mode) \
+            or int(getattr(info, "st_nlink", 1)) != 1:
+        raise ValueError("publication restore stage is not a safe ordinary file")
+    identity = _publication_stage_identity({
+        "st_dev": int(getattr(info, "st_dev", -1)),
+        "st_ino": int(getattr(info, "st_ino", 0)),
+    })
+    return info, identity
+
+
+def _create_publication_restore_stage_locked(
+        target: str, stage_basename: str) -> dict:
+    """Exclusively allocate one empty same-parent restore stage."""
+    stage = _publication_stage_path(target, stage_basename)
+    _ensure_directory(os.path.dirname(stage))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(stage, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or int(getattr(info, "st_nlink", 1)) != 1:
+            raise ValueError("publication restore stage allocation is unsafe")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _file_info, identity = _publication_stage_info(stage)
+    archive_tx._flush_directory(os.path.dirname(stage))
+    return identity
+
+
+def _inspect_publication_restore_stage_locked(
+        target: str, stage_basename: str) -> dict:
+    """Observe one deterministic stage path without scanning or hashing."""
+    stage = _publication_stage_path(target, stage_basename)
+    try:
+        info = os.lstat(stage)
+    except FileNotFoundError:
+        return {"state": "ABSENT", "kind": "absence", "identity": None, "size": 0}
+    identity = {
+        "st_dev": int(getattr(info, "st_dev", -1)),
+        "st_ino": int(getattr(info, "st_ino", 0)),
+    }
+    if os.path.islink(stage):
+        kind = "link"
+    elif not stat.S_ISREG(info.st_mode):
+        kind = "other"
+    elif int(getattr(info, "st_nlink", 1)) != 1:
+        kind = "hardlink"
+    else:
+        kind = "file"
+    return {
+        "state": "PRESENT", "kind": kind, "identity": identity,
+        "size": int(getattr(info, "st_size", 0)),
+    }
+
+
+def _verified_publication_snapshot(snapshot: dict, target: str) -> tuple:
+    target = os.path.abspath(target)
+    if snapshot.get("kind") != "archive" \
+            or snapshot.get("state") != archive_tx.COMMITTED \
+            or snapshot.get("artifact_kind") != "file" \
+            or snapshot.get("source_kind", "file") != "file" \
+            or not archive_tx.entry_is_verified(
+                agw_home(), archive_tx.entry_from_record(snapshot), target):
+        raise ValueError("publication rollback snapshot is not verified")
+    return "file", snapshot.get("sha256"), snapshot.get("size")
+
+
+def _require_publication_stage(
+        stage: str, expected_stage_identity) -> dict:
+    expected = _publication_stage_identity(expected_stage_identity)
+    _info, actual = _publication_stage_info(stage)
+    if actual != expected:
+        raise ValueError("publication restore stage identity changed")
+    return actual
+
+
+def _write_publication_restore_stage_locked(
+        snapshot: dict, target: str, stage_basename: str,
+        expected_stage_identity) -> None:
+    """Write a verified snapshot into the exact journal-owned stage inode."""
+    target = os.path.abspath(target)
+    stage = _publication_stage_path(target, stage_basename)
+    expected = _verified_publication_snapshot(snapshot, target)
+    identity = _require_publication_stage(stage, expected_stage_identity)
+    flags = os.O_WRONLY | int(getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(stage, flags)
+    try:
+        opened = os.fstat(fd)
+        if {"st_dev": int(getattr(opened, "st_dev", -1)),
+            "st_ino": int(getattr(opened, "st_ino", 0))} != identity \
+                or not stat.S_ISREG(opened.st_mode) \
+                or int(getattr(opened, "st_nlink", 1)) != 1:
+            raise ValueError("publication restore stage changed before write")
+        os.ftruncate(fd, 0)
+        with open(snapshot["dest"], "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                os.write(fd, chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _require_publication_stage(stage, identity)
+    if archive_tx.artifact_fingerprint(stage) != expected:
+        raise OSError("publication restore stage failed verification")
+
+
+def _publish_publication_restore_stage_locked(
+        snapshot: dict, target: str, stage_basename: str,
+        expected_stage_identity) -> None:
+    """Atomically publish the exact verified stage to an absent target."""
+    target = os.path.abspath(target)
+    stage = _publication_stage_path(target, stage_basename)
+    expected = _verified_publication_snapshot(snapshot, target)
+    identity = _require_publication_stage(stage, expected_stage_identity)
+    if archive_tx.artifact_fingerprint(stage) != expected:
+        raise ValueError("publication restore stage does not match its snapshot")
+    if os.path.lexists(target):
+        raise FileExistsError("publication restore target must be absent")
+    _require_publication_stage(stage, identity)
+    os.replace(stage, target)
+    archive_tx._flush_directory(os.path.dirname(target))
+    _require_publication_stage(target, identity)
+    if archive_tx.artifact_fingerprint(target) != expected:
+        raise OSError("publication rollback restored fingerprint changed")
+
+
+def _remove_publication_restore_stage_locked(
+        target: str, stage_basename: str, expected_stage_identity) -> None:
+    """Remove only the exact journal-owned safe stage inode."""
+    stage = _publication_stage_path(target, stage_basename)
+    identity = _require_publication_stage(stage, expected_stage_identity)
+    _require_publication_stage(stage, identity)
+    os.unlink(stage)
+    archive_tx._flush_directory(os.path.dirname(stage))
 
 
 def _restore_snapshot(member: dict, snapshot: dict):

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import time
@@ -36,6 +37,24 @@ DEFAULT_HIGH_WATER = 0.90
 DEFAULT_LOW_WATER = 0.80
 MAX_INVENTORY_RECORDS = 100_000
 MAX_WALK_NODES = 250_000
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _meaningful_publication_identity(value) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4 \
+            or any(isinstance(item, bool) or not isinstance(item, int)
+                   for item in value):
+        return None
+    identity = tuple(value)
+    device, inode, size, modified_ns = identity
+    if device < 0 or inode <= 0 or size < 0 or modified_ns <= 0:
+        return None
+    return identity
+
+
+def _publication_terminal_valid(prepared: dict, terminal: dict) -> bool:
+    return recovery_contracts.publication_terminal_valid(prepared, terminal)
 
 ELIGIBLE_CLASS = "mutation_preimage"
 PROTECTED_CLASSES = frozenset({
@@ -365,6 +384,285 @@ def activity_index(archive_records: list[dict], activity_records: list[dict]) ->
     return activity
 
 
+def _publication_recovery_pins(
+        manifest_records: list[dict], activity_records: list[dict]
+        ) -> tuple[dict[str, set[str]], list[str], set[str]]:
+    """Derive conservative pins using only bounded inventory evidence.
+
+    This is not Slice 2's live-target authentication.  It validates enough of
+    the immutable PREPARED/snapshot relationship to prevent retention from
+    reclaiming a possible rollback dependency.  Ambiguity makes the inventory
+    incomplete instead of guessing that an artifact is unneeded.
+    """
+    errors = []
+    pins: dict[str, set[str]] = {}
+    manifests = {
+        str(record.get("transaction_id") or ""): record
+        for record in manifest_records
+        if str(record.get("transaction_id") or "")
+    }
+    prepared_by_id = {}
+    changed_members_by_prepared = {}
+    terminal_by_id = {}
+    ambiguous_prepared = set()
+    for record in activity_records:
+        operation = str(record.get("op") or "")
+        if operation == "file-transaction-prepared":
+            if record.get("atomicity") != "recoverable-set" \
+                    or record.get("visibility") != "per-file-sequential":
+                continue
+            transaction_id = str(record.get("transaction_id") or "")
+            try:
+                recovery_contracts.exact_transaction_id(
+                    transaction_id, field="prepared transaction id"
+                )
+            except ValueError:
+                errors.append("prepared publication has an invalid identity")
+                continue
+            prior = prepared_by_id.get(transaction_id)
+            if prior is not None and recovery_contracts.canonical_sha256(prior) \
+                    != recovery_contracts.canonical_sha256(record):
+                errors.append(
+                    f"prepared publication is ambiguous: {transaction_id}"
+                )
+                ambiguous_prepared.add(transaction_id)
+                continue
+            if prior is None:
+                prepared_by_id[transaction_id] = record
+        elif operation == "file-transaction-state":
+            transaction_id = str(record.get("prepared_transaction_id") or "")
+            if not transaction_id:
+                continue
+            try:
+                recovery_contracts.exact_transaction_id(
+                    transaction_id, field="prepared transaction id"
+                )
+            except ValueError:
+                errors.append("publication terminal has an invalid identity")
+                continue
+            terminal_by_id.setdefault(transaction_id, []).append(record)
+
+    unresolved = set()
+    resolved = set()
+    resolved_states = {}
+    for transaction_id, prepared in prepared_by_id.items():
+        if transaction_id in ambiguous_prepared:
+            unresolved.add(transaction_id)
+            continue
+        terminals = terminal_by_id.get(transaction_id, [])
+        if prepared.get("state") != "PREPARED":
+            errors.append(f"prepared publication state is invalid: {transaction_id}")
+            unresolved.add(transaction_id)
+            continue
+        if not _SHA256_RE.fullmatch(str(prepared.get("plan_sha256") or "")):
+            errors.append(f"prepared publication plan binding is invalid: {transaction_id}")
+            unresolved.add(transaction_id)
+            continue
+        operations = prepared.get("operations")
+        if not isinstance(operations, list) or not operations \
+                or len(operations) > recovery_contracts.MAX_PUBLICATION_ROLLBACK_MEMBERS:
+            errors.append(f"prepared publication members are invalid: {transaction_id}")
+            continue
+        snapshot_ids = []
+        changed_members = []
+        seen_targets = set()
+        valid = True
+        for expected_number, member in enumerate(operations, 1):
+            if not isinstance(member, dict) or member.get("number") != expected_number:
+                valid = False
+                break
+            target = str(member.get("path") or "")
+            if not target or os.path.abspath(target) != target:
+                valid = False
+                break
+            target_identity = _canonical(target)
+            if target_identity in seen_targets:
+                valid = False
+                break
+            seen_targets.add(target_identity)
+            before = str(member.get("before_hash") or "")
+            after = str(member.get("after_hash") or "")
+            changed = bool(member.get("changed"))
+            if before != "absent" and not _SHA256_RE.fullmatch(before):
+                valid = False
+                break
+            if not _SHA256_RE.fullmatch(after):
+                valid = False
+                break
+            snapshot_id = str(member.get("snapshot_transaction_id") or "")
+            if not changed:
+                if before != after or snapshot_id:
+                    valid = False
+                    break
+                continue
+            after_identity = _meaningful_publication_identity(
+                member.get("candidate_identity")
+            )
+            if after_identity is None or after_identity[2] < 0:
+                valid = False
+                break
+            try:
+                recovery_contracts.exact_transaction_id(
+                    snapshot_id, field="snapshot transaction id"
+                )
+            except ValueError:
+                valid = False
+                break
+            snapshot = manifests.get(snapshot_id)
+            if not snapshot or snapshot.get("state") != archive_tx.COMMITTED \
+                    or _canonical(snapshot.get("src") or "") != target_identity \
+                    or snapshot.get("source_identity") != target_identity:
+                valid = False
+                break
+            if before == "absent":
+                if snapshot.get("kind") != "absent_tombstone":
+                    valid = False
+                    break
+            elif snapshot.get("kind") != "archive" \
+                    or snapshot.get("sha256") != before:
+                valid = False
+                break
+            snapshot_ids.append(snapshot_id)
+            changed_members.append({
+                "number": expected_number,
+                "target": target,
+                "target_identity": target_identity,
+                "after_sha256": after,
+                "after_identity": after_identity,
+            })
+        if not valid:
+            errors.append(f"prepared publication evidence is incomplete: {transaction_id}")
+            unresolved.add(transaction_id)
+            continue
+        if terminals:
+            terminal_hashes = {
+                recovery_contracts.canonical_sha256(item) for item in terminals
+            }
+            terminal_states = {str(item.get("state") or "") for item in terminals}
+            if len(terminal_hashes) != 1 or len(terminal_states) != 1 \
+                    or not all(_publication_terminal_valid(prepared, item)
+                               for item in terminals):
+                errors.append(
+                    f"publication terminal evidence is invalid: {transaction_id}"
+                )
+                unresolved.add(transaction_id)
+            else:
+                resolved.add(transaction_id)
+                resolved_states[transaction_id] = next(iter(terminal_states))
+        else:
+            unresolved.add(transaction_id)
+        changed_members_by_prepared[transaction_id] = changed_members
+        if transaction_id in unresolved:
+            for snapshot_id in snapshot_ids:
+                pins.setdefault(snapshot_id, set()).add(
+                    recovery_contracts.UNRESOLVED_PREPARED_PUBLICATION
+                )
+
+    prefix = recovery_contracts.PUBLICATION_ROLLBACK_CAPTURE_PREFIX
+    for record in manifest_records:
+        binding = str(record.get("capture_group_id") or "")
+        if not binding.startswith(prefix):
+            continue
+        prepared_id = binding[len(prefix):]
+        try:
+            recovery_contracts.exact_transaction_id(
+                prepared_id, field="publication rollback binding"
+            )
+        except ValueError:
+            errors.append("publication rollback archive has an invalid binding")
+            continue
+        if prepared_id not in prepared_by_id:
+            errors.append(
+                f"publication rollback archive has no prepared record: {prepared_id}"
+            )
+            continue
+        members = changed_members_by_prepared.get(prepared_id)
+        if members is None:
+            # A resolved publication no longer needs a pin. Its terminal record
+            # is sufficient to release retention even if legacy PREPARED
+            # evidence cannot satisfy the newer linkage contract.
+            if prepared_id in resolved:
+                continue
+            errors.append(
+                f"publication rollback archive has unauthenticated members: {prepared_id}"
+            )
+            continue
+        matching = []
+        for member in members:
+            expected_id = recovery_contracts.publication_displaced_transaction_id(
+                prepared_id, member["number"], member["target_identity"]
+            )
+            if expected_id == str(record.get("transaction_id") or ""):
+                matching.append(member)
+        if len(matching) != 1:
+            errors.append(
+                f"publication rollback archive member is ambiguous: {prepared_id}"
+            )
+            continue
+        member = matching[0]
+        if record.get("kind") != "archive" \
+                or record.get("mode") != "move" \
+                or record.get("actor") != "guardrails-recovery" \
+                or record.get("retention_class") != ELIGIBLE_CLASS \
+                or _canonical(record.get("src") or "") \
+                    != member["target_identity"] \
+                or record.get("source_identity") != member["target_identity"] \
+                or record.get("sha256") != member["after_sha256"] \
+                or tuple(record.get("recovery_source_identity") or ()) \
+                    != member["after_identity"]:
+            errors.append(
+                f"publication rollback archive binding is inconsistent: {prepared_id}"
+            )
+            continue
+        if prepared_id in resolved \
+                and resolved_states.get(prepared_id) != "ROLLED_BACK":
+            errors.append(
+                f"publication rollback archive conflicts with terminal: {prepared_id}"
+            )
+            for snapshot_id in (
+                    str(item.get("snapshot_transaction_id") or "")
+                    for item in prepared_by_id[prepared_id].get("operations") or ()):
+                if snapshot_id:
+                    pins.setdefault(snapshot_id, set()).add(
+                        recovery_contracts.UNRESOLVED_PREPARED_PUBLICATION
+                    )
+            pins.setdefault(str(record.get("transaction_id") or ""), set()).add(
+                recovery_contracts.ACTIVE_PUBLICATION_ROLLBACK
+            )
+            continue
+        if prepared_id in unresolved:
+            pins.setdefault(str(record.get("transaction_id") or ""), set()).add(
+                recovery_contracts.ACTIVE_PUBLICATION_ROLLBACK
+            )
+    resolved_captures = set()
+    for record in manifest_records:
+        transaction_id = str(record.get("transaction_id") or "")
+        binding = str(record.get("capture_group_id") or "")
+        if binding.startswith(prefix) \
+                and resolved_states.get(binding[len(prefix):]) == "ROLLED_BACK" \
+                and transaction_id not in pins:
+            # Only records that passed the exact-member loop above are eligible.
+            prepared_id = binding[len(prefix):]
+            members = changed_members_by_prepared.get(prepared_id, ())
+            if any(
+                recovery_contracts.publication_displaced_transaction_id(
+                    prepared_id, member["number"], member["target_identity"]
+                ) == transaction_id
+                and record.get("kind") == "archive"
+                and record.get("mode") == "move"
+                and record.get("actor") == "guardrails-recovery"
+                and record.get("retention_class") == ELIGIBLE_CLASS
+                and _canonical(record.get("src") or "") == member["target_identity"]
+                and record.get("source_identity") == member["target_identity"]
+                and record.get("sha256") == member["after_sha256"]
+                and tuple(record.get("recovery_source_identity") or ())
+                    == member["after_identity"]
+                for member in members
+            ):
+                resolved_captures.add(transaction_id)
+    return pins, errors, resolved_captures
+
+
 def inventory(home: str, *, activity_records: list[dict] | None = None,
               max_records: int = MAX_INVENTORY_RECORDS,
               max_walk_nodes: int = MAX_WALK_NODES) -> dict:
@@ -466,6 +764,18 @@ def inventory(home: str, *, activity_records: list[dict] | None = None,
         errors.extend(activity_errors)
         activity_records = [item for item in activity_records if isinstance(item, dict)]
 
+    recovery_pins, recovery_errors, resolved_captures = _publication_recovery_pins(
+        manifest_records, activity_records
+    )
+    errors.extend(recovery_errors)
+    for candidate in records:
+        candidate["protection_reasons"].extend(
+            sorted(recovery_pins.get(candidate["transaction_id"], ()))
+        )
+        candidate["resolved_publication_rollback"] = (
+            candidate["transaction_id"] in resolved_captures
+        )
+
     activity = activity_index(manifest_records, activity_records)
     fingerprint_payload = {
         "records": sorted(records, key=lambda value: value["transaction_id"]),
@@ -506,7 +816,8 @@ def protection_map(snapshot: dict, *, now_ns: int | None = None,
     for item in snapshot["records"]:
         transaction_id = item["transaction_id"]
         reasons = protected[transaction_id]
-        if item["mode"] == "move":
+        if item["mode"] == "move" \
+                and not item.get("resolved_publication_rollback"):
             reasons.append("move_archive")
         if item["retention_class"] != ELIGIBLE_CLASS:
             reasons.append("retention_class")
