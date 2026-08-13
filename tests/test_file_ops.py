@@ -337,6 +337,8 @@ def test_declared_run_dry_run_does_not_execute_or_snapshot(tmp_path):
     )
     assert result["executed"] is False
     assert result["validation_scope"] == "contract_only"
+    assert "unchanged_outputs" not in result
+    assert "ignored_sidecar_changes" not in result
     assert not output.exists()
     assert store.discover_archive_transactions() == []
 
@@ -477,6 +479,10 @@ def test_declared_run_reports_missing_new_output(tmp_path):
     assert result["exit_code"] == 0
     assert result["ok"] is False
     assert result["declared_outputs_missing"] == [str(output)]
+    # State and contract inventories are intentionally orthogonal: the exact
+    # declaration stayed absent, and a required output is therefore missing.
+    assert result["unchanged_outputs"] == [str(output)]
+    assert result["ignored_sidecar_changes"] == []
     records = store.discover_archive_transactions()
     assert len(records) == 1
     assert records[0]["record"]["kind"] == "absent_tombstone"
@@ -502,11 +508,14 @@ def test_declared_run_reports_undeclared_sidecar(tmp_path):
         "path": str(sidecar), "change": "created", "kind": "file",
     }]
     assert result["unclaimed_observed_changes"] == result["undeclared_outputs"]
+    assert result["unchanged_outputs"] == []
+    assert result["ignored_sidecar_changes"] == []
     assert result["output_observation"]["mode"] == "root_manifest"
 
 
 def test_declared_sidecar_pattern_is_allowed(tmp_path):
     output = tmp_path / "report.xlsx"
+    sidecar = tmp_path / "report.xlsx.inspect.ndjson"
     script = tmp_path / "build.py"
     script.write_text(
         "from pathlib import Path\n"
@@ -521,6 +530,109 @@ def test_declared_sidecar_pattern_is_allowed(tmp_path):
     )
     assert result["ok"] is True
     assert result["undeclared_outputs"] == []
+    assert result["unchanged_outputs"] == []
+    assert result["ignored_sidecar_changes"] == [{
+        "path": str(sidecar),
+        "change": "created",
+        "kind": "file",
+        "output_root": str(tmp_path),
+        "relative_path": sidecar.name,
+        "matched_pattern": "*.inspect.ndjson",
+    }]
+    assert result["output_observation"]["ignored_changes"] == 1
+
+
+def test_ignored_sidecar_reports_first_matching_pattern(tmp_path):
+    output = tmp_path / "report.xlsx"
+    sidecar = tmp_path / "report.xlsx.inspect.ndjson"
+    script = tmp_path / "build_overlap.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('report.xlsx').write_bytes(b'book')\n"
+        "Path('report.xlsx.inspect.ndjson').write_text('inspection')\n",
+        encoding="utf-8",
+    )
+
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+        output_roots=[str(tmp_path)],
+        output_patterns=["report.*", "*.inspect.ndjson"],
+    )
+
+    assert result["ignored_sidecar_changes"][0]["path"] == str(sidecar)
+    assert result["ignored_sidecar_changes"][0]["matched_pattern"] == "report.*"
+
+
+def test_declared_run_reports_existing_output_unchanged(tmp_path):
+    output = tmp_path / "stable.txt"
+    output.write_text("stable\n", encoding="utf-8")
+    script = tmp_path / "no_change.py"
+    script.write_text("print('validated')\n", encoding="utf-8")
+    before = store.file_sha256(str(output))
+
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=[before], cwd=str(tmp_path),
+    )
+
+    assert result["ok"] is True
+    assert result["outputs"][0]["changed"] is False
+    assert result["unchanged_outputs"] == [str(output)]
+    assert result["declared_outputs_missing"] == []
+    assert result["ignored_sidecar_changes"] == []
+
+
+def test_optional_absent_output_is_unchanged_but_not_missing(tmp_path):
+    output = tmp_path / "optional.txt"
+    script = tmp_path / "no_optional_output.py"
+    script.write_text("print('optional output omitted')\n", encoding="utf-8")
+
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], optional_outputs=[True],
+        cwd=str(tmp_path),
+    )
+
+    assert result["ok"] is True
+    assert result["unchanged_outputs"] == [str(output)]
+    assert result["declared_outputs_missing"] == []
+
+
+def test_exact_declared_output_precedes_matching_sidecar_pattern(tmp_path):
+    output = tmp_path / "report.inspect.ndjson"
+    script = tmp_path / "write_declared.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "Path('report.inspect.ndjson').write_text('declared')\n",
+        encoding="utf-8",
+    )
+
+    result = file_ops.run_declared(
+        [sys.executable, str(script)], [str(output)],
+        expected_hashes=["absent"], cwd=str(tmp_path),
+        output_roots=[str(tmp_path)], output_patterns=["*.inspect.ndjson"],
+    )
+
+    assert result["ok"] is True
+    assert result["ignored_sidecar_changes"] == []
+    assert result["unclaimed_observed_changes"] == []
+
+
+def test_cli_run_human_summary_reports_output_inventory(tmp_path):
+    output = tmp_path / "stable.txt"
+    output.write_text("stable\n", encoding="utf-8")
+    script = tmp_path / "validate.py"
+    script.write_text("print('validated')\n", encoding="utf-8")
+
+    result = run_agw(
+        "run", "--output", str(output),
+        "--expected-hash", store.file_sha256(str(output)),
+        "--cwd", str(tmp_path), "--", sys.executable, str(script),
+    )
+
+    assert "output inventory: 1 unchanged; 0 missing; " \
+           "0 ignored sidecar; 0 unclaimed" in result.stdout
 
 
 def test_exact_state_output_is_independent_of_dynamic_cache_root(tmp_path):
@@ -613,7 +725,7 @@ def test_declared_exact_output_does_not_observe_parent_or_ambient_changes(
     assert result["output_observation"] == {
         "mode": "exact_outputs", "complete": True,
         "files_before": 0, "files_after": 0, "changed_paths": 0,
-        "unclaimed_changes": 0,
+        "unclaimed_changes": 0, "ignored_changes": 0,
     }
     assert ambient.read_text(encoding="utf-8") == '{"value":2}\n'
 

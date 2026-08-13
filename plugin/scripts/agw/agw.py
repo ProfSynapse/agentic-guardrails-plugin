@@ -1027,6 +1027,14 @@ def cmd_run(args):
         "validated declared outputs" if data.get("dry_run") else
         f"command exited {data['exit_code']}; {len(data['outputs'])} declared output(s) tracked"
     )
+    if data.get("executed"):
+        human_parts.append(
+            "output inventory: "
+            f"{len(data.get('unchanged_outputs', []))} unchanged; "
+            f"{len(data.get('declared_outputs_missing', []))} missing; "
+            f"{len(data.get('ignored_sidecar_changes', []))} ignored sidecar; "
+            f"{len(data.get('unclaimed_observed_changes', []))} unclaimed"
+        )
     if data.get("timed_out"):
         human_parts.append("command exceeded its bounded timeout and its process tree was terminated")
     _out(args, "\n".join(part for part in human_parts if part), data)

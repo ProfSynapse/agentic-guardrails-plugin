@@ -1,9 +1,9 @@
 # Releasing
 
 Published builds are distributed through `.claude-plugin/marketplace.json` and
-must be pinned to an immutable git tag. A release candidate may temporarily use
-`source.ref: main` while it is being validated; that is a candidate pointer,
-not a published immutable release.
+`.agents/plugins/marketplace.json`; both must be pinned to an immutable git tag.
+A release candidate may temporarily use `source.ref: main` while it is being
+validated; that is a candidate pointer, not a published immutable release.
 
 ## Why versioning matters
 
@@ -12,6 +12,7 @@ The following distributable versions must remain identical:
 1. `plugin/.claude-plugin/plugin.json`
 2. `plugin/.codex-plugin/plugin.json`
 3. the plugin entry in `.claude-plugin/marketplace.json`
+4. the corresponding release ref in `.agents/plugins/marketplace.json`
 
 Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
@@ -112,9 +113,9 @@ release must bump the version.
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.3.1`, rerun JSON and artifact conformance, and merge the catalog
-   pointer update through a follow-up pull request. This tag-exists gate is
-   mandatory.
+   `main` to `v0.3.1` in both marketplace catalogs, rerun JSON and artifact
+   conformance, and merge the catalog pointer update through a follow-up pull
+   request. This tag-exists gate is mandatory.
 
 ## How users update
 

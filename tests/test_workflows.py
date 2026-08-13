@@ -418,6 +418,14 @@ def test_trusted_workflow_separates_exact_state_from_observed_cache(tmp_path):
     assert result["ok"] is True
     assert result["output_roots"] == [str(cache)]
     assert result["unclaimed_observed_changes"] == []
+    assert result["unchanged_outputs"] == []
+    assert result["ignored_sidecar_changes"] == [{
+        "path": str(cache / "summon-a1b2c3.py"),
+        "change": "created", "kind": "file",
+        "output_root": str(cache),
+        "relative_path": "summon-a1b2c3.py",
+        "matched_pattern": "summon-*.py",
+    }]
     assert marker.read_text(encoding="utf-8") == "after"
     assert store.list_versions(str(marker))
 

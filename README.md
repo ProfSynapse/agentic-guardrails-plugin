@@ -218,6 +218,12 @@ and nested diagnostics are omitted
 from the response so candidate values stay hashed and raw values are not multiplied. `agw
 workflow propose` returns an
 inert validated v2 proposal without writing or trusting it.
+
+Migration note for 0.4: `suggested_argv` is no longer an argv array and must not
+be executed or compared as one. JSON consumers should read the sole value-bearing
+`recommended_argv` array and may use the `suggested_argv` object only to discover
+that replacement. This metadata-only shape avoids duplicating potentially private
+command values in diagnostics.
 Manifest v2 also binds the exact script arguments, so `agw run --workflow ID`
 can reconstruct the reviewed command without agents restating Unicode paths or
 flags. Use `agw workflow init` to generate v2, `validate` before trust, and
@@ -232,7 +238,13 @@ changes cannot silently expand an already-trusted workflow.
 Exact outputs are independent of optional observed roots, so a recoverable state
 file can be paired with a separate dynamic cache root. Observed roots only detect
 unclaimed after-the-fact changes; they do not prevent writes or recover an
-unknown file. See the
+unknown file. Executed JSON results make the classification explicit:
+`unchanged_outputs` lists exact declared paths whose before/after states compare
+equal, while `ignored_sidecar_changes` lists every observed change suppressed by
+an output pattern together with its root, relative path, and matched pattern.
+An unchanged path may still be missing when a required absent output stayed
+absent; equality is not proof that a path was never touched. Dry runs do not emit
+post-execution inventories. See the
 [trusted-workflow reference](plugin/skills/agentic-guardrails/references/trusted-workflows.md).
 `agw run --dry-run` is deliberately contract-only: it does not execute the
 command or predict its writes. JSON identifies this explicitly as
