@@ -7,30 +7,34 @@ validated; that is a candidate pointer, not a published immutable release.
 
 ## Why versioning matters
 
-The following distributable versions must remain identical:
+The following distributable release surfaces must remain aligned:
 
 1. `plugin/.claude-plugin/plugin.json`
 2. `plugin/.codex-plugin/plugin.json`
 3. the plugin entry in `.claude-plugin/marketplace.json`
 4. the corresponding release ref in `.agents/plugins/marketplace.json`
 
+The two manifests and Claude catalog carry the plain version. During candidate
+validation both catalogs use `main`; after the tag-exists gate both use the same
+`v<version>` ref.
+
 Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.3.1`
+## Release gate for `0.4.2`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.3.1` before that tag exists.
+   `v0.4.2` before that tag exists.
 
-2. Confirm all three versions are `0.3.1`, then run:
+2. Confirm all three version fields are `0.4.2` and both refs are `main`, then run:
 
    ```bash
    python -m pytest -q
    python -m pytest -q tests/test_packaging.py tests/test_host_conformance.py
    ```
 
-   For the Windows-first `0.3.1` release, Windows CI and the packed-artifact
+   For this Windows-first release, Windows CI and the packed-artifact
    tests are release-blocking. Linux and macOS remain in the matrix as advisory
    preview signals; failures there must be documented but do not block the
    Windows release. Equivalent real-machine validation is required before
@@ -100,20 +104,22 @@ release must bump the version.
    pull request. Do not tag an unverified or unmerged tree.
 
    ```bash
-   git add plugin .claude-plugin/marketplace.json docs/HOST_PARITY.md RELEASING.md .github/workflows/conformance.yml
-   git commit -m "Release Agentic Guardrails 0.3.1"
+   git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json \
+     .claude-plugin/marketplace.json .agents/plugins/marketplace.json \
+     tests/test_packaging.py RELEASING.md
+   git commit -m "Release Agentic Guardrails 0.4.2"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.3.1 --target <verified-main-commit-sha> \
-     --title "v0.3.1" --notes "..."
+   gh release create v0.4.2 --target <verified-main-commit-sha> \
+     --title "v0.4.2" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.3.1` in both marketplace catalogs, rerun JSON and artifact
+   `main` to `v0.4.2` in both marketplace catalogs, rerun JSON and artifact
    conformance, and merge the catalog pointer update through a follow-up pull
    request. This tag-exists gate is mandatory.
 

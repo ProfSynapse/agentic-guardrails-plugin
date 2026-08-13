@@ -172,7 +172,76 @@ def test_publish_plan_recovery_dispatches_inspect_and_explicit_actions(
     assert calls == [("prepared-id", "finalize-observed")]
 
 
-def test_publish_plan_cli_rollback_unavailable_preserves_all_state(
+@pytest.mark.parametrize(("action", "state", "expected"), [
+    ("rollback", "ROLLED_BACK", "ROLLED_BACK; exact before-state restored"),
+    ("finalize-observed", "COMMITTED", "COMMITTED; authenticated all-after"),
+    ("rollback", "NEEDS_ATTENTION", "NEEDS_ATTENTION; manual review required"),
+])
+def test_publish_plan_recovery_human_success_states_are_truthful(
+        monkeypatch, capsys, action, state, expected):
+    import agw as agw_cli
+
+    monkeypatch.setattr(
+        agw_cli.publication, "recover_prepared_transaction",
+        lambda *_args, **_kwargs: {"transaction_id": "prepared-id", "state": state},
+    )
+    args = type("Args", (), {
+        "plan_op": "recover", "transaction_id": "prepared-id",
+        "recovery_action": action, "json": False,
+    })()
+    agw_cli.cmd_publish_plan(args)
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "simultaneous" not in output
+    assert "power-loss" not in output
+
+
+@pytest.mark.parametrize(("exc", "expected"), [
+    (file_ops.PreparedFinalizeNotAllAfter("not all after"),
+     "remains PREPARED; finalize-observed refused"),
+    (file_ops.PreparedFinalizeAfterRollbackStarted("rollback started"),
+     "remains PREPARED; finalize-observed refused"),
+    (file_ops.PreparedRecoveryBlocked("capture failed", {"recovery_state": "BLOCKED"}),
+     "durably BLOCKED; manual attention"),
+    (OSError("busy"), "did not complete; inspect before retrying"),
+])
+def test_publish_plan_recovery_human_failures_distinguish_next_state(
+        monkeypatch, capsys, exc, expected):
+    import agw as agw_cli
+
+    def fail(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(agw_cli.publication, "recover_prepared_transaction", fail)
+    args = type("Args", (), {
+        "plan_op": "recover", "transaction_id": "prepared-id",
+        "recovery_action": "finalize-observed", "json": False,
+    })()
+    with pytest.raises(SystemExit) as caught:
+        agw_cli.cmd_publish_plan(args)
+    assert caught.value.code == 1
+    assert expected in capsys.readouterr().err
+
+
+def test_publish_plan_non_recovery_os_error_keeps_generic_plan_error(
+        monkeypatch, capsys):
+    import agw as agw_cli
+
+    monkeypatch.setattr(
+        agw_cli, "_load_json_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read failed")),
+    )
+    args = type("Args", (), {
+        "plan_op": "create", "operations_file": "ops.json", "json": False,
+    })()
+    with pytest.raises(SystemExit):
+        agw_cli.cmd_publish_plan(args)
+    error = capsys.readouterr().err
+    assert "read failed" in error
+    assert "inspect before retrying" not in error
+
+
+def test_publish_plan_cli_rollback_restores_all_state(
         tmp_path, monkeypatch, capsys):
     import agw as agw_cli
 
@@ -206,29 +275,17 @@ def test_publish_plan_cli_rollback_unavailable_preserves_all_state(
     )
 
     home = Path(store.agw_home())
-    target_before = [path.read_bytes() for path in targets]
-    store_before = {
-        path.relative_to(home).as_posix(): path.read_bytes()
-        for path in home.rglob("*") if path.is_file()
-    }
     args = type("Args", (), {
         "plan_op": "recover", "transaction_id": prepared["transaction_id"],
         "recovery_action": "rollback", "json": True,
     })()
-    with pytest.raises(SystemExit) as caught:
-        agw_cli.cmd_publish_plan(args)
-    assert caught.value.code == 1
-    error = json.loads(capsys.readouterr().err)["error"]
-    assert error["code"] == "prepared_rollback_unavailable"
-    assert error["details"]["required_capability"] == \
-        "crash_resumable_prepared_rollback_journal"
-    assert error["details"]["fallback"] is False
-    assert error["details"]["recovery_state"] == "PREPARED"
-    assert [path.read_bytes() for path in targets] == target_before
-    assert {
-        path.relative_to(home).as_posix(): path.read_bytes()
-        for path in home.rglob("*") if path.is_file()
-    } == store_before
+    agw_cli.cmd_publish_plan(args)
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "ROLLED_BACK"
+    assert result["visibility"] == "per-file-sequential"
+    assert [path.read_bytes() for path in targets] == [b"old-0", b"old-1"]
+    assert (home / "publication-recovery" /
+            f"{prepared['transaction_id']}.json").is_file()
 
 
 def test_run_plan_immutable_execution_unavailable_is_structured_and_unclaimed(tmp_path):

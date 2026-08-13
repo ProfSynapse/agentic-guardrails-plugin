@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import time
 
 import pytest
@@ -245,7 +246,7 @@ def _interrupt_after_first_publish(plan, targets, monkeypatch):
     return prepared
 
 
-def test_prepared_inspection_and_rollback_unavailable_never_mutate_any_store(
+def test_prepared_inspection_and_rollback_restore_without_candidate_reads(
     tmp_path, monkeypatch,
 ):
     plan, stages, targets = _two_file_plan(tmp_path)
@@ -262,25 +263,13 @@ def test_prepared_inspection_and_rollback_unavailable_never_mutate_any_store(
     monkeypatch.setattr(store, "file_sha256", guarded_hash)
     inspected = publication.inspect_prepared_transaction(prepared["transaction_id"])
     assert inspected["classification"] == "mixed"
-    target_before = [path.read_bytes() for path in targets]
-    records_before = store.oplog_read()
-    archive_before = sorted(Path(store.agw_home()).rglob("*"))
-    monkeypatch.setattr(store, "_capture_undo_prestate", lambda *_a, **_k: pytest.fail("archive mutation"))
-    monkeypatch.setattr(store, "_restore_snapshot", lambda *_a, **_k: pytest.fail("target mutation"))
-    with pytest.raises(file_ops.PreparedRollbackUnavailable) as caught:
-        publication.recover_prepared_transaction(prepared["transaction_id"], "rollback")
-    details = caught.value.details
-    assert caught.value.error_code == "prepared_rollback_unavailable"
-    assert details["required_capability"] == "crash_resumable_prepared_rollback_journal"
-    assert details["available"] == "none"
-    assert details["fallback"] is False
-    assert details["process_outcome"] == "not_applicable"
-    assert details["publication_outcome"] == "not_attempted"
-    assert details["recovery_state"] == "PREPARED"
-    assert details["operation_outcome"] == details["outcome"]
-    assert [path.read_bytes() for path in targets] == target_before
-    assert store.oplog_read() == records_before
-    assert sorted(Path(store.agw_home()).rglob("*")) == archive_before
+    terminal = publication.recover_prepared_transaction(
+        prepared["transaction_id"], "rollback",
+    )
+    assert terminal["state"] == "ROLLED_BACK"
+    assert terminal["publication_outcome"] == "rolled_back"
+    assert terminal["rolled_back"] is True
+    assert [path.read_bytes() for path in targets] == [b"old-a", b"old-b"]
 
 
 def test_roll_forward_compatibility_shim_fails_before_mutation(tmp_path, monkeypatch):
@@ -300,7 +289,7 @@ def test_finalize_all_after_is_metadata_only(
 ):
     plan, _stages, targets = _two_file_plan(tmp_path)
     prepared = _interrupt_after_first_publish(plan, targets, monkeypatch)
-    targets[1].write_bytes(b"new-b")
+    os.replace(prepared["operations"][1]["candidate"], targets[1])
     monkeypatch.setattr(store, "_restore_snapshot", lambda *_: pytest.fail("target write"))
     terminal = publication.recover_prepared_transaction(
         prepared["transaction_id"], "finalize-observed",

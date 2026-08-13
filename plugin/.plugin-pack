@@ -14,6 +14,7 @@ scripts/agw/office_tx.py
 scripts/agw/office_excel.py
 scripts/agw/office_word.py
 scripts/agw/publication.py
+scripts/agw/publication_recovery.py
 scripts/agw/path_safety.py
 scripts/agw/retention_config.py
 scripts/agw/run_plans.py

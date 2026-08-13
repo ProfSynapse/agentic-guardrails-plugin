@@ -14,6 +14,8 @@ import subprocess
 import time
 import uuid
 
+from . import recovery_contracts
+
 
 PREPARING = "PREPARING"
 ARTIFACT_VERIFIED = "ARTIFACT_VERIFIED"
@@ -175,6 +177,182 @@ def _persist(home: str, record: dict):
     _flush_directory(os.path.dirname(path))
 
 
+def _persist_new(home: str, record: dict):
+    """Publish a supplied-id manifest using one bounded protocol temp.
+
+    Before the authoritative manifest exists, this reserved path is treated as
+    same-user protocol state: a safe regular single-link partial may be
+    truncated and reused after process crash. Links/nonfiles/hardlinks block.
+    """
+    path = _manifest_path(home, record["transaction_id"])
+    temp = path + ".fixed-new.tmp"
+    if os.path.lexists(path):
+        raise FileExistsError(
+            f"archive transaction id already exists: {record['transaction_id']}"
+        )
+    fd = _open_fixed_protocol_temp(temp)
+    try:
+        payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        os.ftruncate(fd, 0)
+        _write_all(fd, payload)
+        os.fsync(fd)
+        identity = _fd_identity(fd)
+    finally:
+        os.close(fd)
+    _require_fixed_identity(temp, identity)
+    try:
+        try:
+            os.link(temp, path)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"archive transaction id already exists: {record['transaction_id']}"
+            ) from exc
+        _flush_directory(os.path.dirname(path))
+    finally:
+        try:
+            temp_info = os.lstat(temp)
+            path_info = os.lstat(path)
+            if not stat.S_ISREG(temp_info.st_mode) or not stat.S_ISREG(path_info.st_mode) \
+                    or int(getattr(temp_info, "st_nlink", 0)) != 2 \
+                    or int(getattr(path_info, "st_nlink", 0)) != 2 \
+                    or (int(getattr(temp_info, "st_dev", -1)),
+                int(getattr(temp_info, "st_ino", 0))) != identity \
+                    or (int(getattr(path_info, "st_dev", -1)),
+                        int(getattr(path_info, "st_ino", 0))) != identity:
+                raise ValueError("fixed-id manifest publication identity changed")
+            os.unlink(temp)
+            _require_fixed_identity(path, identity)
+        except FileNotFoundError:
+            pass
+
+
+def _fixed_update_path(home: str, transaction_id: str) -> str:
+    return _manifest_path(home, transaction_id) + ".fixed-update.tmp"
+
+
+def _write_all(fd: int, payload: bytes):
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(fd, view[written:])
+        if not isinstance(count, int) or count <= 0:
+            raise OSError("fixed-id protocol write made no progress")
+        written += count
+    if written != len(view):
+        raise OSError("fixed-id protocol write was incomplete")
+
+
+def _fd_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or int(getattr(info, "st_nlink", 1)) != 1:
+        raise ValueError("fixed-id protocol artifact is not a safe ordinary file")
+    identity = int(getattr(info, "st_dev", -1)), int(getattr(info, "st_ino", 0))
+    if identity[0] < 0 or identity[1] <= 0:
+        raise ValueError("fixed-id protocol artifact identity is not meaningful")
+    return identity
+
+
+def _require_fixed_identity(path: str, expected: tuple[int, int]) -> tuple[int, int]:
+    info = os.lstat(path)
+    if os.path.islink(path) or not stat.S_ISREG(info.st_mode) \
+            or int(getattr(info, "st_nlink", 1)) != 1:
+        raise ValueError("fixed-id protocol artifact is foreign or unsafe")
+    actual = int(getattr(info, "st_dev", -1)), int(getattr(info, "st_ino", 0))
+    if actual != expected:
+        raise ValueError("fixed-id protocol artifact identity changed")
+    return actual
+
+
+def _open_fixed_protocol_temp(path: str) -> int:
+    flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags, 0o600)
+    try:
+        identity = _fd_identity(fd)
+        _require_fixed_identity(path, identity)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _persist_fixed_update(home: str, record: dict):
+    """Checkpoint a fixed-id manifest through one bounded update temp."""
+    path = _manifest_path(home, record["transaction_id"])
+    temp = _fixed_update_path(home, record["transaction_id"])
+    fd = _open_fixed_protocol_temp(temp)
+    try:
+        payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        os.ftruncate(fd, 0)
+        _write_all(fd, payload)
+        os.fsync(fd)
+        identity = _fd_identity(fd)
+    finally:
+        os.close(fd)
+    _require_fixed_identity(temp, identity)
+    os.replace(temp, path)
+    _flush_directory(os.path.dirname(path))
+
+
+def _fixed_preparation_identity(path: str) -> tuple[int, int]:
+    info = os.lstat(path)
+    if os.path.islink(path) or not stat.S_ISREG(info.st_mode) \
+            or int(getattr(info, "st_nlink", 1)) != 1:
+        raise ValueError("fixed-id archive preparation is foreign or unsafe")
+    identity = int(getattr(info, "st_dev", -1)), int(getattr(info, "st_ino", 0))
+    if identity[0] < 0 or identity[1] <= 0:
+        raise ValueError("fixed-id archive preparation identity is not meaningful")
+    return identity
+
+
+def _allocate_fixed_preparation(home: str, record: dict) -> tuple[int, int]:
+    temp = record["temp"]
+    checkpoint = record.get("preparation_identity")
+    if os.path.lexists(temp):
+        identity = _fixed_preparation_identity(temp)
+        if checkpoint is not None and tuple(checkpoint) != identity:
+            raise ValueError("fixed-id archive preparation identity changed")
+        if checkpoint is None and os.path.getsize(temp) != 0:
+            raise ValueError("uncheckpointed fixed-id preparation is not empty")
+    else:
+        if checkpoint is not None:
+            raise ValueError("checkpointed fixed-id archive preparation is missing")
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(temp, flags, 0o600)
+        try:
+            identity = _fd_identity(fd)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _require_fixed_identity(temp, identity)
+    if checkpoint is None:
+        record["preparation_identity"] = list(identity)
+        _persist_fixed_update(home, record)
+    return identity
+
+
+def _write_fixed_preparation(record: dict, identity: tuple[int, int]):
+    temp = record["temp"]
+    _require_fixed_identity(temp, identity)
+    flags = os.O_WRONLY | int(getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(temp, flags)
+    try:
+        if _fd_identity(fd) != identity:
+            raise ValueError("fixed-id archive preparation changed before write")
+        os.ftruncate(fd, 0)
+        with open(record["src"], "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                os.write(fd, chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _require_fixed_identity(temp, identity)
+
+
 def load(home: str, transaction_id: str) -> dict:
     with open(_manifest_path(home, transaction_id), encoding="utf-8") as handle:
         record = json.load(handle)
@@ -186,7 +364,10 @@ def load(home: str, transaction_id: str) -> dict:
 def update(home: str, transaction_id: str, **fields) -> dict:
     record = load(home, transaction_id)
     record.update(fields)
-    _persist(home, record)
+    if record.get("fixed_id_transaction") is True:
+        _persist_fixed_update(home, record)
+    else:
+        _persist(home, record)
     return record
 
 
@@ -304,7 +485,10 @@ def _remove(path: str, kind: str):
 
 def _transition(home: str, record: dict, state: str):
     record["state"] = state
-    _persist(home, record)
+    if record.get("fixed_id_transaction") is True:
+        _persist_fixed_update(home, record)
+    else:
+        _persist(home, record)
 
 
 def _crash(crash_after: str | None, point: str):
@@ -318,7 +502,9 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
                    policy_revision: str = "",
                    retention_class: str = "",
                    protected_until_ns: int = 0,
-                   capture_group_id: str = "") -> dict:
+                   capture_group_id: str = "",
+                   transaction_id: str = "",
+                   recovery_source_identity=None) -> dict:
     """Create and commit one archive transaction.
 
     The source is never removed until a published artifact has been verified
@@ -326,6 +512,16 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
     """
     if mode not in {"copy", "move"}:
         raise ValueError("archive mode must be 'copy' or 'move'")
+    supplied_transaction_id = bool(transaction_id)
+    transaction_id = (
+        recovery_contracts.exact_transaction_id(transaction_id)
+        if supplied_transaction_id else uuid.uuid4().hex
+    )
+    if supplied_transaction_id and os.path.lexists(
+            _manifest_path(home, transaction_id)):
+        raise FileExistsError(
+            f"archive transaction id already exists: {transaction_id}"
+        )
     src = os.path.abspath(src)
     dest = os.path.abspath(dest)
     excluded_paths = [os.path.realpath(home), os.path.realpath(dest)]
@@ -334,7 +530,6 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
     if link and link.get("link_type") == "junction":
         _validate_junction_command_paths(src, link.get("target", ""))
     artifact_kind = "link-metadata" if kind == "link" else kind
-    transaction_id = uuid.uuid4().hex
     temp = os.path.join(
         os.path.dirname(dest), f".{os.path.basename(dest)}.{transaction_id}.preparing"
     )
@@ -361,18 +556,33 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
         "retention_class": str(retention_class or ""),
         "protected_until_ns": max(0, int(protected_until_ns or 0)),
         "capture_group_id": str(capture_group_id or ""),
+        **({"recovery_source_identity": list(recovery_source_identity)}
+           if recovery_source_identity is not None else {}),
         "artifact_state": "PRESENT",
         "excluded_paths": excluded_paths,
+        **({"fixed_id_transaction": True} if supplied_transaction_id else {}),
     }
-    _persist(home, record)
+    if supplied_transaction_id:
+        _persist_new(home, record)
+    else:
+        _persist(home, record)
     _crash(crash_after, PREPARING)
 
-    _copy(src, temp, kind, excluded_paths, link=link)
+    if supplied_transaction_id:
+        if kind != "file":
+            raise ValueError("fixed-id publication rollback capture requires a file")
+        preparation_identity = _allocate_fixed_preparation(home, record)
+        _write_fixed_preparation(record, preparation_identity)
+    else:
+        _copy(src, temp, kind, excluded_paths, link=link)
     if _artifact_fingerprint(temp, artifact_kind) != (artifact_kind, digest, size):
         raise OSError("temporary archive artifact did not match its source")
     # Persist verification metadata while still PREPARING so a crash immediately
     # after publish can be discovered and verified without trusting filenames.
-    _persist(home, record)
+    if supplied_transaction_id:
+        _persist_fixed_update(home, record)
+    else:
+        _persist(home, record)
     os.replace(temp, dest)
     _flush_directory(os.path.dirname(dest))
     _crash(crash_after, "ARTIFACT_PUBLISHED")
@@ -454,6 +664,7 @@ def entry_from_record(record: dict) -> dict:
         "retention_class": record.get("retention_class", ""),
         "protected_until_ns": int(record.get("protected_until_ns") or 0),
         "capture_group_id": record.get("capture_group_id", ""),
+        "recovery_source_identity": record.get("recovery_source_identity"),
         "artifact_state": record.get("artifact_state", "PRESENT"),
         "transaction_id": record.get("transaction_id"),
         "created_at_ns": record.get("created_at_ns"),
@@ -490,6 +701,7 @@ def entry_is_verified(home: str, entry: dict, requested_src: str = None) -> bool
             "transaction_id", "created_at_ns", "version", "mode", "artifact_kind",
             "policy_revision", "retention_class", "protected_until_ns",
             "capture_group_id", "artifact_state", "sha256", "size",
+            "recovery_source_identity",
         )
         if any(entry.get(field) != record.get(field) for field in bound_fields):
             return False
@@ -522,7 +734,10 @@ def _quarantine(home: str, record: dict) -> str:
 
 def _record_error(home: str, record: dict, message: str) -> dict:
     record["recovery_error"] = message
-    _persist(home, record)
+    if record.get("fixed_id_transaction") is True:
+        _persist_fixed_update(home, record)
+    else:
+        _persist(home, record)
     return {"transaction_id": record["transaction_id"], "status": "needs_attention",
             "error": message, "record": record}
 
@@ -533,6 +748,9 @@ def recover_record(home: str, record: dict) -> dict:
     expected = (record.get("artifact_kind"), record.get("sha256"), record.get("size"))
     src = record.get("src", "")
     dest = record.get("dest", "")
+
+    if state == PREPARING and record.get("fixed_id_transaction") is True:
+        return _resume_preparing_archive(home, record)
 
     if record.get("kind") == "absent_tombstone":
         return {"transaction_id": record["transaction_id"], "status": state,
@@ -597,6 +815,53 @@ def recover_record(home: str, record: dict) -> dict:
 
     return {"transaction_id": record["transaction_id"], "status": state,
             "record": record}
+
+
+def _resume_preparing_archive(home: str, record: dict) -> dict:
+    """Resume an authenticated fixed-id capture before normal reconciliation.
+
+    The higher store layer authenticates the recovery binding before calling
+    this helper. Under the reserved-path, same-user crash boundary, an
+    incomplete checkpointed copy is truncated and rebuilt in the same inode;
+    this path never creates quarantine or UUID-suffixed evidence.
+    """
+    if record.get("kind") != "archive":
+        raise ValueError("only archive transactions can resume capture")
+    if record.get("state") != PREPARING:
+        return recover_record(home, record)
+    expected = (
+        record.get("artifact_kind"), record.get("sha256"), record.get("size")
+    )
+    source_expected = (
+        record.get("source_kind", record.get("artifact_kind")),
+        record.get("sha256"), record.get("size"),
+    )
+    src = str(record.get("src") or "")
+    dest = str(record.get("dest") or "")
+    temp = str(record.get("temp") or "")
+    if dest and os.path.lexists(dest):
+        if _artifact_fingerprint(dest, record.get("artifact_kind")) != expected:
+            return _record_error(home, record, "published artifact is corrupt")
+        _transition(home, record, ARTIFACT_VERIFIED)
+        return recover_record(home, record)
+    if not src or not os.path.lexists(src):
+        return _record_error(
+            home, record, "fixed-id archive source is unavailable before publication"
+        )
+    if _fingerprint(src, record.get("excluded_paths", ())) != source_expected:
+        return _record_error(home, record, "source changed before capture resumed")
+    if record.get("artifact_kind") != "file" \
+            or record.get("source_kind", "file") != "file" \
+            or not record.get("recovery_source_identity"):
+        raise ValueError("bounded fixed-id resume requires publication file metadata")
+    identity = _allocate_fixed_preparation(home, record)
+    _write_fixed_preparation(record, identity)
+    if _artifact_fingerprint(temp, record.get("artifact_kind")) != expected:
+        return _record_error(home, record, "resumed temporary artifact is corrupt")
+    os.replace(temp, dest)
+    _flush_directory(os.path.dirname(dest))
+    _transition(home, record, ARTIFACT_VERIFIED)
+    return recover_record(home, record)
 
 
 def recover_all(home: str) -> list[dict]:
