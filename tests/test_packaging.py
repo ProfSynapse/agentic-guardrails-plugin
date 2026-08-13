@@ -524,7 +524,12 @@ def test_shipped_recovery_docs_state_process_crash_threat_boundary():
         assert "same-user filesystem race/substitution" in text
         assert "full power-loss durability" in text
         assert "simultaneous" in text
-        assert "identity changes fail closed" in text
+        assert "links/hardlinks" in text or "links, hardlinks" in text
+        assert "recorded filesystem identity" in text
+        assert "fail closed" in text
+        assert "Inode reuse" in text
+        assert "non-cooperating same-user unlink/recreate" in text
+        assert "outside this process-crash guarantee" in text
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])

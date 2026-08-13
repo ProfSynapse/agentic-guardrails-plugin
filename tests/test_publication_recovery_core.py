@@ -424,8 +424,26 @@ def test_publication_stage_replacement_blocks_write_and_preserves_foreign(
     basename = ".agw-publication-rollback-" + "c" * 32 + ".restore"
     identity = store._create_publication_restore_stage_locked(str(target), basename)
     stage = Path(store._publication_stage_path(str(target), basename))
-    stage.unlink()
-    stage.write_bytes(b"foreign")
+    foreign = None
+    foreign_identity = None
+    for attempt in range(8):
+        candidate = tmp_path / f"foreign-replacement-{attempt}.tmp"
+        candidate.write_bytes(b"foreign")
+        info = os.lstat(candidate)
+        observed = {
+            "st_dev": int(getattr(info, "st_dev", -1)),
+            "st_ino": int(getattr(info, "st_ino", 0)),
+        }
+        if observed != identity and observed["st_dev"] >= 0 \
+                and observed["st_ino"] > 0:
+            foreign = candidate
+            foreign_identity = observed
+            break
+        candidate.unlink()
+    if foreign is None:
+        pytest.skip("filesystem did not provide a distinct meaningful inode")
+    assert foreign_identity != identity
+    os.replace(foreign, stage)
 
     with pytest.raises(ValueError, match="identity changed"):
         store._write_publication_restore_stage_locked(

@@ -22,5 +22,7 @@ failures remain retryable `BLOCKED`. The guarantee covers accidental AGW process
 termination on a functioning local OS/filesystem with cooperating AGW locks and
 acknowledged writes—not malicious/non-cooperating same-user filesystem
 race/substitution, full power-loss durability, or simultaneous set visibility.
-Collisions, links, or identity changes fail closed. Recovery never executes
-content/commands or rolls forward.
+Detected collisions, links/hardlinks, or recorded filesystem identity changes
+fail closed. Inode reuse from non-cooperating same-user unlink/recreate is outside
+this process-crash guarantee. Recovery never executes content/commands or rolls
+forward.

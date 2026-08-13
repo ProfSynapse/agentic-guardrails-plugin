@@ -294,7 +294,9 @@ rolls forward, and promises neither simultaneous visibility nor full power-loss
 durability. Its guarantee covers accidental AGW process termination on a
 functioning local OS/filesystem with cooperating AGW locks and acknowledged
 writes—not malicious or non-cooperating same-user filesystem race/substitution.
-Path collisions, links, or identity changes fail closed. Omitting `--action`
+Path collisions, links/hardlinks, or changes to recorded filesystem identity
+fail closed when detected. Inode reuse caused by non-cooperating same-user
+unlink/recreate is outside this process-crash guarantee. Omitting `--action`
 fails without mutation.
 
 Successful file mutations include an explicit recovery receipt stating whether
