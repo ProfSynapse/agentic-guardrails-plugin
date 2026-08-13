@@ -1333,13 +1333,13 @@ def run_declared(
                  "undo_argv": ["agw", "undo", "--transaction", transaction_id]},
             ) from exc
         declared = {os.path.normcase(os.path.abspath(path)) for path in targets}
-        undeclared = []
-        for change in observed_changes:
-            absolute = os.path.normcase(os.path.abspath(change["path"]))
-            if absolute in declared or _matches_output_pattern(
-                    change["path"], roots, patterns):
-                continue
-            undeclared.append(change)
+        undeclared, ignored_sidecar_changes = _partition_observed_changes(
+            observed_changes, declared, roots, patterns,
+        )
+        unchanged_outputs = [
+            output["path"] for output in output_results
+            if not output["changed"]
+        ]
         return {
             "ok": (completed.exit_code == 0 and not missing_outputs
                    and not undeclared and not completed.timed_out),
@@ -1359,10 +1359,19 @@ def run_declared(
                 "timeout_seconds": float(timeout_seconds),
             },
             "declared_outputs_missing": missing_outputs,
+            # This is an exact declared-output state inventory. A required
+            # output that was absent before and remains absent is both
+            # unchanged and missing; callers should use the missing inventory
+            # for contract evaluation.
+            "unchanged_outputs": unchanged_outputs,
             "unclaimed_observed_changes": undeclared,
             # Compatibility alias retained for existing JSON consumers. A
             # before/after manifest cannot prove which process caused a change.
             "undeclared_outputs": undeclared,
+            # Output patterns are intentional after-the-fact exclusions, not
+            # isolation. Return every suppressed changed path and the exact
+            # root/pattern that matched so consumers do not infer silence.
+            "ignored_sidecar_changes": ignored_sidecar_changes,
             "output_roots": roots,
             "output_patterns": patterns,
             "output_observation": {
@@ -1372,6 +1381,7 @@ def run_declared(
                 "files_after": after_observation["count"],
                 "changed_paths": len(observed_changes),
                 "unclaimed_changes": len(undeclared),
+                "ignored_changes": len(ignored_sidecar_changes),
             },
             "capture_truncated": completed.capture_truncated,
         }
@@ -1579,14 +1589,39 @@ def _observation_changes(before: dict, after: dict) -> list[dict]:
     return changes
 
 
-def _matches_output_pattern(path: str, roots: list[str], patterns: list[str]) -> bool:
+def _output_pattern_match(path: str, roots: list[str],
+                          patterns: list[str]) -> Optional[dict]:
+    """Return deterministic match evidence for an observed output change."""
     for root in roots:
         if not _path_is_within(path, root):
             continue
         relative = os.path.relpath(path, root).replace("\\", "/")
-        if any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns):
-            return True
-    return False
+        for pattern in patterns:
+            if fnmatch.fnmatchcase(relative, pattern):
+                return {
+                    "output_root": root,
+                    "relative_path": relative,
+                    "matched_pattern": pattern,
+                }
+    return None
+
+
+def _partition_observed_changes(changes: list[dict], declared: set[str],
+                                roots: list[str], patterns: list[str]
+                                ) -> tuple[list[dict], list[dict]]:
+    """Separate unclaimed changes from exact pattern-matched exclusions."""
+    unclaimed = []
+    ignored = []
+    for change in changes:
+        absolute = os.path.normcase(os.path.abspath(change["path"]))
+        if absolute in declared:
+            continue
+        match = _output_pattern_match(change["path"], roots, patterns)
+        if match is None:
+            unclaimed.append(change)
+        else:
+            ignored.append({**change, **match})
+    return unclaimed, ignored
 
 
 def replace_with_retry(source: str, target: str, retry_seconds: float = 5.0) -> int:

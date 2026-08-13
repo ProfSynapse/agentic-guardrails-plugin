@@ -29,6 +29,7 @@ jobs:
               Path("plugin/.claude-plugin/plugin.json"),
               Path("plugin/.codex-plugin/plugin.json"),
               Path(".claude-plugin/marketplace.json"),
+              Path(".agents/plugins/marketplace.json"),
           ):
               json.loads(path.read_text(encoding="utf-8"))
       - name: Run Windows packed-artifact shard

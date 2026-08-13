@@ -222,6 +222,10 @@ values. The CLI omits the input command, normalized arguments, and nested diagno
 so raw values are not multiplied. `agw workflow propose` builds an inert
 validated v2 manifest from explicit outputs, expected
 states, and allowed roots without writing a file or changing trust state.
+
+Migration note for 0.4: `suggested_argv` is metadata, not an argv array. Consumers
+must take executable values only from `recommended_argv`; the deprecated object
+exists solely to identify that replacement without duplicating private arguments.
 For dependent changes across several UTF-8 files, `agw file plan` validates a
 version-1 JSON list of `write`, `patch`, and `replace` operations and writes a
 self-contained proposal without changing the targets. `agw file apply-plan`
@@ -252,7 +256,11 @@ Explicit, bounded `--output-root` manifests detect unclaimed observed changes, a
 patterns can identify intentional companion files. This is after-the-fact
 detection, not prevention or recovery for unknown files, and it cannot prove
 which process caused a change. Use only narrow, stable roots and declare
-deterministic sidecars exactly whenever possible. See the
+deterministic sidecars exactly whenever possible. Executed JSON returns
+`unchanged_outputs` for exact declarations whose pre/post state compares equal
+and `ignored_sidecar_changes` for every pattern-suppressed change, including its
+root, relative path, and matched pattern. A required absent output can be both
+unchanged and missing; dry runs do not claim either post-execution inventory. See the
 [trusted-workflow reference](skills/agentic-guardrails/references/trusted-workflows.md).
 Compact, bounded stdout/stderr tails are included in JSON results. `publish-file`
 validates a staged hash and Office package, captures one target pre-image,

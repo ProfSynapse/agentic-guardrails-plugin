@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -211,12 +211,14 @@ def test_distributable_manifest_versions_are_aligned():
     claude = _manifest(SOURCE_PLUGIN / ".claude-plugin" / "plugin.json")
     codex = _manifest(SOURCE_PLUGIN / ".codex-plugin" / "plugin.json")
     market = _manifest(ROOT / ".claude-plugin" / "marketplace.json")["plugins"][0]
+    codex_market = _manifest(ROOT / ".agents" / "plugins" / "marketplace.json")["plugins"][0]
     assert claude["version"] == codex["version"] == market["version"] == VERSION
     assert re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", VERSION)
     # Release candidates intentionally resolve from main until the verified
     # merge commit is tagged. Published pointers must resolve to this version's
     # exact immutable tag; no other branch or tag is distributable.
     assert market["source"]["ref"] in {"main", f"v{VERSION}"}
+    assert codex_market["source"]["ref"] in {"main", f"v{VERSION}"}
 
 
 def test_packed_artifact_has_selected_hooks_launchers_and_no_caches(packed_plugin):
