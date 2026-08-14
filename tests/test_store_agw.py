@@ -857,6 +857,13 @@ def test_cli_doctor_runs(agw_home):
     result = run_agw("doctor", "--json")
     data = json.loads(result.stdout)
     assert data["agw_home_writable"] is True
+    assert data["launcher_command"] == "agw"
+    assert data["launcher_resolution"] == "trusted-pretool-rewrite"
+    assert data["launcher_cache_discovery_required"] is False
+    assert data["launcher_failure_reason_code"] == "launcher_unavailable"
+    assert data["workflow_record_schema"] == "agw.trusted-workflow/v2"
+    assert data["workflow_refresh_plans"] is True
+    assert data["workflow_export"] is True
 
 
 def test_cli_doctor_uses_real_archive_write_probe(tmp_path):

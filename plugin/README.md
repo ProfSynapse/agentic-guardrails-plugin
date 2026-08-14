@@ -127,6 +127,8 @@ so the agent self-corrects instead of fighting the rails:
 | discover an existing script contract | `agw workflow match -- command` |
 | draft a contract without trusting or writing it | `agw workflow propose ... -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
+| review legitimate trusted-script drift | `agw workflow refresh-plan`, then `agw workflow refresh` |
+| recover a canonical manifest | `agw workflow export ID` |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 | publish several staged artifacts | `agw publish-plan create` then `agw publish-plan apply` |
 | inspect an exact CLI contract | `agw schema file apply-plan --json` |
@@ -238,6 +240,11 @@ JSON failures distinguish `preimage_hash_conflict`, `patch_context_conflict`,
 `patch_hunk_count_mismatch`, and `replace_match_conflict`. Count mismatches also
 return the hunk/header, patch line, expected and observed counts, and a corrected
 header suggestion so an agent can repair the diff without parsing prose.
+PreToolUse denials derive their human explanation and `agw.refusal/v1` metadata
+from the same closed decision. The metadata includes the stable reason code,
+`mutation_occurred`, safe-retry status, revalidated argv when available,
+required approval, and one unambiguous blocked target. Advice is inert and must
+be submitted as a new operation for normal policy evaluation.
 Reviewed repeated tools can install a data-only, script-hash-bound manifest with
 `agw workflow trust`, then use `agw run --workflow ID`; a repository manifest is
 inert until that explicit user-confirmed trust step. Manifest v2 binds exact
@@ -246,6 +253,14 @@ hash; `agw run --workflow ID` reconstructs that reviewed command without
 restating fragile Unicode paths. `agw workflow init` generates escaped v2 JSON,
 `validate` checks an inert manifest, and `status` compares it with this machine's
 sealed record. V1 remains readable for compatibility but does not bind arguments.
+New trust records also retain authenticated canonical-manifest provenance,
+semantic contract and script hashes, reviewed source/version labels, approval
+metadata, and one compressed approved script snapshot embedded in the sealed
+record and capped at 128 KiB. Repeated refreshes replace that bounded record.
+`workflow refresh-plan` creates an expiring review bound to the current
+record seal; `workflow refresh` updates only the trusted script identity and
+refuses contract changes, replay, expiry, and post-review drift. `workflow
+export` reconstructs inert manifests, including legacy registrations.
 Manifest v3 binds named typed parameters to reviewed argument positions. Run it
 with `agw run --workflow ID --param NAME=VALUE`; enum, hash-bound enum-file,
 conservative regex, integer-range, and bounded-path constraints are available.

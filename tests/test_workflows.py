@@ -697,12 +697,36 @@ def test_engine_requires_confirmation_to_install_trust_but_allows_inspection(pol
                   cwd=os.getcwd()),
         policy, PLUGIN,
     )
+    refresh = engine.evaluate(
+        ToolEvent(kind=EXEC, tool="Bash",
+                  command=f'"{launcher}" workflow refresh refresh-plan.json '
+                          '--expected-plan-hash ' + "a" * 64 + ' --approve-refresh',
+                  cwd=os.getcwd()),
+        policy, PLUGIN,
+    )
+    refresh_plan = engine.evaluate(
+        ToolEvent(kind=EXEC, tool="Bash",
+                  command=f'"{launcher}" workflow refresh-plan example.writer '
+                          '--plan-file refresh-plan.json', cwd=os.getcwd()),
+        policy, PLUGIN,
+    )
+    exported = engine.evaluate(
+        ToolEvent(kind=EXEC, tool="Bash",
+                  command=f'"{launcher}" workflow export example.writer',
+                  cwd=os.getcwd()),
+        policy, PLUGIN,
+    )
     assert trust.action == ASK
     assert trust.rule_id == "builtin:agw-workflow-trust"
     assert trust.presentation_details["targets"] == ["contract.json"]
     assert trust.presentation_details["target_kind"] == "file"
+    assert refresh.action == ASK
+    assert refresh.rule_id == "builtin:agw-workflow-refresh"
+    assert refresh.presentation_details["targets"] == ["refresh-plan.json"]
     assert listing.action == ALLOW
     assert matching.action == ALLOW
+    assert refresh_plan.action == ALLOW
+    assert exported.action == ALLOW
 
 
 def test_workflow_match_cli_returns_one_authoritative_recommendation(tmp_path):

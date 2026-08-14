@@ -1643,36 +1643,47 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                 (value for value in args[verb_index + 1:]
                  if value and not value.startswith("-")), ""
             )
-            if workflow_op == "trust":
+            if workflow_op in {"trust", "refresh"}:
                 try:
-                    workflow_op_index = args.index("trust", verb_index + 1)
+                    workflow_op_index = args.index(workflow_op, verb_index + 1)
                 except ValueError:
                     workflow_op_index = -1
                 manifest = ""
                 if workflow_op_index >= 0 and workflow_op_index + 1 < len(args):
                     candidate = args[workflow_op_index + 1]
                     manifest = candidate if candidate and not candidate.startswith("-") else ""
+                refreshing = workflow_op == "refresh"
                 return Decision(
                     ASK,
-                    "Installing or replacing a trusted workflow grants a specific, "
-                    "hash-bound script permission to write its declared outputs. "
-                    "Review the manifest, script identity, output paths, and observed roots.",
-                    "builtin:agw-workflow-trust",
+                    ("Refreshing a trusted workflow replaces its approved script identity "
+                     "from one hash-bound review plan. Review the script diff and confirm "
+                     "that the declared contract is unchanged."
+                     if refreshing else
+                     "Installing or replacing a trusted workflow grants a specific, "
+                     "hash-bound script permission to write its declared outputs. "
+                     "Review the manifest, script identity, output paths, and observed roots."),
+                    ("builtin:agw-workflow-refresh" if refreshing
+                     else "builtin:agw-workflow-trust"),
                     enforcement_class=NON_WAIVABLE_INVARIANT,
                     presentation_context=DecisionContext.AGW_MUTATION,
                     presentation_details={
-                        "operation": "trust workflow",
+                        "operation": ("refresh workflow" if refreshing else "trust workflow"),
                         "targets": [manifest] if manifest else [],
                         "target_kind": "file",
                         "signal": "persistent script output authorization",
-                        "trigger": "The agent requested a new or replacement trusted workflow record.",
+                        "trigger": (
+                            "The agent requested a reviewed script-only trust refresh."
+                            if refreshing else
+                            "The agent requested a new or replacement trusted workflow record."
+                        ),
                     },
                 )
             workflow_help = any(
                 value in {"-h", "--help"} for value in args[verb_index + 1:]
             )
             if not workflow_help and workflow_op not in {
-                "list", "match", "propose", "info", "validate", "status", "init",
+                "list", "match", "propose", "info", "export", "refresh-plan",
+                "validate", "status", "init",
             }:
                 return Decision(
                     DENY, "This workflow operation is not recognized.",

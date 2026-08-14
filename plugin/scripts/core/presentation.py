@@ -201,14 +201,64 @@ def render_safe_next(advice: remediation.SafeNext) -> str:
             "Continue without the operation, or retry later when an approval "
             "provider is available."
         )
+    if reason_code == remediation.REASON_BOUNDED_DISCOVERY:
+        return "Use the exact bounded Guardrails listing command supplied below."
     return (
         "Propose a narrower, reversible operation with explicit targets that "
         "satisfies the active safety policy."
     )
 
 
+def _blocked_target(evlist) -> str:
+    targets = []
+    for event in list(evlist or []):
+        for value in list(getattr(event, "paths", []) or []):
+            target = str(value or "")
+            if target and target not in targets:
+                targets.append(target)
+    if len(targets) != 1 or len(targets[0].encode("utf-8")) > 4096:
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in targets[0]):
+        return ""
+    return targets[0]
+
+
+def build_refusal_metadata(decision: GuardrailDecision,
+                           approval_outcome: str = "", evlist=None) -> dict:
+    advice = decision.safe_next or remediation.incomplete(decision.rule_id)
+    if approval_outcome == "prompt-incomplete":
+        advice = remediation.SafeNext(
+            remediation.REASON_DIRECT, source=advice.source,
+            missing_fields=("recommended_argv", "approval_target"),
+        )
+    elif approval_outcome:
+        advice = remediation.approval_outcome(advice, approval_outcome)
+    if approval_outcome in {
+            "provider-unavailable", "provider-timeout", "provider-error",
+            "headless-deny", "not-prompt-eligible", "policy-revision-unavailable",
+            "prompt-incomplete"}:
+        required_approval = "host-approval-capability"
+    elif decision.rule_id in {"builtin:protected-path", "policy:zone"}:
+        required_approval = "policy-change"
+    elif decision.rule_id == "builtin:agw-impostor":
+        required_approval = "host-launcher-capability"
+    else:
+        required_approval = "none"
+    return {
+        "schema": "agw.refusal/v1",
+        "reason_code": advice.reason_code,
+        "rule_id": decision.rule_id or "unknown",
+        "mutation_occurred": False,
+        "safe_retry_available": advice.safe_to_retry,
+        "recommended_command": list(advice.recommended_argv),
+        "required_approval": required_approval,
+        "blocked_target": _blocked_target(evlist),
+        "safe_next": advice.as_dict(),
+    }
+
+
 def build_denial_feedback(decision: GuardrailDecision,
-                          approval_outcome: str = "") -> str:
+                          approval_outcome: str = "", evlist=None) -> str:
     """Render a denial as useful feedback instead of a dead end.
 
     A declined approval is deliberately non-retriable so an agent cannot nag by
@@ -238,6 +288,7 @@ def build_denial_feedback(decision: GuardrailDecision,
             "\n\nRecommended argv (submit as a new operation for policy evaluation): "
             + json.dumps(list(advice.recommended_argv), ensure_ascii=False)
         )
+    metadata = build_refusal_metadata(decision, approval_outcome, evlist)
     return (
         f"Blocked: {blocked}\n\n"
         "Result: The requested action did not run; no requested target was changed.\n\n"
@@ -245,7 +296,9 @@ def build_denial_feedback(decision: GuardrailDecision,
         "User communication: Briefly explain in plain language why Guardrails "
         "blocked the action and recommend the safest way to continue toward the "
         "user's goal. Do not quote the raw command or expose sensitive values. "
-        "Ask the user only when choosing among safe alternatives requires their decision."
+        "Ask the user only when choosing among safe alternatives requires their decision.\n\n"
+        "Machine-readable refusal: "
+        + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
     )
 
 

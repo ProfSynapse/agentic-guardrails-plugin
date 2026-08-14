@@ -21,7 +21,7 @@ _WINDOWS_PREREQUISITE = (
     if os.name == "nt" else ""
 )
 
-CONTEXT = f"""agentic-guardrails is active. Use `{_AGW}`; the trusted PreToolUse hook resolves it. Use the exact host-supplied `SKILL.md` location; never infer, shorten, search for, or expose a plugin-cache path.{_WINDOWS_PREREQUISITE}
+CONTEXT = f"""agentic-guardrails is active. Use `{_AGW}`; the trusted PreToolUse hook resolves it. Use the exact host-supplied `SKILL.md` location; never infer, shorten, search for, or expose a plugin-cache path. If literal `agw` cannot be invoked, stop with reason code `launcher_unavailable`; do not scan for a launcher. Ask the user to enable the Guardrails hooks and start a new task.{_WINDOWS_PREREQUISITE}
 Treat CLI help as authoritative. Request only `--help`, `<verb> --help`, or `office <operation> --help` for the needed scope.
 - Resolve exact targets before acting; name every target literally. Avoid variables, globs, substitutions, splatting, dynamic joins, and mixed mutation scripts.
 - Separate discovery/read, validation/dry-run, mutation, and verification. Do not bundle unrelated writes. Prefer the smallest reversible operation and compact file/stdin input.
