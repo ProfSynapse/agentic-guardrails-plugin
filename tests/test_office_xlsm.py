@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,16 @@ def rewrite_part(path: Path, part: str, transform) -> None:
     os.replace(replacement, path)
 
 
+def prefix_worksheet_main_namespace(payload: bytes) -> bytes:
+    namespace = office_surgical.MAIN_NS.encode("ascii")
+    prefixed = payload.replace(
+        b'xmlns="' + namespace + b'"', b'xmlns:x="' + namespace + b'"', 1,
+    )
+    return re.sub(
+        rb"<(/?)([A-Za-z_][\w.-]*)(?=[\s>/])", rb"<\1x:\2", prefixed,
+    )
+
+
 def test_manifest_and_validation_track_vba_exactly(tmp_path):
     original = make_synthetic_xlsm(tmp_path / "macro.xlsm")
     candidate = tmp_path / "candidate.xlsm"
@@ -132,6 +143,58 @@ def test_set_cell_supports_xlsm_with_exact_unrelated_part_preservation(
     with zipfile.ZipFile(target) as package:
         assert package.read("xl/vbaProject.bin") == vba_before
     assert Path(store.list_versions(str(target))[0]["dest"]).exists()
+
+
+def test_set_cell_preserves_prefixed_worksheet_namespace(tmp_path, agw_home):
+    target = make_synthetic_xlsm(tmp_path / "prefixed.xlsm")
+    office_surgical.set_cell(str(target), "Data", "K16", 0)
+    rewrite_part(
+        target, "xl/worksheets/sheet1.xml", prefix_worksheet_main_namespace,
+    )
+    before = store.file_sha256(str(target))
+
+    result = json.loads(run_agw(
+        "office", "set-cell", target, "--sheet", "Data", "--cell", "K16",
+        "--value", "7", "--expected-file-hash", before, "--json",
+    ).stdout)
+    assert result["old"] == 0
+    assert result["new"] == 7
+    assert office_surgical.inspect_cell(str(target), "Data", "K16")["value"] == 7
+
+    office_surgical.set_cell(str(target), "Data", "L16", "same-row")
+    office_surgical.set_cell(str(target), "Data", "A17", "new-row")
+    assert office_surgical.inspect_cell(str(target), "Data", "L16")["value"] == "same-row"
+    assert office_surgical.inspect_cell(str(target), "Data", "A17")["value"] == "new-row"
+    with zipfile.ZipFile(target) as package:
+        worksheet = package.read("xl/worksheets/sheet1.xml")
+    assert b"<x:sheetData" in worksheet
+    assert b'<x:c r="K16"' in worksheet
+    assert b'<x:c r="L16"' in worksheet
+    assert b'<x:row r="17"' in worksheet
+    assert b"<sheetData" not in worksheet
+
+
+def test_set_cell_dry_run_rejects_missing_sheet_data(tmp_path, agw_home):
+    target = make_synthetic_xlsm(tmp_path / "missing-sheet-data.xlsm")
+    rewrite_part(
+        target,
+        "xl/worksheets/sheet1.xml",
+        lambda payload: re.sub(
+            rb"<sheetData\b[^>]*(?:/>|>.*?</sheetData\s*>)", b"", payload,
+            count=1, flags=re.DOTALL,
+        ),
+    )
+    before = store.file_sha256(str(target))
+
+    result = run_agw(
+        "office", "set-cell", target, "--sheet", "Data", "--cell", "B2",
+        "--value", "blocked", "--expected-file-hash", before,
+        "--dry-run", "--json", check=False,
+    )
+    assert result.returncode != 0
+    assert "worksheet has no sheetData element" in result.stderr
+    assert store.file_sha256(str(target)) == before
+    assert store.list_versions(str(target)) == []
 
 
 def test_xlsm_checkout_defaults_outside_source_and_publishes_safely(
