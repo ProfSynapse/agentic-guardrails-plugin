@@ -1270,6 +1270,7 @@ def cmd_workflow(args):
 
             data = workflows.trust_manifest(
                 args.manifest, args.expected_manifest_hash, replace=args.replace,
+                source_name=args.source_name, source_version=args.source_version,
                 phase_callback=show_phase,
             )
             human = (
@@ -1359,8 +1360,52 @@ def cmd_workflow(args):
                 "parameters": manifest.get("parameters", {}),
                 "manifest_sha256": record["manifest_sha256"],
                 "trusted_at": record["trusted_at"], "verified": True,
+                "record_schema": record["schema"],
+                "provenance": record.get("provenance"),
             }
             human = f"trusted workflow {manifest['id']} ({manifest['command']['runtime']})"
+        elif args.workflow_op == "export":
+            data = workflows.export_trusted(args.workflow_id)
+            if args.output:
+                written = file_ops.write_text(
+                    args.output, data["content"], expected_hash=args.expected_file_hash,
+                    operation="workflow-export",
+                )
+                data = {
+                    **data, "output": written["path"], "changed": written["changed"],
+                    "snapshot_transaction_id": written.get("snapshot_transaction_id", ""),
+                }
+                human = f"exported workflow {data['workflow']} to {data['output']}"
+            elif args.json:
+                human = json.dumps(data["manifest"], ensure_ascii=True, indent=2)
+            else:
+                sys.stdout.write(data["content"] + "\n")
+                return
+        elif args.workflow_op == "refresh-plan":
+            data = workflows.build_refresh_plan(args.workflow_id)
+            serialized = json.dumps(data, ensure_ascii=True, indent=2) + "\n"
+            written = file_ops.write_text(
+                args.plan_file, serialized, expected_hash=args.expected_file_hash,
+                operation="workflow-refresh-plan",
+            )
+            data = {
+                **data, "plan_file": written["path"], "changed": written["changed"],
+                "snapshot_transaction_id": written.get("snapshot_transaction_id", ""),
+            }
+            human = (
+                f"created workflow refresh plan {data['plan_sha256']} at {data['plan_file']}; "
+                + ("contract unchanged; refresh may be approved" if data["apply_allowed"]
+                   else "contract changed; full trust replacement is required")
+            )
+        elif args.workflow_op == "refresh":
+            if not args.approve_refresh:
+                raise workflows.WorkflowRefreshError(
+                    "review the refresh plan and pass --approve-refresh; the host will also request confirmation"
+                )
+            data = workflows.apply_refresh_plan(
+                args.plan_file, args.expected_plan_hash,
+            )
+            human = f"refreshed trusted workflow {data['workflow']}"
         elif args.workflow_op == "validate":
             validated = workflows.validate_manifest_file(
                 args.manifest, args.expected_manifest_hash,
@@ -1646,6 +1691,13 @@ def cmd_doctor(args):
     validation_caps = office_tx.office_validation_capabilities()
     checks = {
         "agw_home": home, "agw_home_writable": writable,
+        "launcher_command": "agw",
+        "launcher_resolution": "trusted-pretool-rewrite",
+        "launcher_cache_discovery_required": False,
+        "launcher_failure_reason_code": "launcher_unavailable",
+        "workflow_record_schema": workflows.RECORD_SCHEMA,
+        "workflow_refresh_plans": True,
+        "workflow_export": True,
         "python": sys.version.split()[0], "cwd_profile": profile.name,
         "enforcement_level": cfg.get("level"), "enforcement": cfg.get("enforcement"),
         "session_memory": cfg.get("session_memory"),
@@ -2379,10 +2431,8 @@ def main(argv=None):
     )
     workflow_trust = workflow_sub.add_parser(
         "trust", parents=[common],
-        help="install one reviewed hash-checked manifest",
-        description=("Validate and copy a workflow manifest into the protected "
-                     "Guardrails trust store. Repository manifests are inert until "
-                     "this explicit operation is approved."),
+        help="approve manifest",
+        description="Approve one hash-checked manifest.",
     )
     workflow_trust.add_argument("manifest", help="literal manifest JSON file")
     workflow_trust.add_argument(
@@ -2401,13 +2451,21 @@ def main(argv=None):
         "--progress", action="store_true",
         help="report trust phases to stderr",
     )
+    workflow_trust.add_argument(
+        "--source-name", default="unavailable",
+        help="reviewed source label",
+    )
+    workflow_trust.add_argument(
+        "--source-version", default="unavailable",
+        help="reviewed source version",
+    )
     workflow_trust.set_defaults(fn=cmd_workflow)
     workflow_list = workflow_sub.add_parser(
-        "list", parents=[common], help="list trusted workflows and purposes",
+        "list", parents=[common], help="list trusted",
     )
     workflow_list.set_defaults(fn=cmd_workflow)
     workflow_match = workflow_sub.add_parser(
-        "match", parents=[common], help="match an exact script command",
+        "match", parents=[common], help="diagnose command",
     )
     workflow_match.add_argument("--cwd", default="", help="command working directory")
     workflow_match.add_argument(
@@ -2416,7 +2474,7 @@ def main(argv=None):
     workflow_match.set_defaults(fn=cmd_workflow)
     workflow_propose = workflow_sub.add_parser(
         "propose", parents=[common],
-        help="draft",
+        help="draft manifest",
         description=("Build and validate a workflow proposal without writing a "
                      "manifest or changing trusted workflow state."),
     )
@@ -2435,13 +2493,58 @@ def main(argv=None):
     )
     workflow_propose.set_defaults(fn=cmd_workflow)
     workflow_info = workflow_sub.add_parser(
-        "info", parents=[common], help="verify and inspect one trusted workflow",
+        "info", parents=[common], help="inspect trusted",
     )
     workflow_info.add_argument("workflow_id", help="trusted workflow id")
     workflow_info.set_defaults(fn=cmd_workflow)
+    workflow_export = workflow_sub.add_parser(
+        "export", parents=[common],
+        help="export manifest",
+    )
+    workflow_export.add_argument("workflow_id", help="trusted workflow id")
+    workflow_export.add_argument(
+        "--output", default="", help="optional exact manifest output file",
+    )
+    workflow_export.add_argument(
+        "--expected-file-hash", default="absent",
+        help="expected existing output SHA-256, or absent",
+    )
+    workflow_export.set_defaults(fn=cmd_workflow)
+    workflow_refresh_plan = workflow_sub.add_parser(
+        "refresh-plan", parents=[common],
+        help="plan script refresh",
+        description=("Read canonical provenance, compare the approved script and "
+                     "current source, and write an expiring refresh review plan. "
+                     "This does not change trust."),
+    )
+    workflow_refresh_plan.add_argument("workflow_id", help="trusted workflow id")
+    workflow_refresh_plan.add_argument(
+        "--plan-file", required=True, help="exact refresh plan output file",
+    )
+    workflow_refresh_plan.add_argument(
+        "--expected-file-hash", default="absent",
+        help="expected existing plan-file SHA-256, or absent",
+    )
+    workflow_refresh_plan.set_defaults(fn=cmd_workflow)
+    workflow_refresh = workflow_sub.add_parser(
+        "refresh", parents=[common],
+        help="apply script refresh",
+        description=("Atomically replace one trusted workflow record only when "
+                     "the reviewed plan is current and the semantic contract is unchanged."),
+    )
+    workflow_refresh.add_argument("plan_file", help="literal refresh plan JSON file")
+    workflow_refresh.add_argument(
+        "--expected-plan-hash", required=True,
+        help="exact plan SHA-256 reported by refresh-plan",
+    )
+    workflow_refresh.add_argument(
+        "--approve-refresh", action="store_true",
+        help="confirm the script diff and unchanged contract were reviewed",
+    )
+    workflow_refresh.set_defaults(fn=cmd_workflow)
     workflow_validate = workflow_sub.add_parser(
         "validate", parents=[common],
-        help="validate an inert manifest and script hash",
+        help="validate manifest",
     )
     workflow_validate.add_argument("manifest", help="literal manifest JSON file")
     workflow_validate.add_argument(
@@ -2451,13 +2554,13 @@ def main(argv=None):
     workflow_validate.set_defaults(fn=cmd_workflow)
     workflow_status = workflow_sub.add_parser(
         "status", parents=[common],
-        help="compare a manifest with this machine's trusted record",
+        help="compare manifest",
     )
     workflow_status.add_argument("manifest", help="literal manifest JSON file")
     workflow_status.set_defaults(fn=cmd_workflow)
     workflow_init = workflow_sub.add_parser(
         "init", parents=[common],
-        help="generate an escaped validated v2 manifest",
+        help="create manifest",
     )
     workflow_init.add_argument("--script", required=True, help="versioned script path")
     workflow_init.add_argument("--manifest", required=True, help="manifest output path")

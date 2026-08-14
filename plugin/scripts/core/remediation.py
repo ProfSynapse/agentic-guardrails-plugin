@@ -56,6 +56,7 @@ REASON_REMOVE_SECRET = "remove-secret-material"
 REASON_NARROW = "narrow-reversible-operation"
 REASON_DECLINED = "approval-declined"
 REASON_PROVIDER = "approval-provider-unavailable"
+REASON_BOUNDED_DISCOVERY = "bounded-guardrails-discovery"
 _REASON_CODES = frozenset({
     REASON_ARCHIVE, REASON_WORKFLOW, REASON_DIRECT, REASON_INSPECT,
     REASON_SECRET, REASON_READ_ONLY, REASON_FILTERED_DELETE,
@@ -63,6 +64,7 @@ _REASON_CODES = frozenset({
     REASON_AUTHORIZED_COPY, REASON_CLOUD_DOCUMENT, REASON_OFFLINE,
     REASON_LAUNCHER, REASON_AGW_HELP, REASON_POLICY_HEALTH,
     REASON_REMOVE_SECRET, REASON_NARROW, REASON_DECLINED, REASON_PROVIDER,
+    REASON_BOUNDED_DISCOVERY,
 })
 
 
@@ -214,6 +216,8 @@ def reason_for_rule(rule_id: str) -> tuple[str, bool]:
         return REASON_OFFLINE, False
     if rule_id == "builtin:agw-impostor":
         return REASON_LAUNCHER, False
+    if rule_id == "builtin:unbounded-discovery":
+        return REASON_BOUNDED_DISCOVERY, False
     if rule_id in {
             "builtin:agw-empty", "builtin:agw-search-empty",
             "builtin:agw-unknown", "builtin:agw-workflow-unknown"}:
@@ -293,6 +297,27 @@ def _archive_argv(command, cwd: str) -> tuple[str, ...]:
     return "agw", "archive", resolved
 
 
+def _bounded_list_argv(event) -> tuple[str, ...]:
+    paths = []
+    for value in list(getattr(event, "paths", []) or []):
+        path = str(value or "")
+        if path and path not in paths:
+            paths.append(path)
+    if len(paths) != 1:
+        return ()
+    target = paths[0]
+    if any(char in target for char in "$`*?[]{}()") or "\x00" in target:
+        return ()
+    cwd = str(getattr(event, "cwd", "") or "")
+    resolved = os.path.normpath(os.path.abspath(
+        target if os.path.isabs(target) else os.path.join(cwd, target)
+    ))
+    return (
+        "agw", "list", resolved,
+        "--max-depth", "2", "--max-results", "100",
+    )
+
+
 def for_event(decision, event) -> Optional[SafeNext]:
     """Derive inert advice from one evaluated event; incomplete data fails closed."""
     if getattr(decision, "action", "") != events.DENY:
@@ -324,6 +349,15 @@ def for_event(decision, event) -> Optional[SafeNext]:
         if argv:
             return SafeNext(
                 REASON_ARCHIVE, argv, True, False,
+                (ASSUMPTION_EVENT_CURRENT, ASSUMPTION_CWD_BOUND,
+                 ASSUMPTION_SINGLE_LITERAL, ASSUMPTION_TARGETS_REVALIDATED),
+                source, (),
+            )
+    if rule_id == "builtin:unbounded-discovery":
+        argv = _bounded_list_argv(event)
+        if argv:
+            return SafeNext(
+                REASON_BOUNDED_DISCOVERY, argv, True, False,
                 (ASSUMPTION_EVENT_CURRENT, ASSUMPTION_CWD_BOUND,
                  ASSUMPTION_SINGLE_LITERAL, ASSUMPTION_TARGETS_REVALIDATED),
                 source, (),

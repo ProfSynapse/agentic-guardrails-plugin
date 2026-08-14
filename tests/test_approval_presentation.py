@@ -6,7 +6,7 @@ from dataclasses import replace
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
-from core import approvals, events, presentation  # noqa: E402
+from core import approvals, events, presentation, remediation  # noqa: E402
 from core.approvals import ApprovalProvider, ApprovalResponse  # noqa: E402
 from core.decisions import GuardrailDecision, LOW  # noqa: E402
 
@@ -75,6 +75,47 @@ def test_optional_recovery_copy_is_not_required_for_an_informative_prompt():
     _decision, request = _request()
     assert request.safeguard == ""
     assert request.validation_problem() == ""
+
+
+def test_denial_metadata_is_machine_actionable_and_derived_from_safe_next(tmp_path):
+    target = tmp_path / "remove-me.txt"
+    event = events.ToolEvent(
+        kind=events.EXEC, tool="PowerShell",
+        command=f"Remove-Item '{target}'", paths=[str(target)], cwd=str(tmp_path),
+    )
+    decision = GuardrailDecision(events.DENY, rule_id="builtin:pwsh-delete")
+    decision.safe_next = remediation.for_events(decision, [event])
+    metadata = presentation.build_refusal_metadata(decision, evlist=[event])
+    assert metadata["schema"] == "agw.refusal/v1"
+    assert metadata["reason_code"] == "reversible-archive"
+    assert metadata["mutation_occurred"] is False
+    assert metadata["safe_retry_available"] is True
+    assert metadata["recommended_command"] == ["agw", "archive", str(target)]
+    assert metadata["required_approval"] == "none"
+    assert metadata["blocked_target"] == str(target)
+    assert metadata["safe_next"]["source"]["command_parse"] == "parsed-literal"
+    rendered = presentation.build_denial_feedback(decision, evlist=[event])
+    assert "Machine-readable refusal:" in rendered
+    assert '"mutation_occurred":false' in rendered
+
+
+def test_unbounded_discovery_gets_one_exact_bounded_guardrails_retry(tmp_path):
+    target = tmp_path / "plugin"
+    target.mkdir()
+    event = events.ToolEvent(
+        kind=events.EXEC, tool="PowerShell",
+        command=f"Get-ChildItem -Recurse -LiteralPath '{target}'",
+        paths=[str(target)], cwd=str(tmp_path),
+    )
+    decision = GuardrailDecision(events.DENY, rule_id="builtin:unbounded-discovery")
+    decision.safe_next = remediation.for_events(decision, [event])
+    metadata = presentation.build_refusal_metadata(decision, evlist=[event])
+    assert metadata["reason_code"] == "bounded-guardrails-discovery"
+    assert metadata["recommended_command"] == [
+        "agw", "list", str(target),
+        "--max-depth", "2", "--max-results", "100",
+    ]
+    assert metadata["safe_retry_available"] is True
 
 
 def test_closed_prompt_copy_uses_safe_categories_not_raw_inputs():

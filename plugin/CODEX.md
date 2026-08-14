@@ -65,6 +65,11 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    The launcher invokes Python explicitly and never asks Windows to open a `.py`
    file by file association.
 
+   If literal `agw` cannot be invoked, stop with the stable reason code
+   `launcher_unavailable`; never search the plugin cache for a launcher. Ask the
+   user to enable the Guardrails hooks and start a new task. `agw doctor --json`
+   reports the launcher contract when bootstrap succeeds.
+
    Codex records trust against each hook definition's exact hash. Keep manifest
    launcher commands stable and put behavior changes in the dispatchers; changing
    a command makes Codex skip it until the user reviews it again in the host's

@@ -48,6 +48,12 @@ def test_hooks_config_matches_shell_exec_tools():
             assert tool in matcher, f"{ev} does not cover the {tool} shell-exec tool"
 
 
+def test_sessionstart_bootstrap_failure_is_stable_and_forbids_cache_discovery():
+    context = _context(_run(START, {"hook_event_name": "SessionStart"}))
+    assert "launcher_unavailable" in context
+    assert "do not scan for a launcher" in context
+
+
 def test_pretooluse_denies_bare_remove_item_via_shell_tools(tmp_path):
     """Regression: a bare `Remove-Item <path>` arriving through a non-Bash shell
     tool (PowerShell or Monitor, with tool_input.command) must be denied, not
@@ -61,6 +67,12 @@ def test_pretooluse_denies_bare_remove_item_via_shell_tools(tmp_path):
                    "hook_event_name": "PreToolUse"}
         out, dec = _decision(_run(PRE, payload, env_extra={"AGW_HOME": str(home)}))
         assert dec == "deny", (tool, out)
+        refusal = out["hookSpecificOutput"]["agwRefusal"]
+        assert refusal["schema"] == "agw.refusal/v1"
+        assert refusal["mutation_occurred"] is False
+        assert refusal["reason_code"] == "reversible-archive"
+        assert refusal["safe_retry_available"] is True
+        assert refusal["recommended_command"][:2] == ["agw", "archive"]
         # The host displays the denial in task history; the hook must not create
         # its retired duplicate audit ledger.
         assert not (home / "audit.jsonl").exists()

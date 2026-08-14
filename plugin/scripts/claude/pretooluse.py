@@ -214,6 +214,7 @@ def main():
         )
 
     out = {}
+    refusal_metadata = None
     if action in (events.ALLOW, events.ASK, events.DENY):
         if action == events.ASK:
             reason = prompt_request.action + "\n\n" + prompt_request.primary_text()
@@ -221,7 +222,10 @@ def main():
             denial_decision = GuardrailDecision.from_legacy(decision)
             denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
-                denial_decision, approval_outcome
+                denial_decision, approval_outcome, [event]
+            )
+            refusal_metadata = presentation.build_refusal_metadata(
+                denial_decision, approval_outcome, [event]
             )
         else:
             reason = decision.reason
@@ -231,6 +235,8 @@ def main():
             "hookEventName": "PreToolUse",
             "permissionDecision": action,
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
+        if refusal_metadata is not None:
+            out["hookSpecificOutput"]["agwRefusal"] = refusal_metadata
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
 

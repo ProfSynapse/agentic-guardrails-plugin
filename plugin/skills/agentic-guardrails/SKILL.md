@@ -10,7 +10,8 @@ description: >
 
 Use `agw`; `agw.cmd` is compatibility-only. Use exact host-supplied paths;
 never infer or search plugin-cache paths. If `agw` is unrecognized, ask the user
-to approve Guardrails hooks in the host UI and start a new task.
+to approve Guardrails hooks in the host UI and start a new task. Report the
+stable reason code `launcher_unavailable`; never scan for a launcher.
 Never use a cache path or change PATH.
 
 ## Progressive discovery

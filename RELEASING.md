@@ -22,12 +22,12 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.4.3`
+## Release gate for `0.4.4`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.4.3` before that tag exists.
+   `v0.4.4` before that tag exists.
 
-2. Confirm all three version fields are `0.4.3` and both refs are `main`, then run:
+2. Confirm all three version fields are `0.4.4` and both refs are `main`, then run:
 
    ```bash
    python -m pytest -q
@@ -107,19 +107,19 @@ release must bump the version.
    git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json \
      .claude-plugin/marketplace.json .agents/plugins/marketplace.json \
      tests/test_packaging.py RELEASING.md
-   git commit -m "Release Agentic Guardrails 0.4.3"
+   git commit -m "Release Agentic Guardrails 0.4.4"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.4.3 --target <verified-main-commit-sha> \
-     --title "v0.4.3" --notes "..."
+   gh release create v0.4.4 --target <verified-main-commit-sha> \
+     --title "v0.4.4" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.4.3` in both marketplace catalogs, rerun JSON and artifact
+   `main` to `v0.4.4` in both marketplace catalogs, rerun JSON and artifact
    conformance, and merge the catalog pointer update through a follow-up pull
    request. This tag-exists gate is mandatory.
 

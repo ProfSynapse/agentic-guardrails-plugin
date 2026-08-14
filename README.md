@@ -129,6 +129,8 @@ so the agent self-corrects instead of fighting the rails:
 | discover an existing script contract | `agw workflow match -- command` |
 | draft a contract without trusting or writing it | `agw workflow propose ... -- command` |
 | repeated versioned script | `agw run --workflow ID -- command` after explicit trust |
+| review legitimate trusted-script drift | `agw workflow refresh-plan`, then `agw workflow refresh` |
+| recover a canonical manifest | `agw workflow export ID` |
 | inspect an exact CLI contract | `agw schema file apply-plan --json` |
 | reverse one exact mutation | `agw undo --transaction ID` |
 
@@ -192,6 +194,11 @@ JSON failures distinguish `preimage_hash_conflict`, `patch_context_conflict`,
 `patch_hunk_count_mismatch`, and `replace_match_conflict`. Count mismatches also
 return the hunk/header, patch line, expected and observed counts, and a corrected
 header suggestion so an agent can repair the diff without parsing prose.
+PreToolUse denials now derive human copy and an `agw.refusal/v1` object from one
+closed decision. It reports a stable reason code, `mutation_occurred`, whether a
+safe retry exists, exact revalidated argv when available, required approval, and
+the one blocked target when unambiguous. Recommended argv is inert and must pass
+normal policy evaluation as a new operation.
 
 Write-capable scripts remain fail-closed unless every output is declared before
 execution. One-off runs use exact `--output` arguments; reviewed repeated tools
@@ -218,6 +225,18 @@ and nested diagnostics are omitted
 from the response so candidate values stay hashed and raw values are not multiplied. `agw
 workflow propose` returns an
 inert validated v2 proposal without writing or trusting it.
+
+New trust records retain authenticated canonical-manifest provenance, semantic
+contract and script hashes, reviewed source/version labels, approval metadata,
+and one compressed approved script snapshot embedded in the sealed record and
+capped at 128 KiB. Repeated refreshes replace that bounded record instead of
+accumulating snapshot files.
+Use `agw workflow refresh-plan` to review an expiring, record-seal-bound script
+diff and semantic contract diff, then `agw workflow refresh` with the exact plan
+hash and explicit approval. Refresh changes only the trusted script identity and
+is refused on contract change, replay, expiry, or source drift. `agw workflow
+export` reconstructs an inert manifest for current and legacy records; legacy
+records require one explicit retrust before provenance-based refresh.
 
 Migration note for 0.4: `suggested_argv` is no longer an argv array and must not
 be executed or compared as one. JSON consumers should read the sole value-bearing

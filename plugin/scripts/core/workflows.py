@@ -7,6 +7,10 @@ language; manifests never execute code.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import copy
+import difflib
 import hashlib
 import hmac
 import json
@@ -18,6 +22,7 @@ import stat
 import sys
 import tempfile
 import time
+import zlib
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -28,7 +33,10 @@ MANIFEST_SCHEMA_V1 = "agw.workflow/v1"
 MANIFEST_SCHEMA = "agw.workflow/v2"
 PARAMETERIZED_SCHEMA = "agw.workflow/v3"
 MANIFEST_SCHEMAS = {MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}
-RECORD_SCHEMA = "agw.trusted-workflow/v1"
+RECORD_SCHEMA_V1 = "agw.trusted-workflow/v1"
+RECORD_SCHEMA = "agw.trusted-workflow/v2"
+RECORD_SCHEMAS = {RECORD_SCHEMA_V1, RECORD_SCHEMA}
+REFRESH_PLAN_SCHEMA = "agw.workflow-refresh-plan/v1"
 DIAGNOSTIC_SCHEMA = "agw.workflow-diagnostics/v1"
 DIAGNOSTIC_REASON_CODES = frozenset({
     "command_normalization_failed",
@@ -47,6 +55,7 @@ _DIAGNOSTIC_CLASS_ORDER = {
     "incompatible": 3,
 }
 MAX_MANIFEST_BYTES = 256 * 1024
+MAX_RECORD_BYTES = 512 * 1024
 MAX_WORKFLOWS = 256
 MAX_OUTPUTS = 128
 MAX_ROOTS = 16
@@ -56,6 +65,12 @@ MAX_ARG_BYTES = 16 * 1024
 MAX_PARAMETERS = 32
 MAX_ENUM_VALUES = 512
 MAX_PARAMETER_BYTES = 4096
+MAX_SCRIPT_SNAPSHOT_BYTES = 128 * 1024
+MAX_SCRIPT_SNAPSHOT_COMPRESSED_BYTES = 128 * 1024
+MAX_REFRESH_PLAN_BYTES = 512 * 1024
+MAX_REFRESH_DIFF_BYTES = 128 * 1024
+MAX_REFRESH_DIFF_LINES = 2000
+REFRESH_PLAN_TTL_NS = 30 * 60 * 1_000_000_000
 
 _ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 _PARAMETER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -83,6 +98,14 @@ class WorkflowConflict(WorkflowError):
 
 class WorkflowTrustError(WorkflowError):
     error_code = "workflow_trust_error"
+
+
+class WorkflowProvenanceError(WorkflowTrustError):
+    error_code = "workflow_provenance_error"
+
+
+class WorkflowRefreshError(WorkflowTrustError):
+    error_code = "workflow_refresh_error"
 
 
 def _json_no_duplicates(pairs):
@@ -775,6 +798,16 @@ def _atomic_write(path: str, payload: bytes, mode: int = 0o600) -> None:
             pass
 
 
+def _write_trusted_record(path: str, record: dict) -> None:
+    payload = _canonical_json(record) + b"\n"
+    if len(payload) > MAX_RECORD_BYTES:
+        raise WorkflowTrustError(
+            "trusted workflow record exceeds its storage bound",
+            {"bytes": len(payload), "maximum_bytes": MAX_RECORD_BYTES},
+        )
+    _atomic_write(path, payload)
+
+
 def _trust_key(*, create: bool) -> bytes:
     path = _key_path()
     try:
@@ -801,13 +834,209 @@ def _canonical_json(value: dict) -> bytes:
     ).encode("utf-8")
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _contract_manifest(manifest: dict) -> dict:
+    contract = copy.deepcopy(manifest)
+    command = contract.get("command")
+    if isinstance(command, dict):
+        command.pop("script_sha256", None)
+    return contract
+
+
+def _contract_sha256(manifest: dict) -> str:
+    return _sha256_bytes(_canonical_json(_contract_manifest(manifest)))
+
+
+def _source_label(value: str, field: str) -> str:
+    label = str(value or "unavailable").strip()
+    if not label:
+        label = "unavailable"
+    if len(label.encode("utf-8")) > 256 or any(ord(char) < 32 for char in label):
+        raise WorkflowError(f"{field} must be a short printable label")
+    return label
+
+
 def _seal(record: dict, key: bytes) -> str:
     unsigned = dict(record)
     unsigned.pop("seal", None)
     return hmac.new(key, _canonical_json(unsigned), hashlib.sha256).hexdigest()
 
 
+def _decode_snapshot(payload: bytes, expected_sha256: str) -> bytes:
+    if len(payload) > MAX_SCRIPT_SNAPSHOT_COMPRESSED_BYTES:
+        raise WorkflowTrustError("workflow source snapshot exceeds its compressed bound")
+    try:
+        decoder = zlib.decompressobj()
+        source = decoder.decompress(payload, MAX_SCRIPT_SNAPSHOT_BYTES + 1)
+    except zlib.error as exc:
+        raise WorkflowTrustError("workflow source snapshot is corrupt") from exc
+    if (len(source) > MAX_SCRIPT_SNAPSHOT_BYTES or decoder.unconsumed_tail
+            or not decoder.eof):
+        raise WorkflowTrustError("workflow source snapshot exceeds its content bound")
+    if not hmac.compare_digest(_sha256_bytes(source), expected_sha256):
+        raise WorkflowTrustError("workflow source snapshot hash is invalid")
+    try:
+        source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkflowTrustError("workflow source snapshot is not UTF-8 text") from exc
+    return source
+
+
+def _read_snapshot_blob(metadata: dict) -> bytes:
+    if not isinstance(metadata, dict) or metadata.get("available") is not True:
+        raise WorkflowProvenanceError("the approved script snapshot is unavailable")
+    content_hash = str(metadata.get("content_sha256") or "")
+    blob_hash = str(metadata.get("blob_sha256") or "")
+    if not _HASH_RE.fullmatch(content_hash) or not _HASH_RE.fullmatch(blob_hash):
+        raise WorkflowTrustError("workflow source snapshot metadata is invalid")
+    try:
+        payload = base64.b64decode(
+            str(metadata.get("payload_base64") or "").encode("ascii"), validate=True,
+        )
+    except (UnicodeError, ValueError, binascii.Error) as exc:
+        raise WorkflowTrustError("workflow source snapshot encoding is invalid") from exc
+    compressed_bytes = metadata.get("compressed_bytes")
+    source_bytes = metadata.get("bytes")
+    if (not isinstance(compressed_bytes, int) or isinstance(compressed_bytes, bool)
+            or not isinstance(source_bytes, int) or isinstance(source_bytes, bool)
+            or compressed_bytes < 0 or source_bytes < 0
+            or compressed_bytes != len(payload)
+            or source_bytes > MAX_SCRIPT_SNAPSHOT_BYTES):
+        raise WorkflowTrustError("workflow source snapshot size metadata is invalid")
+    if len(payload) > MAX_SCRIPT_SNAPSHOT_COMPRESSED_BYTES:
+        raise WorkflowTrustError("workflow source snapshot exceeds its compressed bound")
+    if not hmac.compare_digest(_sha256_bytes(payload), blob_hash):
+        raise WorkflowTrustError("workflow source snapshot blob hash is invalid")
+    source = _decode_snapshot(payload, content_hash)
+    if len(source) != source_bytes:
+        raise WorkflowTrustError("workflow source snapshot size binding is invalid")
+    return source
+
+
+def _capture_source_snapshot(script_path: str, expected_sha256: str) -> dict:
+    try:
+        st = os.stat(script_path, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise WorkflowConflict("workflow script is no longer an ordinary file")
+        if st.st_size > MAX_SCRIPT_SNAPSHOT_BYTES:
+            return {
+                "available": False, "reason": "script_too_large",
+                "content_sha256": expected_sha256, "bytes": int(st.st_size),
+            }
+        with open(script_path, "rb") as handle:
+            source = handle.read(MAX_SCRIPT_SNAPSHOT_BYTES + 1)
+    except OSError as exc:
+        raise WorkflowConflict(f"workflow script could not be snapshotted: {exc}") from exc
+    if len(source) > MAX_SCRIPT_SNAPSHOT_BYTES:
+        return {
+            "available": False, "reason": "script_too_large",
+            "content_sha256": expected_sha256, "bytes": len(source),
+        }
+    actual = _sha256_bytes(source)
+    if not hmac.compare_digest(actual, expected_sha256):
+        raise WorkflowConflict(
+            "workflow script changed while its approved snapshot was captured",
+            {"expected": expected_sha256, "actual": actual},
+        )
+    try:
+        source.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "available": False, "reason": "script_not_utf8",
+            "content_sha256": expected_sha256, "bytes": len(source),
+        }
+    payload = zlib.compress(source, level=9)
+    if len(payload) > MAX_SCRIPT_SNAPSHOT_COMPRESSED_BYTES:
+        return {
+            "available": False, "reason": "compressed_snapshot_too_large",
+            "content_sha256": expected_sha256, "bytes": len(source),
+        }
+    blob_hash = _sha256_bytes(payload)
+    metadata = {
+        "available": True, "encoding": "utf-8", "compression": "zlib",
+        "content_sha256": expected_sha256, "blob_sha256": blob_hash,
+        "bytes": len(source), "compressed_bytes": len(payload),
+        "payload_base64": base64.b64encode(payload).decode("ascii"),
+    }
+    if _read_snapshot_blob(metadata) != source:
+        raise WorkflowTrustError("workflow source snapshot failed verification")
+    return metadata
+
+
+def _build_provenance(manifest_path: str, manifest_file_sha256: str,
+                      manifest: dict, *, source_name: str = "",
+                      source_version: str = "", approved_at: str = "",
+                      snapshot: Optional[dict] = None) -> dict:
+    approved_at = approved_at or datetime.now(timezone.utc).isoformat()
+    script_path = manifest["command"]["script"]
+    script_sha256 = manifest["command"]["script_sha256"]
+    if snapshot is None:
+        snapshot = _capture_source_snapshot(script_path, script_sha256)
+    return {
+        "source_manifest_path": os.path.realpath(os.path.abspath(
+            os.path.expanduser(manifest_path)
+        )),
+        "source_manifest_sha256": manifest_file_sha256,
+        "effective_manifest_sha256": manifest_file_sha256,
+        "contract_sha256": _contract_sha256(manifest),
+        "script_path": script_path,
+        "script_sha256": script_sha256,
+        "source": {
+            "name": _source_label(source_name, "source name"),
+            "version": _source_label(source_version, "source version"),
+            "attested": False,
+        },
+        "approval": {
+            "approved_at": approved_at,
+            "identity": "local-user-confirmation",
+            "identity_attested": False,
+            "method": "explicit-cli-approval",
+        },
+        "script_snapshot": snapshot,
+    }
+
+
+def _validate_provenance(record: dict) -> None:
+    provenance = record.get("provenance")
+    if not isinstance(provenance, dict):
+        raise WorkflowTrustError("trusted workflow provenance is missing")
+    manifest = record["manifest"]
+    path = provenance.get("source_manifest_path")
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        raise WorkflowTrustError("trusted workflow manifest provenance path is invalid")
+    for field in (
+            "source_manifest_sha256", "effective_manifest_sha256",
+            "contract_sha256", "script_sha256"):
+        if not _HASH_RE.fullmatch(str(provenance.get(field) or "")):
+            raise WorkflowTrustError(f"trusted workflow provenance {field} is invalid")
+    if not hmac.compare_digest(
+            provenance["contract_sha256"], _contract_sha256(manifest)):
+        raise WorkflowTrustError("trusted workflow contract provenance is invalid")
+    if provenance.get("script_path") != manifest["command"]["script"] or not hmac.compare_digest(
+            provenance["script_sha256"], manifest["command"]["script_sha256"]):
+        raise WorkflowTrustError("trusted workflow script provenance is invalid")
+    approval = provenance.get("approval")
+    if not isinstance(approval, dict) or not isinstance(approval.get("approved_at"), str):
+        raise WorkflowTrustError("trusted workflow approval provenance is invalid")
+    source = provenance.get("source")
+    if (not isinstance(source, dict)
+            or not isinstance(source.get("name"), str)
+            or not isinstance(source.get("version"), str)
+            or source.get("attested") is not False):
+        raise WorkflowTrustError("trusted workflow source provenance is invalid")
+    snapshot = provenance.get("script_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("available"), bool):
+        raise WorkflowTrustError("trusted workflow source snapshot metadata is invalid")
+    if not hmac.compare_digest(
+            str(snapshot.get("content_sha256") or ""), provenance["script_sha256"]):
+        raise WorkflowTrustError("trusted workflow source snapshot binding is invalid")
+
+
 def trust_manifest(path: str, expected_manifest_hash: str, *, replace: bool = False,
+                   source_name: str = "", source_version: str = "",
                    phase_callback=None) -> dict:
     """Explicitly trust one hash-checked manifest and its current script."""
     started = time.monotonic()
@@ -822,7 +1051,9 @@ def trust_manifest(path: str, expected_manifest_hash: str, *, replace: bool = Fa
     phase("acquiring_lock")
     with store.Lock("workflow-trust", timeout=10.0):
         result = _trust_manifest_locked(
-            path, expected_manifest_hash, replace=replace, phase_callback=phase,
+            path, expected_manifest_hash, replace=replace,
+            source_name=source_name, source_version=source_version,
+            phase_callback=phase,
         )
     phase("complete")
     result["phases"] = phases
@@ -830,7 +1061,8 @@ def trust_manifest(path: str, expected_manifest_hash: str, *, replace: bool = Fa
 
 
 def _trust_manifest_locked(path: str, expected_manifest_hash: str,
-                           *, replace: bool = False, phase_callback=None) -> dict:
+                           *, replace: bool = False, source_name: str = "",
+                           source_version: str = "", phase_callback=None) -> dict:
     wanted = str(expected_manifest_hash or "").strip().lower()
     if not _HASH_RE.fullmatch(wanted):
         raise WorkflowError("--expected-manifest-hash must be a SHA-256")
@@ -849,35 +1081,53 @@ def _trust_manifest_locked(path: str, expected_manifest_hash: str,
     existing_records = [name for name in os.listdir(trust_dir) if name.endswith(".json")]
     record_path = _record_path(manifest["id"])
     key = _trust_key(create=True)
+    existing = None
+    migrate_legacy = False
     if os.path.exists(record_path):
         existing = load_trusted(manifest["id"])
         if (existing.get("manifest_sha256") == actual
                 and existing.get("manifest") == manifest):
-            return {
-                "ok": True, "changed": False, "workflow": manifest["id"],
-                "manifest_sha256": actual, "script_sha256": manifest["command"]["script_sha256"],
-            }
+            if existing.get("schema") == RECORD_SCHEMA and not replace:
+                return {
+                    "ok": True, "changed": False, "workflow": manifest["id"],
+                    "manifest_sha256": actual,
+                    "script_sha256": manifest["command"]["script_sha256"],
+                    "provenance": existing["provenance"],
+                }
+            migrate_legacy = existing.get("schema") == RECORD_SCHEMA_V1
         if not replace:
-            raise WorkflowConflict(
-                "a different trusted record already exists; review it and repeat with --replace",
-                {"workflow": manifest["id"]},
-            )
+            if not migrate_legacy:
+                raise WorkflowConflict(
+                    "a different trusted record already exists; review it and repeat with --replace",
+                    {"workflow": manifest["id"]},
+                )
     elif len(existing_records) >= MAX_WORKFLOWS:
         raise WorkflowError(f"trusted workflow store is limited to {MAX_WORKFLOWS} records")
+    trusted_at = (
+        str(existing.get("trusted_at") or "")
+        if migrate_legacy and existing else ""
+    ) or datetime.now(timezone.utc).isoformat()
+    provenance = _build_provenance(
+        path, actual, manifest, source_name=source_name,
+        source_version=source_version, approved_at=trusted_at,
+    )
     record = {
         "schema": RECORD_SCHEMA,
         "manifest_sha256": actual,
-        "trusted_at": datetime.now(timezone.utc).isoformat(),
+        "trusted_at": trusted_at,
         "manifest": manifest,
+        "provenance": provenance,
     }
     record["seal"] = _seal(record, key)
     if phase_callback:
         phase_callback("writing_record")
-    _atomic_write(record_path, _canonical_json(record) + b"\n")
+    _write_trusted_record(record_path, record)
     return {
-        "ok": True, "changed": True, "workflow": manifest["id"],
+        "ok": True, "changed": True, "migrated": migrate_legacy,
+        "workflow": manifest["id"],
         "manifest_sha256": actual, "script": manifest["command"]["script"],
         "script_sha256": manifest["command"]["script_sha256"],
+        "provenance": provenance,
     }
 
 
@@ -890,10 +1140,10 @@ def load_trusted(workflow_id: str) -> dict:
         st = os.stat(path, follow_symlinks=False)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             raise WorkflowTrustError("trusted workflow record is not an ordinary file")
-        if st.st_size > MAX_MANIFEST_BYTES:
+        if st.st_size > MAX_RECORD_BYTES:
             raise WorkflowTrustError("trusted workflow record is too large")
         with open(path, "rb") as handle:
-            raw = handle.read(MAX_MANIFEST_BYTES + 1)
+            raw = handle.read(MAX_RECORD_BYTES + 1)
         record = json.loads(raw.decode("utf-8"), object_pairs_hook=_json_no_duplicates)
     except FileNotFoundError as exc:
         raise WorkflowTrustError(
@@ -901,7 +1151,7 @@ def load_trusted(workflow_id: str) -> dict:
         ) from exc
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise WorkflowTrustError(f"trusted workflow record could not be verified: {exc}") from exc
-    if not isinstance(record, dict) or record.get("schema") != RECORD_SCHEMA:
+    if not isinstance(record, dict) or record.get("schema") not in RECORD_SCHEMAS:
         raise WorkflowTrustError("trusted workflow record has an invalid schema")
     manifest = record.get("manifest")
     if not isinstance(manifest, dict) or manifest.get("id") != workflow_id:
@@ -912,6 +1162,8 @@ def load_trusted(workflow_id: str) -> dict:
     expected = _seal(record, _trust_key(create=False))
     if not hmac.compare_digest(seal, expected):
         raise WorkflowTrustError("trusted workflow record was tampered with")
+    if record.get("schema") == RECORD_SCHEMA:
+        _validate_provenance(record)
     return record
 
 
@@ -928,10 +1180,10 @@ def list_trusted() -> list[dict]:
         try:
             st = os.stat(path, follow_symlinks=False)
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) \
-                    or st.st_size > MAX_MANIFEST_BYTES:
+                    or st.st_size > MAX_RECORD_BYTES:
                 raise WorkflowTrustError("record verification failed")
             with open(path, "rb") as handle:
-                candidate = json.loads(handle.read(MAX_MANIFEST_BYTES + 1).decode("utf-8"))
+                candidate = json.loads(handle.read(MAX_RECORD_BYTES + 1).decode("utf-8"))
             workflow_id = candidate.get("manifest", {}).get("id", "")
             record = load_trusted(workflow_id)
             manifest = record["manifest"]
@@ -939,10 +1191,372 @@ def list_trusted() -> list[dict]:
                 "id": workflow_id, "description": manifest.get("description", ""),
                 "runtime": manifest["command"]["runtime"],
                 "script": manifest["command"]["script"], "verified": True,
+                "provenance_available": record.get("schema") == RECORD_SCHEMA,
             })
         except (OSError, ValueError, TypeError, WorkflowError):
             result.append({"record": name, "verified": False, "error": "record verification failed"})
     return result
+
+
+def export_trusted(workflow_id: str) -> dict:
+    """Return a deterministic inert manifest for a trusted workflow."""
+    record = load_trusted(workflow_id)
+    manifest = record["manifest"]
+    payload = _canonical_json(manifest)
+    provenance = record.get("provenance") if record.get("schema") == RECORD_SCHEMA else None
+    return {
+        "ok": True,
+        "workflow": workflow_id,
+        "schema": manifest["schema"],
+        "manifest": manifest,
+        "content": payload.decode("utf-8"),
+        "manifest_sha256": _sha256_bytes(payload),
+        "provenance_available": provenance is not None,
+        "source_manifest_path": (
+            provenance.get("source_manifest_path", "") if provenance else ""
+        ),
+        "legacy_reconstruction": provenance is None,
+    }
+
+
+def _refresh_source(record: dict) -> dict:
+    if record.get("schema") != RECORD_SCHEMA:
+        raise WorkflowProvenanceError(
+            "this legacy workflow has no canonical manifest provenance; export and trust it once before refresh",
+            {"reason_code": "workflow_provenance_missing"},
+        )
+    provenance = record["provenance"]
+    manifest_path = provenance["source_manifest_path"]
+    raw, source_manifest_sha256 = _load_json_file(manifest_path)
+    if raw.get("id") != record["manifest"].get("id"):
+        raise WorkflowProvenanceError(
+            "the canonical manifest no longer identifies this workflow",
+            {"reason_code": "workflow_manifest_identity_changed"},
+        )
+    command = raw.get("command")
+    if not isinstance(command, dict):
+        raise WorkflowError("the canonical workflow manifest has no command object")
+    script_value = command.get("script")
+    if not isinstance(script_value, str) or not script_value:
+        raise WorkflowError("the canonical workflow manifest has no literal script path")
+    script_path = script_value if os.path.isabs(script_value) else os.path.join(
+        os.path.dirname(os.path.abspath(manifest_path)), script_value
+    )
+    script_path = _ordinary_script(script_path)
+    script_sha256 = store.file_sha256(script_path)
+    candidate_raw = copy.deepcopy(raw)
+    candidate_raw["command"]["script_sha256"] = script_sha256
+    candidate = validate_manifest(candidate_raw, manifest_path)
+    candidate_manifest_sha256 = _sha256_bytes(_canonical_json(candidate))
+    before_contract = _contract_manifest(record["manifest"])
+    after_contract = _contract_manifest(candidate)
+    return {
+        "manifest_path": manifest_path,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_declared_script_sha256": str(command.get("script_sha256") or "").lower(),
+        "script_path": script_path,
+        "script_sha256": script_sha256,
+        "candidate_manifest_sha256": candidate_manifest_sha256,
+        "candidate": candidate,
+        "contract_sha256": _contract_sha256(candidate),
+        "contract_changed": before_contract != after_contract,
+        "contract_changed_fields": _changed_fields(before_contract, after_contract),
+    }
+
+
+def _changed_fields(before, after, prefix: str = "") -> list[str]:
+    changed = []
+    if type(before) is not type(after):
+        return [prefix or "/"]
+    if isinstance(before, dict):
+        for key in sorted(set(before) | set(after)):
+            child = (prefix + "/" + str(key).replace("~", "~0").replace("/", "~1"))
+            if key not in before or key not in after:
+                changed.append(child)
+            else:
+                changed.extend(_changed_fields(before[key], after[key], child))
+            if len(changed) >= 128:
+                return changed[:128]
+        return changed
+    if isinstance(before, list):
+        if before != after:
+            return [prefix or "/"]
+        return []
+    return [prefix or "/"] if before != after else []
+
+
+def _current_script_text(path: str, expected_sha256: str) -> tuple[Optional[str], str]:
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return None, "script_not_ordinary"
+        if st.st_size > MAX_SCRIPT_SNAPSHOT_BYTES:
+            return None, "script_too_large"
+        with open(path, "rb") as handle:
+            source = handle.read(MAX_SCRIPT_SNAPSHOT_BYTES + 1)
+    except OSError as exc:
+        raise WorkflowRefreshError(f"current workflow script could not be read: {exc}") from exc
+    if len(source) > MAX_SCRIPT_SNAPSHOT_BYTES:
+        return None, "script_too_large"
+    actual = _sha256_bytes(source)
+    if not hmac.compare_digest(actual, expected_sha256):
+        raise WorkflowConflict(
+            "workflow script changed while the refresh review was prepared",
+            {"expected": expected_sha256, "actual": actual},
+        )
+    try:
+        return source.decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return None, "script_not_utf8"
+
+
+def _script_diff(record: dict, current_path: str, current_sha256: str) -> dict:
+    snapshot = record["provenance"].get("script_snapshot", {})
+    if snapshot.get("available") is not True:
+        return {
+            "available": False,
+            "reason": str(snapshot.get("reason") or "approved_snapshot_unavailable"),
+            "truncated": False,
+        }
+    approved = _read_snapshot_blob(snapshot).decode("utf-8")
+    current, reason = _current_script_text(current_path, current_sha256)
+    if current is None:
+        return {"available": False, "reason": reason, "truncated": False}
+    lines = list(difflib.unified_diff(
+        approved.splitlines(), current.splitlines(),
+        fromfile="approved-script", tofile="current-script", lineterm="",
+    ))
+    truncated = len(lines) > MAX_REFRESH_DIFF_LINES
+    lines = lines[:MAX_REFRESH_DIFF_LINES]
+    diff = "\n".join(lines)
+    encoded = diff.encode("utf-8")
+    if len(encoded) > MAX_REFRESH_DIFF_BYTES:
+        encoded = encoded[:MAX_REFRESH_DIFF_BYTES]
+        while encoded:
+            try:
+                diff = encoded.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                encoded = encoded[:-1]
+        truncated = True
+    return {
+        "available": True, "diff": diff, "changed": approved != current,
+        "truncated": truncated,
+        "approved_sha256": snapshot["content_sha256"],
+        "current_sha256": current_sha256,
+    }
+
+
+def _refresh_plan_hash(plan: dict) -> str:
+    unsigned = dict(plan)
+    unsigned.pop("plan_sha256", None)
+    return _sha256_bytes(_canonical_json(unsigned))
+
+
+def build_refresh_plan(workflow_id: str, *, now_ns: Optional[int] = None) -> dict:
+    """Build a read-only, expiring review plan for one trusted workflow."""
+    record = load_trusted(workflow_id)
+    source = _refresh_source(record)
+    now_ns = int(time.time_ns() if now_ns is None else now_ns)
+    plan = {
+        "schema": REFRESH_PLAN_SCHEMA,
+        "workflow": workflow_id,
+        "created_at_ns": now_ns,
+        "expires_at_ns": now_ns + REFRESH_PLAN_TTL_NS,
+        "trusted_record": {
+            "seal": record["seal"],
+            "manifest_sha256": record["manifest_sha256"],
+            "script_sha256": record["manifest"]["command"]["script_sha256"],
+            "contract_sha256": _contract_sha256(record["manifest"]),
+        },
+        "candidate": {
+            "source_manifest_path": source["manifest_path"],
+            "source_manifest_sha256": source["source_manifest_sha256"],
+            "source_declared_script_sha256": source["source_declared_script_sha256"],
+            "manifest_sha256": source["candidate_manifest_sha256"],
+            "script_path": source["script_path"],
+            "script_sha256": source["script_sha256"],
+            "contract_sha256": source["contract_sha256"],
+        },
+        "contract_changed": source["contract_changed"],
+        "contract_changed_fields": source["contract_changed_fields"],
+        "script_diff": _script_diff(record, source["script_path"], source["script_sha256"]),
+        "apply_allowed": not source["contract_changed"],
+    }
+    plan["plan_sha256"] = _refresh_plan_hash(plan)
+    if len(_canonical_json(plan)) > MAX_REFRESH_PLAN_BYTES:
+        raise WorkflowRefreshError("workflow refresh plan exceeds its bounded size")
+    return plan
+
+
+def load_refresh_plan(path: str) -> dict:
+    source = os.path.abspath(os.path.expanduser(str(path or "")))
+    try:
+        st = os.stat(source, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise WorkflowRefreshError("workflow refresh plan must be an ordinary file")
+        if st.st_size > MAX_REFRESH_PLAN_BYTES:
+            raise WorkflowRefreshError("workflow refresh plan exceeds its bounded size")
+        with open(source, "rb") as handle:
+            raw = handle.read(MAX_REFRESH_PLAN_BYTES + 1)
+        plan = json.loads(raw.decode("utf-8"), object_pairs_hook=_json_no_duplicates)
+    except WorkflowError as exc:
+        raise WorkflowRefreshError(str(exc), getattr(exc, "details", None)) from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkflowRefreshError(f"workflow refresh plan could not be read: {exc}") from exc
+    expected_keys = {
+        "schema", "workflow", "created_at_ns", "expires_at_ns", "trusted_record",
+        "candidate", "contract_changed", "contract_changed_fields", "script_diff",
+        "apply_allowed", "plan_sha256",
+    }
+    if not isinstance(plan, dict) or set(plan) != expected_keys:
+        raise WorkflowRefreshError("workflow refresh plan has an invalid schema")
+    if plan.get("schema") != REFRESH_PLAN_SCHEMA:
+        raise WorkflowRefreshError("workflow refresh plan schema is unsupported")
+    if not isinstance(plan.get("workflow"), str) or not _ID_RE.fullmatch(plan["workflow"]):
+        raise WorkflowRefreshError("workflow refresh plan identity is invalid")
+    if (not isinstance(plan.get("created_at_ns"), int)
+            or isinstance(plan.get("created_at_ns"), bool)
+            or not isinstance(plan.get("expires_at_ns"), int)
+            or isinstance(plan.get("expires_at_ns"), bool)
+            or plan["created_at_ns"] < 0
+            or plan["expires_at_ns"] <= plan["created_at_ns"]):
+        raise WorkflowRefreshError("workflow refresh plan timestamps are invalid")
+    if not isinstance(plan.get("contract_changed"), bool) \
+            or not isinstance(plan.get("apply_allowed"), bool):
+        raise WorkflowRefreshError("workflow refresh plan decision fields are invalid")
+    if not isinstance(plan.get("contract_changed_fields"), list) \
+            or len(plan["contract_changed_fields"]) > 128 \
+            or not all(isinstance(value, str) and len(value) <= 512
+                       for value in plan["contract_changed_fields"]):
+        raise WorkflowRefreshError("workflow refresh plan contract diff is invalid")
+    trusted = plan.get("trusted_record")
+    candidate = plan.get("candidate")
+    if not isinstance(trusted, dict) or set(trusted) != {
+            "seal", "manifest_sha256", "script_sha256", "contract_sha256"}:
+        raise WorkflowRefreshError("workflow refresh plan trusted binding is invalid")
+    if not isinstance(candidate, dict) or set(candidate) != {
+            "source_manifest_path", "source_manifest_sha256",
+            "source_declared_script_sha256", "manifest_sha256", "script_path",
+            "script_sha256", "contract_sha256"}:
+        raise WorkflowRefreshError("workflow refresh plan candidate binding is invalid")
+    for value in trusted.values():
+        if not _HASH_RE.fullmatch(str(value or "")):
+            raise WorkflowRefreshError("workflow refresh plan trusted hash is invalid")
+    for field in (
+            "source_manifest_sha256", "manifest_sha256", "script_sha256",
+            "contract_sha256"):
+        if not _HASH_RE.fullmatch(str(candidate.get(field) or "")):
+            raise WorkflowRefreshError("workflow refresh plan candidate hash is invalid")
+    for field in ("source_manifest_path", "script_path"):
+        value = candidate.get(field)
+        if not isinstance(value, str) or not value or not os.path.isabs(value):
+            raise WorkflowRefreshError("workflow refresh plan candidate path is invalid")
+    if not isinstance(candidate.get("source_declared_script_sha256"), str) \
+            or len(candidate["source_declared_script_sha256"]) > 128:
+        raise WorkflowRefreshError("workflow refresh plan declared script hash is invalid")
+    if not isinstance(plan.get("script_diff"), dict):
+        raise WorkflowRefreshError("workflow refresh plan script diff is invalid")
+    plan_hash = str(plan.get("plan_sha256") or "")
+    if not _HASH_RE.fullmatch(plan_hash) or not hmac.compare_digest(
+            plan_hash, _refresh_plan_hash(plan)):
+        raise WorkflowRefreshError("workflow refresh plan hash is invalid")
+    return plan
+
+
+def apply_refresh_plan(path: str, expected_plan_hash: str,
+                       *, now_ns: Optional[int] = None) -> dict:
+    """Atomically replace one trusted record after exact refresh review."""
+    plan = load_refresh_plan(path)
+    wanted = str(expected_plan_hash or "").strip().lower()
+    if not _HASH_RE.fullmatch(wanted):
+        raise WorkflowRefreshError("--expected-plan-hash must be a SHA-256")
+    if not hmac.compare_digest(wanted, plan["plan_sha256"]):
+        raise WorkflowConflict(
+            "workflow refresh plan hash does not match the reviewed version",
+            {"expected": wanted, "actual": plan["plan_sha256"]},
+        )
+    now_ns = int(time.time_ns() if now_ns is None else now_ns)
+    if now_ns > int(plan["expires_at_ns"]):
+        raise WorkflowRefreshError(
+            "workflow refresh plan expired; create and review a new plan",
+            {"reason_code": "workflow_refresh_plan_expired"},
+        )
+    if plan.get("contract_changed") or not plan.get("apply_allowed"):
+        raise WorkflowRefreshError(
+            "workflow contract changed; use full workflow trust replacement after review",
+            {"reason_code": "workflow_contract_changed",
+             "changed_fields": plan.get("contract_changed_fields", [])},
+        )
+    with store.Lock("workflow-trust", timeout=10.0):
+        record = load_trusted(plan["workflow"])
+        trusted = plan["trusted_record"]
+        if not hmac.compare_digest(record["seal"], str(trusted.get("seal") or "")):
+            raise WorkflowConflict(
+                "trusted workflow changed after the refresh plan was created",
+                {"reason_code": "workflow_trusted_record_changed"},
+            )
+        source = _refresh_source(record)
+        candidate = plan["candidate"]
+        comparisons = {
+            "source_manifest_path": source["manifest_path"],
+            "source_manifest_sha256": source["source_manifest_sha256"],
+            "source_declared_script_sha256": source["source_declared_script_sha256"],
+            "manifest_sha256": source["candidate_manifest_sha256"],
+            "script_path": source["script_path"],
+            "script_sha256": source["script_sha256"],
+            "contract_sha256": source["contract_sha256"],
+        }
+        if candidate != comparisons:
+            raise WorkflowConflict(
+                "workflow source changed after the refresh plan was created",
+                {"reason_code": "workflow_refresh_source_changed"},
+            )
+        if source["contract_changed"]:
+            raise WorkflowRefreshError(
+                "workflow contract changed; use full workflow trust replacement after review",
+                {"reason_code": "workflow_contract_changed",
+                 "changed_fields": source["contract_changed_fields"]},
+            )
+        snapshot = _capture_source_snapshot(source["script_path"], source["script_sha256"])
+        prior = record["provenance"]
+        source_meta = prior.get("source", {})
+        provenance = _build_provenance(
+            source["manifest_path"], source["source_manifest_sha256"], source["candidate"],
+            source_name=source_meta.get("name", "unavailable"),
+            source_version=source_meta.get("version", "unavailable"),
+            approved_at=prior["approval"]["approved_at"], snapshot=snapshot,
+        )
+        provenance["effective_manifest_sha256"] = source["candidate_manifest_sha256"]
+        refreshed_at = datetime.now(timezone.utc).isoformat()
+        provenance["refresh"] = {
+            "refreshed_at": refreshed_at,
+            "identity": "local-user-confirmation",
+            "identity_attested": False,
+            "method": "hash-bound-refresh-plan",
+            "plan_sha256": plan["plan_sha256"],
+        }
+        updated = {
+            "schema": RECORD_SCHEMA,
+            "manifest_sha256": source["candidate_manifest_sha256"],
+            "trusted_at": record["trusted_at"],
+            "refreshed_at": refreshed_at,
+            "manifest": source["candidate"],
+            "provenance": provenance,
+        }
+        updated["seal"] = _seal(updated, _trust_key(create=False))
+        _write_trusted_record(_record_path(plan["workflow"]), updated)
+        verified = load_trusted(plan["workflow"])
+        if not hmac.compare_digest(verified["seal"], updated["seal"]):
+            raise WorkflowTrustError("refreshed workflow record failed verification")
+    return {
+        "ok": True, "changed": True, "workflow": plan["workflow"],
+        "plan_sha256": plan["plan_sha256"],
+        "manifest_sha256": updated["manifest_sha256"],
+        "script_sha256": updated["manifest"]["command"]["script_sha256"],
+        "contract_sha256": provenance["contract_sha256"],
+        "refreshed_at": refreshed_at,
+    }
 
 
 def _executable_name(value: str) -> str:
