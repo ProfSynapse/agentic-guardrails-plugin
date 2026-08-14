@@ -85,13 +85,58 @@ def worksheet_part(path: str, sheet_name: str) -> str:
         return resolution.actual_part
 
 
-def _find_cell(payload: bytes, coordinate: str):
-    quoted = re.escape(coordinate.encode("ascii"))
+def _worksheet_prefix(payload: bytes) -> bytes:
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise SurgicalCellError("worksheet XML is malformed") from exc
+    if root.tag != f"{{{MAIN_NS}}}worksheet":
+        raise SurgicalCellError("worksheet root namespace is unsupported")
+    opening = re.search(
+        rb"<(?P<prefix>(?:[A-Za-z_][\w.-]*:)?)worksheet\b", payload
+    )
+    if not opening:
+        raise SurgicalCellError("worksheet root element is malformed")
+    return opening.group("prefix")
+
+
+def _qualified(prefix: bytes, local_name: bytes) -> bytes:
+    return prefix + local_name
+
+
+def _element(prefix: bytes, local_name: bytes, *, attrs: bytes = b"",
+             body: bytes | None = None) -> bytes:
+    name = _qualified(prefix, local_name)
+    if body is None:
+        return b"<" + name + attrs + b"/>"
+    return b"<" + name + attrs + b">" + body + b"</" + name + b">"
+
+
+def _sheet_data_match(payload: bytes, prefix: bytes):
+    sheet_data_name = re.escape(_qualified(prefix, b"sheetData"))
     pattern = re.compile(
-        rb"<c\b(?=[^>]*\br\s*=\s*['\"]" + quoted
-        + rb"['\"])[^>]*(?:/>|>.*?</c\s*>)", re.DOTALL,
+        rb"<" + sheet_data_name + rb"\b[^>]*(?:/>|>.*?</"
+        + sheet_data_name + rb"\s*>)", re.DOTALL,
     )
     matches = list(pattern.finditer(payload))
+    if not matches:
+        raise SurgicalCellError("worksheet has no sheetData element")
+    if len(matches) > 1:
+        raise SurgicalCellError("worksheet contains duplicate sheetData elements")
+    return matches[0]
+
+
+def _find_cell(payload: bytes, coordinate: str, prefix: bytes):
+    quoted = re.escape(coordinate.encode("ascii"))
+    cell_name = re.escape(_qualified(prefix, b"c"))
+    pattern = re.compile(
+        rb"<" + cell_name + rb"\b(?=[^>]*\br\s*=\s*['\"]" + quoted
+        + rb"['\"])[^>]*(?:/>|>.*?</" + cell_name + rb"\s*>)", re.DOTALL,
+    )
+    sheet_data = _sheet_data_match(payload, prefix)
+    matches = list(pattern.finditer(
+        payload, sheet_data.start(), sheet_data.end()
+    ))
     if len(matches) > 1:
         raise SurgicalCellError("worksheet contains duplicate cell references")
     return matches[0] if matches else None
@@ -110,12 +155,24 @@ def inspect_cell(path: str, sheet_name: str, coordinate: str) -> dict:
     part = worksheet_part(path, sheet_name)
     with zipfile.ZipFile(path) as package:
         payload = _part(package, part)
-        match = _find_cell(payload, coordinate)
-        if match is None:
+        try:
+            root = ElementTree.fromstring(payload)
+        except ElementTree.ParseError as exc:
+            raise SurgicalCellError("worksheet XML is malformed") from exc
+        sheet_data = root.findall(f"{{{MAIN_NS}}}sheetData")
+        if not sheet_data:
+            raise SurgicalCellError("worksheet has no sheetData element")
+        if len(sheet_data) > 1:
+            raise SurgicalCellError("worksheet contains duplicate sheetData elements")
+        matches = [
+            node for node in sheet_data[0].iter(f"{{{MAIN_NS}}}c")
+            if node.attrib.get("r", "").upper() == coordinate
+        ]
+        if len(matches) > 1:
+            raise SurgicalCellError("worksheet contains duplicate cell references")
+        if not matches:
             return {"part": part, "coordinate": coordinate, "value": None}
-        wrapper = (f'<root xmlns="{MAIN_NS}">'.encode("ascii")
-                   + match.group(0) + b"</root>")
-        node = ElementTree.fromstring(wrapper)[0]
+        node = matches[0]
         formula = node.find(f"{{{MAIN_NS}}}f")
         if formula is not None:
             value = "=" + (formula.text or "")
@@ -143,11 +200,16 @@ def inspect_cell(path: str, sheet_name: str, coordinate: str) -> dict:
         return {"part": part, "coordinate": coordinate, "value": value}
 
 
-def _opening_attributes(existing: bytes | None, coordinate: str) -> bytes:
+def _opening_attributes(existing: bytes | None, coordinate: str,
+                        prefix: bytes) -> bytes:
     if existing is None:
         return f' r="{coordinate}"'.encode("ascii")
     opening = existing[:existing.find(b">") + 1]
-    match = re.match(rb"<c(?P<attrs>[^>]*?)(?:/)?\s*>", opening, re.DOTALL)
+    cell_name = re.escape(_qualified(prefix, b"c"))
+    match = re.match(
+        rb"<" + cell_name + rb"(?P<attrs>[^>]*?)(?:/)?\s*>",
+        opening, re.DOTALL,
+    )
     if not match:
         raise SurgicalCellError("existing cell XML is malformed")
     attrs = match.group("attrs")
@@ -155,45 +217,66 @@ def _opening_attributes(existing: bytes | None, coordinate: str) -> bytes:
     return attrs.rstrip().rstrip(b"/").rstrip()
 
 
-def _new_cell(existing: bytes | None, coordinate: str, value) -> bytes:
-    attrs = _opening_attributes(existing, coordinate)
+def _new_cell(existing: bytes | None, coordinate: str, value,
+              prefix: bytes) -> bytes:
+    attrs = _opening_attributes(existing, coordinate, prefix)
     if value is None:
-        return b"<c" + attrs + b"/>"
+        return _element(prefix, b"c", attrs=attrs)
     if isinstance(value, bool):
-        return b"<c" + attrs + b' t="b"><v>' + (b"1" if value else b"0") + b"</v></c>"
+        body = _element(prefix, b"v", body=b"1" if value else b"0")
+        return _element(prefix, b"c", attrs=attrs + b' t="b"', body=body)
     if isinstance(value, int) and not isinstance(value, bool):
         body = str(value).encode("ascii")
-        return b"<c" + attrs + b"><v>" + body + b"</v></c>"
+        return _element(
+            prefix, b"c", attrs=attrs,
+            body=_element(prefix, b"v", body=body),
+        )
     if isinstance(value, float):
         if not math.isfinite(value):
             raise SurgicalCellError("non-finite numbers are unsupported")
         body = repr(value).encode("ascii")
-        return b"<c" + attrs + b"><v>" + body + b"</v></c>"
+        return _element(
+            prefix, b"c", attrs=attrs,
+            body=_element(prefix, b"v", body=body),
+        )
     text = str(value)
     if text.startswith("="):
         body = escape(text[1:]).encode("utf-8")
-        return b"<c" + attrs + b"><f>" + body + b"</f></c>"
+        return _element(
+            prefix, b"c", attrs=attrs,
+            body=_element(prefix, b"f", body=body),
+        )
     body = escape(text).encode("utf-8")
     space = b' xml:space="preserve"' if text != text.strip() else b""
-    return (b"<c" + attrs + b' t="inlineStr"><is><t' + space + b">"
-            + body + b"</t></is></c>")
+    inline = _element(
+        prefix, b"is", body=_element(prefix, b"t", attrs=space, body=body),
+    )
+    return _element(prefix, b"c", attrs=attrs + b' t="inlineStr"', body=inline)
 
 
 def _insert_cell(payload: bytes, coordinate: str, row_number: int,
-                 column_number: int, cell: bytes) -> bytes:
+                 column_number: int, value, prefix: bytes) -> bytes:
+    row_name = re.escape(_qualified(prefix, b"row"))
+    cell_name = re.escape(_qualified(prefix, b"c"))
+    sheet_data = _sheet_data_match(payload, prefix)
     row_pattern = re.compile(
-        rb"<row\b(?=[^>]*\br\s*=\s*['\"]" + str(row_number).encode("ascii")
-        + rb"['\"])[^>]*(?:/>|>.*?</row\s*>)", re.DOTALL,
+        rb"<" + row_name + rb"\b(?=[^>]*\br\s*=\s*['\"]"
+        + str(row_number).encode("ascii") + rb"['\"])[^>]*(?:/>|>.*?</"
+        + row_name + rb"\s*>)", re.DOTALL,
     )
-    row_match = row_pattern.search(payload)
+    row_match = row_pattern.search(payload, sheet_data.start(), sheet_data.end())
     if row_match:
+        cell = _new_cell(None, coordinate, value, prefix)
         row = row_match.group(0)
         if re.search(rb"/\s*>$", row):
             opening = re.sub(rb"/\s*>$", b">", row)
-            updated = opening + cell + b"</row>"
+            updated = opening + cell + b"</" + _qualified(prefix, b"row") + b">"
         else:
-            insertion = row.rfind(b"</row")
-            for existing in re.finditer(rb"<c\b[^>]*\br\s*=\s*['\"]([A-Za-z]{1,3})[0-9]+['\"]", row):
+            insertion = row.rfind(b"</" + _qualified(prefix, b"row"))
+            for existing in re.finditer(
+                    rb"<" + cell_name
+                    + rb"\b[^>]*\br\s*=\s*['\"]([A-Za-z]{1,3})[0-9]+['\"]",
+                    row):
                 column = 0
                 for char in existing.group(1).decode("ascii").upper():
                     column = column * 26 + ord(char) - 64
@@ -203,18 +286,20 @@ def _insert_cell(payload: bytes, coordinate: str, row_number: int,
             updated = row[:insertion] + cell + row[insertion:]
         return payload[:row_match.start()] + updated + payload[row_match.end():]
 
-    sheet_data = re.search(rb"<sheetData\b[^>]*(?:/>|>.*?</sheetData\s*>)", payload,
-                           re.DOTALL)
-    if not sheet_data:
-        raise SurgicalCellError("worksheet has no sheetData element")
     block = sheet_data.group(0)
-    new_row = f'<row r="{row_number}">'.encode("ascii") + cell + b"</row>"
+    cell = _new_cell(None, coordinate, value, prefix)
+    new_row = _element(
+        prefix, b"row", attrs=f' r="{row_number}"'.encode("ascii"), body=cell,
+    )
     if re.search(rb"/\s*>$", block):
         opening = re.sub(rb"/\s*>$", b">", block)
-        updated = opening + new_row + b"</sheetData>"
+        updated = (opening + new_row + b"</"
+                   + _qualified(prefix, b"sheetData") + b">")
     else:
-        insertion = block.rfind(b"</sheetData")
-        for existing in re.finditer(rb"<row\b[^>]*\br\s*=\s*['\"]([0-9]+)['\"]", block):
+        insertion = block.rfind(b"</" + _qualified(prefix, b"sheetData"))
+        for existing in re.finditer(
+                rb"<" + row_name + rb"\b[^>]*\br\s*=\s*['\"]([0-9]+)['\"]",
+                block):
             if int(existing.group(1)) > row_number:
                 insertion = existing.start()
                 break
@@ -234,15 +319,17 @@ def set_cell(path: str, sheet_name: str, coordinate: str, value) -> dict:
                 replacement, "w") as target:
             target.comment = source.comment
             before_payload = _part(source, part)
-            cell_match = _find_cell(before_payload, coordinate)
+            prefix = _worksheet_prefix(before_payload)
+            cell_match = _find_cell(before_payload, coordinate, prefix)
             existing = cell_match.group(0) if cell_match else None
-            cell = _new_cell(existing, coordinate, value)
             if cell_match:
+                cell = _new_cell(existing, coordinate, value, prefix)
                 after_payload = (before_payload[:cell_match.start()] + cell
                                  + before_payload[cell_match.end():])
             else:
                 after_payload = _insert_cell(
-                    before_payload, coordinate, row_number, column_number, cell
+                    before_payload, coordinate, row_number, column_number,
+                    value, prefix,
                 )
             for item in source.infolist():
                 target.writestr(item, after_payload if item.filename == part
