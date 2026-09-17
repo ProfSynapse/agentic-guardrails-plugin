@@ -624,6 +624,54 @@ def test_mcp_read_defers(policy):
     assert d.action == DEFER
 
 
+def _regenerable_project(tmp_path):
+    for relative in ("node_modules/x/a.js", "build/o.js", "dist/bundle.js",
+                     "src/app.py"):
+        path = tmp_path.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n", encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_regenerable_delete_is_planned_as_skipped_not_as_a_target(tmp_path):
+    """F6: the allowance was useless because the directory stayed a target.
+
+    `preimages.prepare` rejects anything that is not a regular file, so a
+    listed directory turned `builtin:rm-regenerable` into a non-waivable
+    `invariant:prestate-unavailable` DENY whenever the tree actually existed.
+    """
+    from core import mutations
+
+    cwd = _regenerable_project(tmp_path)
+    for tool, command in (
+        ("PowerShell", "Remove-Item -Recurse -Force node_modules"),
+        ("PowerShell", "ri -Recurse -Force build"),
+        ("PowerShell", "rm -r -fo dist"),
+        ("Bash", "rm -rf node_modules"),
+    ):
+        event = _ev(EXEC, tool=tool, command=command, cwd=cwd)
+        plan = mutations.plan([event], engine.clobber_targets)
+        assert plan.complete, f"{command!r}: {plan.reason}"
+        assert plan.targets == [], command
+        assert plan.skipped, command
+        assert all(why == engine.SKIP_REGENERABLE for _target, why in plan.skipped)
+
+
+def test_a_mixed_delete_keeps_full_preimage_coverage(tmp_path):
+    """Only an all-regenerable delete is allowed, so only it may skip."""
+    from core import mutations
+
+    cwd = _regenerable_project(tmp_path)
+    for tool, command in (
+        ("Bash", "rm -rf node_modules src"),
+        ("PowerShell", "Remove-Item -Recurse -Force src"),
+    ):
+        event = _ev(EXEC, tool=tool, command=command, cwd=cwd)
+        plan = mutations.plan([event], engine.clobber_targets)
+        assert plan.skipped == [], command
+        assert engine.evaluate(event, engine.load_policy(REPO), REPO).action == DENY
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)

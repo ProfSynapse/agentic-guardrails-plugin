@@ -90,6 +90,48 @@ def test_operation_scope_ask_reaches_the_human(hook, tmp_path, tool, command,
     assert "could not identify enough structured information" not in reason
 
 
+# --- F6: deleting a regenerable tree that actually exists ---------------------
+
+REGENERABLE_DELETES = [
+    ("PowerShell", "Remove-Item -Recurse -Force node_modules"),
+    ("PowerShell", "ri -Recurse -Force build"),
+    ("PowerShell", "rm -r -fo dist"),
+    ("Bash", "rm -rf node_modules"),
+    ("Bash", "rm -rf build"),
+]
+
+
+@pytest.mark.parametrize("tool,command", REGENERABLE_DELETES)
+def test_regenerable_delete_is_allowed_when_the_tree_exists(hook, tmp_path, tool,
+                                                            command):
+    """The allowance only ever worked because test cwds had no such directory.
+
+    With the tree present, `mutations.plan` listed the directory and
+    `preimages.prepare` refused it, so routine cleanup hit a non-waivable
+    `invariant:prestate-unavailable` DENY on the PowerShell path and a
+    "could not determine every file" DENY on the Bash path.
+    """
+    project = _project(tmp_path)
+    _tree(project, "node_modules/x/a.js", "build/o.js", "dist/bundle.js",
+          "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision == "allow", f"{command!r} was {decision}: {reason}"
+    assert "builtin:rm-regenerable" in reason
+
+
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "rm -rf src"),
+    ("PowerShell", "Remove-Item -Recurse -Force src"),
+    ("Bash", "rm -rf node_modules src"),
+])
+def test_a_real_source_tree_is_still_protected(hook, tmp_path, tool, command):
+    project = _project(tmp_path)
+    _tree(project, "node_modules/x/a.js", "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision == "deny", f"{command!r} was {decision}"
+    assert "agw archive" in reason
+
+
 def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     """The operation-scope prompt is a floor for ASK only; DENY must not soften."""
     project = _project(tmp_path)

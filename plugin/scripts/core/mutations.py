@@ -624,6 +624,10 @@ class MutationPlan:
     reason: str = ""
     review_required: bool = False
     evidence: dict = field(default_factory=dict)
+    # (target, why) pairs the planner analyzed and deliberately did not
+    # schedule a pre-image for. A complete plan with no targets is only honest
+    # when it can say which targets it dropped and why.
+    skipped: list = field(default_factory=list)
 
 
 def _canonical(path: str, cwd: str) -> str:
@@ -725,6 +729,9 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
                         "-- <command>`, or install a reviewed reusable contract with "
                         "`agw workflow trust --help`"
                     )
+                for entry in getattr(targets, "skipped", ()) or ():
+                    if entry not in result.skipped:
+                        result.skipped.append(entry)
                 surface = _NULL_REDIRECT.sub("", _unquoted_surface(ev.command))
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
                     or _looks_locally_mutating(ev.command, dialect=dialect)

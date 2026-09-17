@@ -622,13 +622,18 @@ def _named_arg(argv: list, flags: tuple) -> str:
 class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
-    def __init__(self, values=(), complete=True, reason="", covered=False):
+    def __init__(self, values=(), complete=True, reason="", covered=False,
+                 skipped=()):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
         # True when a recognized mutator was fully analyzed but legitimately
         # needs no pre-image (for example mkdir -p on an existing directory).
         self.covered = covered
+        # (target, why) pairs a recognized mutator deliberately left out of the
+        # target set. The planner records them so the receipt stays honest
+        # about what was analyzed and not snapshotted.
+        self.skipped = list(skipped)
 
 
 def _static_shell_path(token: str) -> bool:
@@ -709,15 +714,52 @@ def _powershell_directory_creation(argv: list[str]) -> bool:
     return False
 
 
+SKIP_REGENERABLE = "regenerable, no pre-image required"
+
+
+def _regenerable_delete_operands(cmd: SimpleCommand, binding, regenerable: set):
+    """Operands of a delete whose every target is a regenerable tree.
+
+    Mirrors the `builtin:rm-regenerable` allowance exactly: only the general
+    removers, and only when *every* operand is regenerable. Returns an empty
+    list otherwise, so a mixed delete keeps full pre-image coverage.
+    """
+    name = cmd.name
+    if name not in _REGEN_OK_VERBS:
+        return []
+    if binding.recognized and binding.complete:
+        operands = list(binding.targets)
+    elif binding.recognized:
+        return []
+    else:
+        operands = [value for value in cmd.argv[1:]
+                    if not value.startswith("-")
+                    and not (name in _CMD_SWITCH_VERBS
+                             and _CMD_SWITCH_RE.fullmatch(value))]
+    if not operands:
+        return []
+    return operands if all(_is_regenerable(value, regenerable)
+                           for value in operands) else []
+
+
 def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
-                    dialect: str = None) -> list:
+                    dialect: str = None, regenerable: set = None) -> list:
     """Existing files a shell command would overwrite/truncate: `>` redirects,
     POSIX mv/cp/tee/dd/truncate/install destinations, and the PowerShell/cmd
     write forms (Set-Content/Out-File, Copy-Item/copy /y, Move-Item/move,
     [IO.File]::WriteAllText) that carry no `>` token. Used by the adapter to
     pre-image-snapshot them before the command runs — the Bash equivalent of
     the Write/Edit pre-image. Best-effort: never raises. Over-inclusion is
-    cheap (a redundant snapshot is deduped); a miss is silent data loss."""
+    cheap (a redundant snapshot is deduped); a miss is silent data loss.
+
+    `regenerable` is the engine's regenerable-tree set (defaults to the
+    built-in one). Deletes the engine allows under `builtin:rm-regenerable`
+    report their operands as skipped instead of as targets: a directory has no
+    pre-image to take and archiving a build tree would copy gigabytes of
+    reproducible junk. When the level turns the allowance off the delete is a
+    DENY, so the command never reaches pre-image preparation anyway."""
+    regenerable = _REGENERABLE if regenerable is None else regenerable
+
     def _abs(tok):
         tok = tok.strip("'\"")
         p = os.path.expanduser(tok)
@@ -731,6 +773,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     complete = True
     incomplete_reason = ""
     covered = False
+    skipped = []
     try:
         for t in redirect_targets(command):
             targets.add(_abs(t))
@@ -753,6 +796,14 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             name = cmd.name
             argv_low = [a.lower() for a in cmd.argv]
             binding = powershell_bind.bind(cmd.argv, cmd.dialect)
+            regen_operands = _regenerable_delete_operands(
+                cmd, binding, regenerable
+            )
+            if regen_operands:
+                covered = True
+                skipped.extend((_abs(value), SKIP_REGENERABLE)
+                               for value in regen_operands)
+                continue
             if binding.recognized:
                 if not binding.complete:
                     complete = False
@@ -860,7 +911,8 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
         for m in _WRITEALLTEXT_RE.finditer(text):
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
-    return TargetList(values, complete, incomplete_reason, covered=covered)
+    return TargetList(values, complete, incomplete_reason, covered=covered,
+                      skipped=skipped)
 
 
 def _zone_rule_for(path: str, policy: Policy):
