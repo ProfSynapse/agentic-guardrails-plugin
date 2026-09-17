@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+import re
 from typing import Iterable, Optional
 
 from . import events
-from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
+from .shellparse import (
+    DIALECT_POWERSHELL, ParseUncertain, extract_commands, wrapper_kind,
+)
 
 
 SCHEMA = "agw.safe-next/v1"
@@ -26,10 +29,15 @@ ASSUMPTION_SINGLE_LITERAL = "single-literal-command"
 ASSUMPTION_TARGETS_REVALIDATED = "targets-revalidated"
 ASSUMPTION_AUTHENTICATED_WORKFLOW = "authenticated-workflow"
 ASSUMPTION_WORKFLOW_REVALIDATED = "workflow-revalidated"
+# The literal command was found inside an interpreter wrapper (`bash -c`,
+# `wsl`, `cmd /c`, `powershell -Command`) and its target was mapped back to a
+# host path; the advice names that host path, not the wrapper's view of it.
+ASSUMPTION_WRAPPER_UNWRAPPED = "interpreter-wrapper-unwrapped"
 _ASSUMPTIONS = frozenset({
     ASSUMPTION_EVENT_CURRENT, ASSUMPTION_CWD_BOUND,
     ASSUMPTION_SINGLE_LITERAL, ASSUMPTION_TARGETS_REVALIDATED,
     ASSUMPTION_AUTHENTICATED_WORKFLOW, ASSUMPTION_WORKFLOW_REVALIDATED,
+    ASSUMPTION_WRAPPER_UNWRAPPED,
 })
 _COMPONENTS = frozenset({"engine", "workflow-diagnostics", "decision-fallback"})
 _EVENT_KINDS = frozenset({
@@ -311,6 +319,26 @@ def incomplete(rule_id: str, event=None, *, component: str = "decision-fallback"
     )
 
 
+def _unwrap_literal(commands):
+    """Peel interpreter wrappers off a parsed chain, leaving one inner literal.
+
+    `bash.exe -c "rm -rf X"` and `wsl rm -rf X` parse as ``[wrapper, rm]``:
+    the denial came from the inner command, so the advice should describe it
+    too. Anything that is not wrapper* followed by exactly one command (`rm a;
+    rm b`, or a wrapper whose body holds two commands) stays ambiguous and
+    yields no advice. Returns ``(command, wrapper_kinds)`` or ``None``.
+    """
+    if not commands:
+        return None
+    wrappers = []
+    for command in commands[:-1]:
+        kind = wrapper_kind(command.argv[0]) if command.argv else ""
+        if not kind:
+            return None
+        wrappers.append(kind)
+    return commands[-1], tuple(wrappers)
+
+
 def _literal_event(event):
     if event is None or event.kind != events.EXEC or not event.command or not event.cwd:
         return None
@@ -320,14 +348,58 @@ def _literal_event(event):
         parsed = extract_commands(event.command, dialect=dialect)
     except (ParseUncertain, TypeError, ValueError):
         return None
-    if len(parsed.commands) != 1 or parsed.flags or not parsed.commands[0].argv:
+    if parsed.flags:
         return None
-    if not all(isinstance(value, str) and value for value in parsed.commands[0].argv):
+    unwrapped = _unwrap_literal(parsed.commands)
+    if unwrapped is None:
         return None
-    return parsed.commands[0], dialect
+    command, wrappers = unwrapped
+    if not command.argv:
+        return None
+    if not all(isinstance(value, str) and value for value in command.argv):
+        return None
+    return command, dialect, wrappers
 
 
-def _archive_argv(command, cwd: str) -> tuple[str, ...]:
+_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+# `/mnt/<drive>/...`: how WSL (and System32's bash.exe) see the Windows drives.
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([A-Za-z])/(.+)$")
+# `/<drive>/...`: how Git Bash / MSYS see them.
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])/(.+)$")
+
+
+def _host_target(target: str, cwd: str, wrappers: tuple[str, ...]) -> str:
+    """Map a deletion target back to a path `agw archive` can act on.
+
+    A plain command's target is resolved against ``cwd`` as usual. Inside a
+    wrapper the inner command may have seen the drives through a mount, so a
+    Windows host translates the `/mnt/f/...` and `/f/...` spellings back to
+    `F:\\...` and refuses anything else absolute (a distro-internal path has no
+    host-side equivalent). Relative targets are cwd-bound either way: every
+    wrapper inherits the caller's working directory. Returns ``""`` when there
+    is no deterministic host path.
+    """
+    if not wrappers:
+        return target if os.path.isabs(target) else os.path.join(cwd, target)
+    if target.startswith("~"):
+        return ""
+    if _DRIVE_PATH_RE.match(target):
+        return target if os.name == "nt" else ""
+    if not target.startswith("/"):
+        return os.path.join(cwd, target)
+    if "wsl" in wrappers:
+        match = _WSL_MOUNT_RE.match(target) if os.name == "nt" else None
+    elif os.name == "nt":
+        match = _WSL_MOUNT_RE.match(target) or _MSYS_DRIVE_RE.match(target)
+    else:
+        return target
+    if not match:
+        return ""
+    return match.group(1).upper() + ":\\" + match.group(2).replace("/", "\\")
+
+
+def _archive_argv(command, cwd: str,
+                  wrappers: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Build advice only for a narrow one-target literal deletion form."""
     if command.name not in {
         "rm", "unlink", "shred", "rmdir", "del", "erase", "rd", "ri",
@@ -348,9 +420,10 @@ def _archive_argv(command, cwd: str) -> tuple[str, ...]:
     target = operands[0]
     if any(char in target for char in "$`*?[]{}()") or "\x00" in target:
         return ()
-    resolved = os.path.normpath(os.path.abspath(
-        target if os.path.isabs(target) else os.path.join(cwd, target)
-    ))
+    host_target = _host_target(target, cwd, wrappers)
+    if not host_target:
+        return ()
+    resolved = os.path.normpath(os.path.abspath(host_target))
     if os.path.normcase(resolved) != os.path.normcase(os.path.normpath(
             os.path.abspath(resolved))):
         return ()
@@ -390,16 +463,19 @@ def for_event(decision, event) -> Optional[SafeNext]:
     parsed = _literal_event(event)
     if parsed is None:
         return incomplete(rule_id, event)
-    command, dialect = parsed
+    command, dialect, wrappers = parsed
     # Deferred: mutations pulls in workflows and the whole store, and only a
     # DENY reaches this line. Every routine allow evaluates without them.
     from . import mutations
     source = RemediationSource(
         "engine", rule_id, events.EXEC, COMMAND_PARSED, CWD_EVENT,
     )
+    # Workflow advice re-parses the raw command line itself; only a bare
+    # literal is handed to it, never a wrapper whose body it would have to
+    # unwrap on its own.
     argv = mutations.workflow_recommended_argv(
         event.command, event.cwd, dialect=dialect,
-    ) if rule_id in _WORKFLOW_ELIGIBLE_RULES else []
+    ) if rule_id in _WORKFLOW_ELIGIBLE_RULES and not wrappers else []
     if argv:
         return SafeNext(
             REASON_WORKFLOW, tuple(argv), True, False,
@@ -412,13 +488,16 @@ def for_event(decision, event) -> Optional[SafeNext]:
             ), (),
         )
     if rule_id in _ARCHIVE_RULES:
-        argv = _archive_argv(command, event.cwd)
+        argv = _archive_argv(command, event.cwd, wrappers)
         if argv:
+            assumptions = (
+                ASSUMPTION_EVENT_CURRENT, ASSUMPTION_CWD_BOUND,
+                ASSUMPTION_SINGLE_LITERAL, ASSUMPTION_TARGETS_REVALIDATED,
+            )
+            if wrappers:
+                assumptions += (ASSUMPTION_WRAPPER_UNWRAPPED,)
             return SafeNext(
-                REASON_ARCHIVE, argv, True, False,
-                (ASSUMPTION_EVENT_CURRENT, ASSUMPTION_CWD_BOUND,
-                 ASSUMPTION_SINGLE_LITERAL, ASSUMPTION_TARGETS_REVALIDATED),
-                source, (),
+                REASON_ARCHIVE, argv, True, False, assumptions, source, (),
             )
     if rule_id == "builtin:unbounded-discovery":
         argv = _bounded_list_argv(event)

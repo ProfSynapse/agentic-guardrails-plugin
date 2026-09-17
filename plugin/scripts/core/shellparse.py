@@ -65,6 +65,26 @@ def _normalized_head(token: str) -> str:
     head = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
     return _WRAPPER_EXT_RE.sub("", head)
 
+
+def wrapper_kind(token: str) -> str:
+    """Classify argv0 as an interpreter wrapper this parser recurses into.
+
+    Returns ``"shell"``, ``"wsl"``, ``"cmd"``, ``"pwsh"``, or ``""`` for a plain
+    command. Remediation uses it to tell `bash.exe -c "rm X"` (a wrapper around
+    one literal deletion) from `rm a; rm b` (two deletions) once both have been
+    parsed into a command chain.
+    """
+    head = _normalized_head(token)
+    if head in _SHELLS:
+        return "shell"
+    if head in _WSL:
+        return "wsl"
+    if head in _WIN_CMD:
+        return "cmd"
+    if head in _PWSH:
+        return "pwsh"
+    return ""
+
 # PowerShell parameter prefixes (it accepts any unambiguous abbreviation). We
 # only need the exec-surface ones: -Command, -EncodedCommand, -File, plus the
 # value-taking setup flags so we can skip them and their argument.
