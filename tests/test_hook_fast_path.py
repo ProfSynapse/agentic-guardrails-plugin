@@ -143,3 +143,58 @@ def test_failed_lazy_import_still_fails_closed(host, expected, plain_file, tmp_p
     # Exactly one decision object on stdout: the fail-closed handler must not
     # append a second one to a stream that already carries a decision.
     assert result.stdout.count("hookSpecificOutput") == 1
+
+
+# --- G11: PostToolUse checks the cheap gate before loading anything ----------
+
+POST_HEAVY = HEAVY | {"core.engine", "core.events", "core.shellparse", "core.launcher",
+                      "core.profiles", "core.policy_health", "core.mcpshell"}
+
+
+def _post_payload(path, **extra):
+    payload = {"tool_name": "Read", "tool_input": {"file_path": path},
+               "cwd": os.getcwd(), "session_id": "post-gate",
+               "hook_event_name": "PostToolUse", "tool_use_id": "tu-post-1",
+               "tool_response": {"ok": True}}
+    payload.update(extra)
+    return payload
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_posttooluse_without_a_pending_record_loads_nothing_heavy(host, plain_file, tmp_path):
+    result = _run(host, "posttooluse", _post_payload(plain_file), verbose=True,
+                  env_extra={"AGW_HOME": str(tmp_path / "home")})
+    assert result.returncode == 0
+    loaded = _imports(result)
+    forbidden = POST_HEAVY - ({"core.events", "core.mcpshell"} if host == "codex" else set())
+    assert not loaded & forbidden, sorted(loaded & forbidden)
+    assert "core.pending_approvals" in loaded
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_posttooluse_with_a_pending_record_still_verifies_with_the_engine(
+        host, plain_file, tmp_path, monkeypatch):
+    """The record is the sole gate: once it exists, the full verification runs."""
+    from core import approvals, pending_approvals, store
+    assert approvals.consume_pending_approval is pending_approvals.consume_pending_approval
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = _post_payload(plain_file)
+    assert pending_approvals.record_pending_approval(
+        payload, payload["session_id"], "memo", "stale-revision", "fingerprint")
+    result = _run(host, "posttooluse", payload, verbose=True,
+                  env_extra={"AGW_HOME": str(home)})
+    assert result.returncode == 0
+    loaded = _imports(result)
+    assert {"core.engine", "core.store", "core.presentation"} <= loaded
+    # The record was consumed, and a stale revision grants nothing.
+    assert not list(home.glob("pending-approvals/*.json"))
+    assert not store.session_approved(payload["session_id"], "memo")
+
+
+def test_auditlog_no_longer_needs_dataclasses():
+    result = subprocess.run(
+        [sys.executable, "-v", "-c", "import core.auditlog"],
+        capture_output=True, text=True, cwd=SCRIPTS, timeout=60)
+    assert result.returncode == 0
+    assert "dataclasses" not in _imports(result)

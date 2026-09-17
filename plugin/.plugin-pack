@@ -49,6 +49,7 @@ scripts/core/mcpshell.py
 scripts/core/miniyaml.py
 scripts/core/mutations.py
 scripts/core/outcomes.py
+scripts/core/pending_approvals.py
 scripts/core/policy_health.py
 scripts/core/policycache.py
 scripts/core/powershell_bind.py
