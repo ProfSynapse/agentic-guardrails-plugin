@@ -56,6 +56,8 @@ scripts/core/powershell_bind.py
 scripts/core/preimages.py
 scripts/core/presentation.py
 scripts/core/profiles.py
+scripts/core/readfast.py
+scripts/core/readscan.py
 scripts/core/recovery_contracts.py
 scripts/core/remediation.py
 scripts/core/retention.py

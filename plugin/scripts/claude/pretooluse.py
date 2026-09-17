@@ -101,11 +101,23 @@ def _plan_mutations(evlist, engine, events, mutations, **options):
                           **options)
 
 
+def _routine_read(payload):
+    """The Read fast path: True means the engine would say nothing, so we say
+    nothing without loading it. Anything else takes the full path below."""
+    from core import readfast
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    return readfast.routine_read(tool_input.get("file_path", ""), PLUGIN_ROOT)
+
+
 def main():
     payload = json.load(sys.stdin)
     unknown = unrecognized_tool(payload)
     if unknown is not None:
         _emit(_unrecognized_tool_decision(unknown))
+        return
+    if payload.get("tool_name") == "Read" and _routine_read(payload):
         return
     from core import auditlog, enforcement, engine, events, launcher, remediation
     from core.lazyimport import LazyModule

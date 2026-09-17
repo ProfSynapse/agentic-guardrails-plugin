@@ -100,8 +100,21 @@ def _plan_mutations(evlist, engine, events, mutations, **options):
                           **options)
 
 
+def _routine_read(payload):
+    """The Read fast path: True means the engine would say nothing, so we say
+    nothing without loading it. Anything else takes the full path below."""
+    from core import readfast
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    path = tool_input.get("file_path") or tool_input.get("path") or ""
+    return readfast.routine_read(path, PLUGIN_ROOT)
+
+
 def main(approval_provider=None):
     payload = json.load(sys.stdin)
+    if payload.get("tool_name") == "Read" and _routine_read(payload):
+        return
     from core import auditlog, enforcement, engine, events, launcher, remediation
     from core.lazyimport import LazyModule
     # Deferred until a call site needs them: the store, workflows and the
