@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import os
 from typing import Iterable, Optional
 
-from . import events, mutations
+from . import events
 from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
 
 
@@ -391,6 +391,9 @@ def for_event(decision, event) -> Optional[SafeNext]:
     if parsed is None:
         return incomplete(rule_id, event)
     command, dialect = parsed
+    # Deferred: mutations pulls in workflows and the whole store, and only a
+    # DENY reaches this line. Every routine allow evaluates without them.
+    from . import mutations
     source = RemediationSource(
         "engine", rule_id, events.EXEC, COMMAND_PARSED, CWD_EVENT,
     )

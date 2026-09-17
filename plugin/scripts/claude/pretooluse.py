@@ -76,15 +76,49 @@ def _unrecognized_tool_decision(label):
 from adapter_common import INERT_TOOLS  # noqa: E402
 
 
+class _InertPlan:
+    """The plan mutations.plan returns for an event that cannot mutate files."""
+    mutating = False
+    complete = True
+    review_required = False
+    reason = ""
+    evidence = {}
+    targets = []
+
+
+def _plan_mutations(evlist, engine, events, mutations, **options):
+    """Plan pre-images only for events that can mutate files.
+
+    mutations.plan leaves a READ or MCP event inert by construction (a Read
+    has no mutation primitive; a connected-service call has no local files to
+    snapshot). Every other kind, including an unmodeled OTHER tool, goes to
+    the planner. Skipping the call for the two inert kinds keeps the
+    mutations/workflows/store import chain off the routine path entirely.
+    """
+    if all(ev.kind in (events.READ, events.MCP) for ev in evlist):
+        return _InertPlan()
+    return mutations.plan(evlist, engine.clobber_targets, plugin_root=PLUGIN_ROOT,
+                          **options)
+
+
 def main():
     payload = json.load(sys.stdin)
     unknown = unrecognized_tool(payload)
     if unknown is not None:
         _emit(_unrecognized_tool_decision(unknown))
         return
-    from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, remediation, retention_policy, store
-    from core.decisions import GuardrailDecision
+    from core import auditlog, enforcement, engine, events, launcher, remediation
+    from core.lazyimport import LazyModule
+    # Deferred until a call site needs them: the store, workflows and the
+    # prompt/approval machinery cost more to import than the whole routine
+    # Read or MCP path. Each proxy imports inside this function, so a
+    # broken module still lands in the fail-closed handler below.
+    approvals = LazyModule("core.approvals")
+    mutations = LazyModule("core.mutations")
+    preimages = LazyModule("core.preimages")
+    presentation = LazyModule("core.presentation")
+    retention_policy = LazyModule("core.retention_policy")
+    store = LazyModule("core.store")
 
     evaluation_payload = payload
     rewritten_command = None
@@ -122,8 +156,8 @@ def main():
     will_run = effective.action != events.DENY
     # Prestate failures are safety invariants. Unlike advisory policy choices,
     # they cannot be approved away or suppressed by observe mode.
-    mutation_plan = mutations.plan(
-        [event], engine.clobber_targets, plugin_root=PLUGIN_ROOT,
+    mutation_plan = _plan_mutations(
+        [event], engine, events, mutations,
         regenerable=cfg.get("regenerable"), inert_tools=INERT_TOOLS,
     )
     invariant_failure = ""
@@ -276,6 +310,7 @@ def main():
     prompt_request = None
     approval_outcome = ""
     if action == events.ASK:
+        from core.decisions import GuardrailDecision
         prompt_decision = GuardrailDecision.from_legacy(decision)
         prompt_request = presentation.build_prompt(
             prompt_decision, evaluation_payload, [event]
@@ -306,6 +341,7 @@ def main():
         if action == events.ASK:
             reason = prompt_request.action + "\n\n" + prompt_request.primary_text()
         elif action == events.DENY:
+            from core.decisions import GuardrailDecision
             denial_decision = GuardrailDecision.from_legacy(decision)
             denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
