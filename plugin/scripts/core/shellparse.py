@@ -199,12 +199,32 @@ def _canonicalize_powershell_backticks(command: str) -> str:
     return "".join(out)
 
 
+# A `Verb-Noun` token only means PowerShell when the verb is one PowerShell
+# actually ships. The old shape (`[A-Z][A-Za-z]+-[A-Z][A-Za-z]+`) matched any
+# capitalized hyphenated word, so `Content-Type`, `X-Request-Id`, `Foo-Bar` and
+# `My-App` switched a Bash command line into the PowerShell dialect and took its
+# parsing rules with them.
+_PWSH_CMDLET_RE = re.compile(
+    r"\b(?:Get|Set|New|Remove|Copy|Move|Invoke|Start|Stop|Out|Clear|Rename|Test"
+    r"|Write|Select|Where|ForEach|Compress|Expand|Import|Export|Add|Read|Format"
+    r"|Sort|Group|Measure|Join|Split|Resolve|ConvertTo|ConvertFrom)"
+    r"-[A-Z][A-Za-z]+\b")
+# Constructs with no Bash reading at all: the PowerShell environment drive and
+# the pipeline current-object variable.
+_PWSH_ONLY_RE = re.compile(r"(?i)\$env:[A-Za-z_]|\$PSItem\b")
+
+
 def _detect_dialect(command: str) -> str:
-    if re.search(r"(?i)\$env:[A-Za-z_]", command):
+    """Guess the dialect of a `tool=Bash` command line.
+
+    Only a guess is needed here: `tool=PowerShell` pins the dialect by tool name
+    before the parser is reached, so this never decides a real PowerShell call.
+    """
+    if _PWSH_ONLY_RE.search(command):
         return DIALECT_POWERSHELL
     if re.search(r"(?m)(?:^|[;\n])\s*\$[A-Za-z_]\w*\s*=", command):
         return DIALECT_POWERSHELL
-    if re.search(r"\b[A-Z][A-Za-z]+-[A-Z][A-Za-z]+\b", command):
+    if _PWSH_CMDLET_RE.search(command):
         return DIALECT_POWERSHELL
     return DIALECT_POSIX
 
@@ -507,8 +527,6 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
     if toks[0].startswith(_PWSH_INDIRECT_PREFIX):
         result.flags.add(FLAG_INDIRECT)
         return [SimpleCommand(argv=toks, dialect=dialect)]
-    if dialect == DIALECT_POWERSHELL and toks[0].startswith("$"):
-        return []
     if toks[0].startswith("$") or toks[0] == "SUBST_OUT":
         if not re.match(r"\$(_|psitem)\b", toks[0], re.IGNORECASE):
             result.flags.add(FLAG_INDIRECT)

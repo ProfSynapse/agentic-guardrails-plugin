@@ -1,9 +1,10 @@
 """Shell parser unit tests."""
 import pytest
 
-from core.shellparse import (DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_INDIRECT,
-                             FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT,
-                             ParseUncertain, extract_commands, extract_payloads)
+from core.shellparse import (DIALECT_POSIX, DIALECT_POWERSHELL, FLAG_DECODE_PIPE,
+                             FLAG_INDIRECT, FLAG_INNER_UNCERTAIN,
+                             FLAG_UNINSPECTED_SCRIPT, ParseUncertain,
+                             _detect_dialect, extract_commands, extract_payloads)
 
 
 def names(command):
@@ -273,3 +274,53 @@ def test_uninspected_script_survives_wrapper_recursion():
     parsed = extract_commands('cmd /c "powershell -File wipe.ps1"')
     assert FLAG_UNINSPECTED_SCRIPT in parsed.flags
     assert parsed.uninspected == ["wipe.ps1"]
+
+
+# ---- F7: $var heads and a cmdlet-shaped dialect detector -----------------
+
+@pytest.mark.parametrize("command", [
+    "$deleter -Recurse C:\\work",
+    "$cmd notes.txt",
+    "& $tool -Force x",
+])
+def test_powershell_variable_head_is_flagged_indirect(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert parsed.commands, command
+    assert FLAG_INDIRECT in parsed.flags, command
+
+
+def test_powershell_pipeline_current_object_is_not_indirection():
+    parsed = extract_commands("Get-ChildItem | % { $_.Name }",
+                              dialect=DIALECT_POWERSHELL)
+    assert FLAG_INDIRECT not in parsed.flags
+
+
+@pytest.mark.parametrize("command", [
+    'curl -H "Content-Type: application/json" https://x.test',
+    'curl -H "X-Request-Id: abc" https://x.test',
+    "echo Foo-Bar",
+    "grep My-App src/",
+    "make Build-All",
+])
+def test_hyphenated_words_are_not_powershell(command):
+    assert _detect_dialect(command) == DIALECT_POSIX, command
+
+
+@pytest.mark.parametrize("command", [
+    "Get-ChildItem .",
+    "Remove-Item -Recurse x",
+    "Start-Process notepad",
+    "ConvertTo-Json $x",
+    "$env:PATH = 'x'",
+    "echo $PSItem",
+])
+def test_real_cmdlet_shapes_are_powershell(command):
+    assert _detect_dialect(command) == DIALECT_POWERSHELL, command
+
+
+def test_variable_head_on_the_bash_tool_is_no_longer_dialect_confused():
+    # `My-Documents` used to match the loose cmdlet regex, switch the line into
+    # the PowerShell dialect, and vanish through the `$var` early return.
+    parsed = extract_commands("$RM -rf ~/My-Documents")
+    assert [c.argv for c in parsed.commands] == [["$RM", "-rf", "~/My-Documents"]]
+    assert FLAG_INDIRECT in parsed.flags
