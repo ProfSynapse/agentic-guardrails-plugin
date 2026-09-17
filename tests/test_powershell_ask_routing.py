@@ -153,3 +153,48 @@ def test_codex_routes_the_unresolved_path_to_its_approval_provider(project,
 def test_a_literal_write_is_still_untouched(project, agw_home):
     action, _ = run_hook("Set-Content -Path out.txt -Value 'hi'", project, agw_home)
     assert action == "allow"
+
+
+# ---- the documented -wi / -cf aliases --------------------------------------
+
+def test_wi_binds_as_whatif_not_as_an_unknown_parameter():
+    """`-wi` is no prefix of "whatif", so prefix resolution alone rejected it."""
+    parsed = engine.extract_commands("Remove-Item temp -Recurse -wi",
+                                     dialect="powershell")
+    binding = powershell_bind.bind(parsed.commands[0].argv, "powershell")
+    assert binding.recognized and binding.complete, binding.reason
+
+
+def test_cf_binds_as_confirm():
+    parsed = engine.extract_commands("Remove-Item temp -Recurse -cf",
+                                     dialect="powershell")
+    binding = powershell_bind.bind(parsed.commands[0].argv, "powershell")
+    assert binding.recognized and binding.complete, binding.reason
+
+
+def test_an_explicit_alias_beats_a_prefix_match():
+    """PowerShell resolves `-wi` on Out-File as WhatIf, not as Width."""
+    parsed = engine.extract_commands("Out-File -FilePath out.txt -wi",
+                                     dialect="powershell")
+    binding = powershell_bind.bind(parsed.commands[0].argv, "powershell")
+    assert binding.complete and binding.targets == ["out.txt"], binding.reason
+
+
+@pytest.mark.parametrize("command", [
+    "Remove-Item temp -Recurse -wi",
+    "Set-Content -Path out.txt -Value 'hi' -wi",
+])
+def test_the_hook_allows_a_wi_dry_run(command, project, agw_home):
+    action, reason = run_hook(command, project, agw_home)
+    assert action == "allow", reason
+
+
+@pytest.mark.parametrize("command", [
+    # `-cf` still deletes once the prompt is answered, and the hook never sees
+    # the answer, so it gets no dry-run allowance.
+    "Remove-Item temp -Recurse -cf",
+    "Remove-Item temp -Recurse -wi:$false",
+])
+def test_a_confirm_or_disabled_whatif_still_denies(command, project, agw_home):
+    action, _ = run_hook(command, project, agw_home)
+    assert action == "deny"

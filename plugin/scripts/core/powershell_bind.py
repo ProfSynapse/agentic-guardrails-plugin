@@ -173,10 +173,28 @@ def _unbindable(reason: str, value: str) -> BindingResult:
     return _unresolved(reason) if _runtime_value(value) else _incomplete(reason)
 
 
+# PowerShell's documented short aliases for two common parameters. Neither is
+# a prefix of its parameter name, so prefix resolution alone called `-wi`
+# unknown and denied the dry run an agent should be using to show its work
+# first. PowerShell resolves an explicit alias ahead of a prefix, so these are
+# checked before prefix matching: `Out-File -wi` is WhatIf, not Width.
+_PARAMETER_ALIASES = {"wi": "whatif", "cf": "confirm"}
+
+# The alias spellings of `-WhatIf`, for a caller that recognizes a dry run from
+# the command line rather than from a finished binding.
+WHATIF_ALIASES = frozenset(
+    alias for alias, parameter in _PARAMETER_ALIASES.items()
+    if parameter == "whatif"
+)
+
+
 def _resolve_parameter(name: str, spec: CommandSpec):
     lowered = name.lower()
     if lowered in spec.parameters:
         return lowered
+    alias = _PARAMETER_ALIASES.get(lowered)
+    if alias in spec.parameters:
+        return alias
     matches = sorted(param for param in spec.parameters if param.startswith(lowered))
     return matches[0] if len(matches) == 1 else None
 

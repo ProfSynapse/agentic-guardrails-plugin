@@ -753,12 +753,13 @@ SKIP_WHATIF = "dry run (-WhatIf), nothing is changed"
 
 # `-WhatIf` short-circuits ShouldProcess: the cmdlet reports what it would do
 # and changes nothing. PowerShell resolves any unambiguous prefix, and every
-# bound parameter starting with "wh" is WhatIf. `-Confirm` is deliberately not
-# here: it still deletes once the prompt is answered, and the hook cannot see
-# that answer.
+# bound parameter starting with "wh" is WhatIf; it also documents `-wi`, which
+# is no prefix of the name at all. `-Confirm` is deliberately not here: it
+# still deletes once the prompt is answered, and the hook cannot see that
+# answer.
 _WHATIF_PREFIXES = frozenset(
     "whatif"[:length] for length in range(2, len("whatif") + 1)
-)
+) | powershell_bind.WHATIF_ALIASES
 _SWITCH_TRUE = {"true", "$true", "1"}
 
 
