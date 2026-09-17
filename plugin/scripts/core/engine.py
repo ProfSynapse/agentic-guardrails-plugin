@@ -1024,6 +1024,27 @@ def _has_mutation_evidence(command: str) -> bool:
                 or redirect_targets(command))
 
 
+# A short POSIX flag cluster carrying both recursion and force — `-rf`, `-fr`,
+# `-Rf`, `-rfv`. The letter bounds keep this to real clusters rather than any
+# long word after a dash.
+#
+# Only the indirect-command evidence test consults it. There, the command name
+# is exactly what we could not resolve (`$RM -rf ~/My-Documents`), so the flag
+# cluster is the whole signal. Everywhere else the head is known and read-only
+# heads spell the same letters for unrelated reasons: `grep -rf patterns.txt .`
+# reads patterns from a file, `tar -rf archive.tar` appends to an archive.
+# Widening the general evidence test would make clobber_targets snapshot both.
+_FORCED_RECURSIVE_FLAGS_RE = re.compile(
+    r"(?<![\w-])-[a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}\b"
+    r"|(?<![\w-])-[a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}\b")
+
+
+def _has_indirect_mutation_evidence(command: str) -> bool:
+    """Whether a command whose name we could not read still looks destructive."""
+    return bool(_has_mutation_evidence(command)
+                or _FORCED_RECURSIVE_FLAGS_RE.search(command))
+
+
 _SEARCH_VALUE_FLAGS = {
     "-A", "-B", "-C", "--after-context", "--before-context", "--context",
     "-g", "--glob", "-t", "--type", "-T", "--type-not", "-e", "--regexp",
@@ -1591,7 +1612,7 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                            "cannot read.",
             }))
     if FLAG_INDIRECT in parsed.flags:
-        if _has_mutation_evidence(event.command):
+        if _has_indirect_mutation_evidence(event.command):
             decisions.append(Decision(
                 DENY, "Guardrails could not identify a potentially file-changing action. "
                       "Ask the agent to use the direct command name so it can be checked.",
