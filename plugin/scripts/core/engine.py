@@ -19,10 +19,11 @@ import re
 import shutil
 from typing import Optional
 
-from . import agw_contract, launcher, policy_health, powershell_bind, profiles as prof, remediation
+from . import agw_contract, launcher, policy_health, policycache, powershell_bind, \
+    profiles as prof, remediation
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
-    ToolEvent, worst
+    EnforcementClass, ToolEvent, worst
 from .shellparse import DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, \
     FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT, \
     ParseUncertain, SimpleCommand, \
@@ -385,7 +386,7 @@ def load_policy(plugin_root: str = "") -> Policy:
     policy = Policy()
     home = os.path.expanduser("~")
     agw_home = os.environ.get("AGW_HOME") or os.path.join(home, ".agw")
-    policy.protected_globs = [
+    protected_globs = policy.protected_globs = [
         os.path.join(agw_home, "**"), agw_home,
         os.path.join(home, ".ssh", "**"), os.path.join(home, ".aws", "**"),
         os.path.join(home, ".gnupg", "**"),
@@ -393,6 +394,20 @@ def load_policy(plugin_root: str = "") -> Policy:
     ]
     if plugin_root:
         policy.protected_globs += [os.path.join(plugin_root, "**"), plugin_root]
+
+    # The key is taken before any pack is read: a pack edited while we parse
+    # must miss on the next call, not be served under its old key.
+    cache_key = policycache.key(plugin_root, agw_home)
+    cached = policycache.load(plugin_root, agw_home, cache_key)
+    if cached is not None:
+        try:
+            _policy_from_document(policy, cached)
+            return policy
+        except (KeyError, TypeError, ValueError, re.error):
+            policy = Policy()
+            policy.protected_globs = protected_globs
+            # A document this loader cannot rebuild is a malformed cache:
+            # parse the real files and overwrite it.
 
     baseline_path = os.path.join(plugin_root, "policies", "core.yaml") if plugin_root else ""
     source_tokens = []
@@ -456,7 +471,58 @@ def load_policy(plugin_root: str = "") -> Policy:
     policy.health_record = policy_health.Health(
         policy.health, policy.baseline_revision, policy.revision, issues
     )
+    if policy.health == policy_health.HEALTHY:
+        # Only a clean result is worth remembering. A degraded or unavailable
+        # policy is re-derived from the real files on every call, so a stale
+        # cache can never hide a broken pack.
+        policycache.store(agw_home, cache_key, _policy_document(policy))
     return policy
+
+
+def _policy_document(policy: Policy) -> dict:
+    """The parsed, merged state of a HEALTHY policy as plain JSON data."""
+    snippets = [dict(rule, pattern=rule["pattern"].pattern)
+                for rule in policy.snippet_rules]
+    return {
+        "command_rules": policy.command_rules, "snippet_rules": snippets,
+        "path_rules": policy.path_rules, "mcp_rules": policy.mcp_rules,
+        "settings": policy.settings, "baseline_revision": policy.baseline_revision,
+        "revision": policy.revision,
+    }
+
+
+def _policy_from_document(policy: Policy, document: dict) -> None:
+    """Rebuild a HEALTHY policy from a cached document (raises on a bad one)."""
+    def _rules(section):
+        rules = document[section]
+        if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+            raise TypeError("cached policy section %s is not a rule list" % section)
+        return [dict(rule, enforcement_class=EnforcementClass(rule["enforcement_class"]))
+                for rule in rules]
+    command_rules = _rules("command_rules")
+    snippet_rules = [dict(rule, pattern=re.compile(rule["pattern"]))
+                     for rule in _rules("snippet_rules")]
+    path_rules = _rules("path_rules")
+    mcp_rules = _rules("mcp_rules")
+    settings = document["settings"]
+    if not isinstance(settings, dict):
+        raise TypeError("cached policy settings is not a mapping")
+    revision = document["revision"]
+    baseline_revision = document["baseline_revision"]
+    if not (isinstance(revision, str) and isinstance(baseline_revision, str)):
+        raise TypeError("cached policy revision is not a string")
+    policy.command_rules = command_rules
+    policy.snippet_rules = snippet_rules
+    policy.path_rules = path_rules
+    policy.mcp_rules = mcp_rules
+    policy.settings = settings
+    policy.degraded = []
+    policy.baseline_revision = baseline_revision
+    policy.revision = revision
+    policy.health = policy_health.HEALTHY
+    policy.health_record = policy_health.Health(
+        policy.health, baseline_revision, revision, ()
+    )
 
 
 def _read_policy_bytes(path: str) -> bytes:
@@ -469,12 +535,18 @@ def _load_policy_document(path: str, raw: bytes):
     if path.lower().endswith(".json"):
         import json
         return json.loads(text)
+    # miniyaml first: it is the reader every install has, CONTRIBUTING requires
+    # core.yaml to parse under it, and it costs a fraction of PyYAML's import.
+    # PyYAML is only consulted for a document miniyaml cannot read.
+    from . import miniyaml
     try:
-        import yaml  # type: ignore
-        return yaml.safe_load(text)
-    except ImportError:
-        from . import miniyaml
         return miniyaml.loads(text)
+    except Exception:
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            raise
+        return yaml.safe_load(text)
 
 
 def _load_yaml(path: str):

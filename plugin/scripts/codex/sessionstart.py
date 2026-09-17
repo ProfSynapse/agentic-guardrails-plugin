@@ -84,7 +84,10 @@ def main():
     try:
         from core import engine, policy_health, store, workflows
         store.agw_home()  # ensures ~/.agw exists
-        policy = engine.load_policy(PLUGIN_ROOT)  # validates the policy packs
+        # Validates the policy packs and, when they are healthy, writes the
+        # persisted policy cache every later hook call reads instead of
+        # parsing the packs again.
+        policy = engine.load_policy(PLUGIN_ROOT)
         warning = _health_warning(policy, policy_health)
         cfg = engine.resolve_settings(policy)
         note = _LEVEL_NOTE.get(cfg.get("level"), "")

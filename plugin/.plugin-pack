@@ -50,6 +50,7 @@ scripts/core/miniyaml.py
 scripts/core/mutations.py
 scripts/core/outcomes.py
 scripts/core/policy_health.py
+scripts/core/policycache.py
 scripts/core/powershell_bind.py
 scripts/core/preimages.py
 scripts/core/presentation.py
