@@ -232,6 +232,115 @@ def test_posttooluse_never_crashes_on_garbage():
     assert result.returncode == 0
 
 
+# --- Codex PostToolUse: the same verification, not a bare grant ---------------
+
+CODEX_POST = os.path.join(REPO, "scripts", "codex", "posttooluse.py")
+
+
+def _codex_ask_decision(payload):
+    """Evaluate a Codex payload the way both Codex adapters evaluate it."""
+    from codex.adapter_common import to_events
+    from core import engine, events
+
+    policy = engine.load_policy(REPO)
+    evlist = to_events(payload)
+    decision = events.worst([engine.evaluate(ev, policy, REPO) for ev in evlist])
+    return policy, evlist, decision
+
+
+def test_codex_posttooluse_needs_a_pending_approval_to_grant(tmp_path):
+    """Audit G8: Codex granted a session approval for *any* decision carrying a
+    memo key - no pending record, no fingerprint, no revision or ASK check. A
+    tool having run is not evidence that this operation was the one approved."""
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    home = tmp_path / "home"
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-unverified",
+               "event_id": "codex-unverified-1",
+               "hook_event_name": "PostToolUse"}
+    _run(CODEX_POST, payload, env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-unverified.json").exists()
+
+
+def test_codex_posttooluse_grants_on_a_verified_pending_record(tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-verified",
+               "event_id": "codex-verified-1"}
+    from core import approvals, events, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    assert decision.action == events.ASK and decision.memo_key
+    assert approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse"},
+         env_extra={"AGW_HOME": str(home)})
+    record = home / "sessions" / "codex-verified.json"
+    assert record.exists(), "the verified pending record granted nothing"
+    approved = json.loads(record.read_text())["approved"]
+    assert any(item.endswith(f":secret-file:{os.path.abspath(secret)}")
+               for item in approved)
+
+
+def test_codex_posttooluse_mismatch_consumes_without_approval(tmp_path, monkeypatch):
+    first = tmp_path / ".env"
+    second = tmp_path / "credentials.json"
+    first.write_text("DB_PASSWORD=hunter2hunter2")
+    second.write_text('{"password":"another-secret"}')
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(first)},
+               "cwd": str(tmp_path), "session_id": "codex-mismatch",
+               "event_id": "codex-mismatch-1"}
+    from core import approvals, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+
+    # A different file under the same host event id must not ride the record,
+    # and must retire it: the candidate is one-use whatever the outcome.
+    mismatch = {**payload, "tool_input": {"file_path": str(second)},
+                "hook_event_name": "PostToolUse"}
+    _run(CODEX_POST, mismatch, env_extra={"AGW_HOME": str(home)})
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse"},
+         env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-mismatch.json").exists()
+    assert not list((home / "pending-approvals").iterdir())
+
+
+def test_codex_posttooluse_skips_recording_on_tool_error(tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=abc123abc123")
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-error",
+               "event_id": "codex-error-1"}
+    from core import approvals, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse",
+                      "tool_error": "permission denied"},
+         env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-error.json").exists()
+    assert not list((home / "pending-approvals").iterdir())
+
+
+def test_codex_posttooluse_never_crashes_on_garbage():
+    assert _run(CODEX_POST, None, stdin="NOT JSON AT ALL").returncode == 0
+
+
 # --- SessionStart: context injection -----------------------------------------
 
 def _context(result):
