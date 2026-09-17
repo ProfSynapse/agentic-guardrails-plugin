@@ -700,6 +700,27 @@ def test_discovery_below_a_marker_less_cwd_still_denies_a_synced_scope(tmp_path,
     assert "cloud-synced tree" in decision.reason
 
 
+def test_force_is_a_risk_flag_only_on_the_finders(tmp_path, policy):
+    """G2: `-Force` on Get-ChildItem only reveals hidden entries."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+
+    def _decide(tool, command):
+        return engine.evaluate(
+            _ev(EXEC, tool=tool, command=command, cwd=str(project)), policy, REPO)
+
+    for tool, command in (("PowerShell", "Get-ChildItem -Recurse -Force"),
+                          ("PowerShell", "gci -Force"),
+                          ("Bash", "ls -Ra"),
+                          ("Bash", "dir")):
+        assert _decide(tool, command).action != DENY, command
+    for command in ("fd -force . .", "find . -force -name '*.py'"):
+        decision = _decide("Bash", command)
+        assert decision.action == DENY, command
+        assert decision.rule_id == "builtin:unbounded-discovery"
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)

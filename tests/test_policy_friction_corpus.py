@@ -182,6 +182,36 @@ def test_discovery_that_escapes_the_project_into_the_cloud_is_denied(
     assert "cloud-synced tree" in reason
 
 
+# --- G2: -Force on a listing only reveals hidden entries ----------------------
+
+@pytest.mark.parametrize("tool,command", [
+    ("PowerShell", "Get-ChildItem -Recurse -Force"),
+    ("PowerShell", "gci -Force"),
+    ("PowerShell", "gci -Recurse -Force src"),
+    ("Bash", "ls -R"),
+])
+def test_force_on_a_listing_is_not_a_disabled_safeguard(hook, tmp_path, tool,
+                                                        command):
+    project = _project(tmp_path)
+    _tree(project, "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision != "deny", f"{command!r}: {reason}"
+
+
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "fd --no-ignore TODO ."),
+    ("Bash", "rg --hidden TODO ."),
+    ("Bash", "find . -follow -name '*.py'"),
+])
+def test_a_finder_that_disables_ignore_rules_still_denies(hook, tmp_path, tool,
+                                                          command):
+    project = _project(tmp_path)
+    _tree(project, "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision == "deny", f"{command!r} was {decision}"
+    assert "agw " in reason
+
+
 def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     """The operation-scope prompt is a floor for ASK only; DENY must not soften."""
     project = _project(tmp_path)

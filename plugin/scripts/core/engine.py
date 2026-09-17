@@ -1123,8 +1123,12 @@ _DISCOVERY_HEAVY_PARTS = {value.casefold() for value in _REGENERABLE} | {
 }
 _DISCOVERY_RISK_FLAGS = {
     "--no-ignore", "--no-ignore-vcs", "--hidden", "--follow",
-    "--dereference-recursive", "-follow", "-followsymlink", "-force",
+    "--dereference-recursive", "-follow", "-followsymlink",
 }
+# `-force` means "ignore safety" only on the finders. On Get-ChildItem/gci and
+# on ls/dir it reveals hidden entries and nothing else — `gci -Recurse -Force`
+# is the standard PowerShell listing idiom, not a safeguard being disabled.
+_DISCOVERY_FORCE_TOOLS = {"fd", "fdfind", "find"}
 
 
 # Markers that identify a checkout the agent is actually working in. A folder
@@ -1304,6 +1308,9 @@ def _raw_discovery_shape(cmd: SimpleCommand, event: ToolEvent):
 def _raw_discovery_risk_flag(cmd: SimpleCommand) -> bool:
     lowered = [value.lower() for value in cmd.argv[1:]]
     if any(value in _DISCOVERY_RISK_FLAGS for value in lowered):
+        return True
+    if cmd.name in _DISCOVERY_FORCE_TOOLS and any(
+            value in {"-force", "--force"} for value in lowered):
         return True
     if cmd.name in {"rg", "ripgrep"} and any(
             re.fullmatch(r"-u{1,3}", value) for value in lowered):
