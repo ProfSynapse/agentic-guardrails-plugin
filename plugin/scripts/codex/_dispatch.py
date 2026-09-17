@@ -40,7 +40,10 @@ def _ask(reason):
     if EVENT != "pretooluse":
         return
     sys.stderr.write("agentic-guardrails: %s\n" % reason)
-    json.dump(
+    # Serialize first, then write once. `json.dump` streams chunks straight at
+    # stdout, so a failure partway through would leave a truncated object for
+    # the host to choke on - and a decision the host cannot parse is an allow.
+    text = json.dumps(
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -50,9 +53,10 @@ def _ask(reason):
                     "Review this operation manually." % reason
                 ),
             }
-        },
-        sys.stdout,
+        }
     )
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
 def main():

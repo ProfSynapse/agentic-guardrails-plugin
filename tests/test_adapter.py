@@ -807,6 +807,104 @@ def test_audit_exception_leaves_claude_decisions_identical_and_never_prompts(
     assert _decision(failed) == expected
 
 
+class _RecordingStdout:
+    """A stdout that remembers how many separate writes reached it."""
+
+    def __init__(self):
+        self.writes = []
+        self.flushes = 0
+
+    def write(self, text):
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self):
+        self.flushes += 1
+
+    def isatty(self):
+        return False
+
+
+@pytest.mark.parametrize("case", ["ask", "deny", "defer", "observe"])
+def test_decision_reaches_stdout_in_exactly_one_write(case, tmp_path, monkeypatch):
+    """P3 in the 2026-09-17 audit: `json.dump` streamed chunks at stdout.
+
+    A failure partway through leaves a truncated object, and the fail-closed
+    handler then appends a whole second one. The host can parse neither, and a
+    decision it cannot parse is an allow. Every exit must serialize first and
+    write once.
+    """
+    import io
+
+    from claude import pretooluse as ptu
+
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    payloads = {
+        "ask": {"tool_name": "Read", "tool_input": {"file_path": str(secret)}},
+        "deny": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+        "defer": {"tool_name": "Shell", "tool_input": {"command": "whatever"}},
+        "observe": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+    }
+    if case == "observe":
+        monkeypatch.setenv("AGW_ENFORCEMENT", "observe")
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    payload = {**payloads[case], "cwd": str(tmp_path),
+               "session_id": f"one-write-{case}", "event_id": f"ev-{case}",
+               "hook_event_name": "PreToolUse"}
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(ptu, "_EMITTED", False, raising=False)
+    ptu.main()
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    json.loads(recorder.writes[0])
+
+
+def test_fail_closed_handler_never_appends_a_second_object(tmp_path, monkeypatch):
+    from claude import pretooluse as ptu
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(ptu, "_EMITTED", False, raising=False)
+
+    # Nothing written yet: the handler must supply the fail-closed decision.
+    ptu._fail_closed()
+    assert len(recorder.writes) == 1
+    assert json.loads(recorder.writes[0])["hookSpecificOutput"][
+        "permissionDecision"] == "ask"
+
+    # A decision already on the wire: the handler must stay silent.
+    recorder.writes.clear()
+    ptu._emit({"systemMessage": "already decided"})
+    ptu._fail_closed()
+    assert len(recorder.writes) == 1, recorder.writes
+    json.loads(recorder.writes[0])
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_dispatcher_ask_is_one_write(host, monkeypatch):
+    """The dispatcher's last-resort ASK runs when an adapter could not even
+    start, so it is the one decision that must never arrive half-written."""
+    import importlib.util
+
+    path = os.path.join(REPO, "scripts", host, "_dispatch.py")
+    monkeypatch.setattr("sys.argv", [path, "pretooluse"])
+    spec = importlib.util.spec_from_file_location(f"_agw_test_{host}_dispatch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    module._ask("hit an internal error (ImportError)")
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    decision = json.loads(recorder.writes[0])["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "ask"
+    assert "failing closed" in decision["permissionDecisionReason"]
+
+
 def run_dispatch_raw(payload, event="pretooluse"):
     """Drive the real hooks.json entry point and keep stdout/stderr separate."""
     dispatch = os.path.join(REPO, "scripts", "claude", "_dispatch.py")

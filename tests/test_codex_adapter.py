@@ -1031,6 +1031,77 @@ def test_codex_powershell_ambiguous_backtick_is_nonwaivable_deny(
     assert _decision(out) == "deny"
 
 
+class _RecordingStdout:
+    """A stdout that remembers how many separate writes reached it."""
+
+    def __init__(self):
+        self.writes = []
+        self.flushes = 0
+
+    def write(self, text):
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self):
+        self.flushes += 1
+
+    def isatty(self):
+        return False
+
+
+@pytest.mark.parametrize("case", ["deny", "defer"])
+def test_codex_decision_reaches_stdout_in_exactly_one_write(
+        case, tmp_path, monkeypatch):
+    """P3 in the 2026-09-17 audit: `json.dump` streamed chunks at stdout, so a
+    failure partway through left a truncated object and the fail-closed handler
+    appended a second one. The host can parse neither, and an unparseable
+    decision is an allow."""
+    import io
+
+    cptu = _load_codex_pretooluse_isolated()
+
+    payloads = {
+        "deny": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+        "defer": {"tool_name": "Bash", "tool_input": {"command": "git status"}},
+    }
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGW_APPROVAL_PROVIDER", "headless")
+    monkeypatch.setenv("AGW_TEST_MODE", "1")
+    payload = {**payloads[case], "cwd": str(tmp_path),
+               "session_id": f"codex-one-write-{case}", "event_id": f"ev-{case}",
+               "hook_event_name": "PreToolUse"}
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(cptu, "_EMITTED", False, raising=False)
+    cptu.main()
+    if case == "defer":
+        assert recorder.writes == []
+        return
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    json.loads(recorder.writes[0])
+
+
+def test_codex_fail_closed_handler_never_appends_a_second_object(monkeypatch):
+    cptu = _load_codex_pretooluse_isolated()
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(cptu, "_EMITTED", False, raising=False)
+
+    cptu._fail_closed()
+    assert len(recorder.writes) == 1
+    assert json.loads(recorder.writes[0])["hookSpecificOutput"][
+        "permissionDecision"] == "deny"
+
+    recorder.writes.clear()
+    cptu._emit({"systemMessage": "already decided"})
+    cptu._fail_closed()
+    assert len(recorder.writes) == 1, recorder.writes
+    json.loads(recorder.writes[0])
+
+
 def run_codex_dispatch_raw(payload, tmp_path, event="pretooluse"):
     """Drive the real hooks-codex.json entry point, keeping the streams apart."""
     dispatch = os.path.join(REPO, "scripts", "codex", "_dispatch.py")
