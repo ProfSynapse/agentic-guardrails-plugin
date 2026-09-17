@@ -8,7 +8,9 @@ import os
 import re
 
 from . import events, powershell_bind, workflows
-from .shellparse import ParseUncertain, extract_commands
+from .shellparse import (
+    _HEREDOC_RE, _normalized_head, ParseUncertain, extract_commands,
+)
 
 # Re-exported so an adapter can recognize the one incomplete plan that is a
 # question for the user rather than a fail-closed invariant, without reaching
@@ -26,6 +28,94 @@ _OVERWRITE_REDIRECT = re.compile(r"(?<!>)>(?!>)")
 _NULL_REDIRECT = re.compile(
     r"(?i)(?:\d*|&)?>\|?\s*(?:\$null|nul:?|/dev/null)(?=$|[\s;&|])"
 )
+# `2>&1`, `>&2`, `>&-`, and PowerShell's `*>&1` duplicate or close a stream.
+# They never name a file, so they are not overwrite evidence; left in the
+# surface, their `>` made every `cmd 2>&1 | tail` an unenumerable mutation.
+# `>& file` (both streams to a file) keeps its `>`: that one does truncate.
+_FD_DUP_REDIRECT = re.compile(r"(?:\d+|&|\*)?>&\s*(?:\d+|-)(?=$|[\s;&|)])")
+
+
+_STATEMENT_SPLIT_RE = re.compile(r"\|\||&&|[;|\n]")
+
+
+def _blank_data_heredocs(command: str) -> str:
+    """Blank heredoc bodies that are data, keep the ones an interpreter runs.
+
+    `git commit -F - <<EOF` carries a message; an arrow like `->` in it is not
+    a redirect. `bash <<EOF` runs its body as a script, so a `>` there is one.
+    The consumer is the head of the statement the `<<` belongs to.
+    """
+    def replace(match):
+        statement = _STATEMENT_SPLIT_RE.split(command[:match.start()])[-1]
+        tokens = statement.split()
+        head = _normalized_head(tokens[0]) if tokens else ""
+        if _is_script_interpreter(head):
+            return match.group(0)
+        return " "
+    return _HEREDOC_RE.sub(replace, command)
+
+
+def _redirect_surface(command: str) -> str:
+    """The command with quoted data, data heredocs, and non-file redirects
+    blanked, so a remaining `>` really is a truncating file redirect."""
+    surface = _unquoted_surface(_blank_data_heredocs(str(command or "")))
+    return _FD_DUP_REDIRECT.sub("", _NULL_REDIRECT.sub("", surface))
+
+
+# git's own options that take a value and precede the subcommand
+# (`git -c core.autocrlf=false commit`, `git -C ../repo checkout`).
+_GIT_GLOBAL_VALUE_OPTIONS = {
+    "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--config-env",
+}
+# checkout/switch forms that can rewrite tracked files even without a
+# pathspec: git only refuses to clobber local edits when none of these is set.
+_GIT_DISCARD_OPTIONS = {
+    "-f", "--force", "--discard-changes", "-m", "--merge", "-p", "--patch",
+}
+_GIT_BRANCH_CREATE_OPTIONS = {"-b", "-B", "--orphan"}
+
+
+def _git_subcommand(argv: list) -> tuple[str, list]:
+    """Return ``(subcommand, its arguments)`` with git's global options skipped.
+
+    Reading ``argv[1]`` as the subcommand let `git -c k=v checkout -- file`
+    through as a non-mutating command.
+    """
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token in _GIT_GLOBAL_VALUE_OPTIONS:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token.lower(), [str(value) for value in argv[index + 1:]]
+    return "", []
+
+
+def _git_rewrites_worktree(argv: list) -> bool:
+    """Whether this git invocation can change tracked files on disk.
+
+    `checkout -b`/`-B`/`--orphan` only move HEAD to a new branch; git refuses
+    to clobber uncommitted edits, so they need no pre-image, exactly like
+    `switch -c`. A pathspec (`--`), a bare argument that may be a file, or a
+    force/merge/patch option can rewrite files and still counts. `switch` is
+    branch-only, so it counts only with a discard-changes form.
+    """
+    subcommand, args = _git_subcommand(argv)
+    if subcommand in {"clean", "reset", "restore"}:
+        return True
+    if subcommand == "checkout":
+        if "--" in args or any(arg in _GIT_DISCARD_OPTIONS for arg in args):
+            return True
+        return not any(arg in _GIT_BRANCH_CREATE_OPTIONS for arg in args)
+    if subcommand == "switch":
+        return any(arg in _GIT_DISCARD_OPTIONS for arg in args)
+    return False
+
+
 _MUTATION_WORDS = {
     "add", "copy", "create", "delete", "edit", "move", "remove", "rename",
     "replace", "truncate", "update", "upload", "write",
@@ -412,8 +502,7 @@ def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
         name = cmd.name
         if name in _LOCAL_MUTATION_NAMES:
             return True
-        if name == "git" and len(cmd.argv) > 1 \
-                and cmd.argv[1].lower() in {"clean", "reset", "checkout", "restore"}:
+        if name == "git" and _git_rewrites_worktree(cmd.argv):
             return True
         if name == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in cmd.argv[1:]):
             return True
@@ -767,7 +856,7 @@ def plan(evlist, clobber_resolver, plugin_root: str = "",
                 for entry in getattr(targets, "skipped", ()) or ():
                     if entry not in result.skipped:
                         result.skipped.append(entry)
-                surface = _NULL_REDIRECT.sub("", _unquoted_surface(ev.command))
+                surface = _redirect_surface(ev.command)
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
                     or _looks_locally_mutating(ev.command, dialect=dialect)
                 if not getattr(targets, "complete", True):
