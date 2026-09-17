@@ -168,7 +168,10 @@ _DOWNLOADERS = {"curl", "wget"}
 
 _SUBST_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
 _PWSH_SUBEXPRESSION_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)")
-_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\1", re.DOTALL)
+# `\r?`: a multi-line command from a Windows host can arrive with CRLF line
+# endings, and a heredoc the regex does not see is a script body the engine
+# never inspects (its lines were read as a second command instead).
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\r?\n(.*?)\r?\n\1", re.DOTALL)
 _PWSH_LITERAL_ASSIGN_RE = re.compile(
     r"(?im)(?P<prefix>^|[;\n])\s*\$(?P<name>(?:env:)?[A-Za-z_][A-Za-z0-9_]*)"
     r"\s*=\s*(?P<value>'[^']*'|\"[^\"]*\"|[^\s;\n]+)\s*(?=;|\n|$)")
