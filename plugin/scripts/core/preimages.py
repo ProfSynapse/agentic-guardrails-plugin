@@ -221,14 +221,20 @@ def prepare(targets, label: str, max_file_bytes: int,
     for path, before_identity in present:
         try:
             before_hash = store.file_sha256(path)
+            # Admission ran once above for every target; the store must not
+            # re-walk per file. Dedupe keeps an unchanged file from storing a
+            # second full copy: the verified newest version is refreshed and
+            # its hold extended to this capture's deadline instead.
             entry = store.archive_file(
-                path, mode="copy", dedupe=False,
+                path, mode="copy", dedupe=True,
                 reason=f"verified pre-image before {label}", actor="guardrails-hook",
                 retention_class="mutation_preimage",
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 retention_config=retention_config,
                 lock_context=store.hook_lock(),
+                policy_revision=policy_revision,
+                _admission_checked=True,
             )
             artifact = str(entry.get("dest") or "")
             transaction_id = str(entry.get("transaction_id") or "")

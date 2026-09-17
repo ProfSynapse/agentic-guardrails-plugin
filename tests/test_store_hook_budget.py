@@ -67,3 +67,160 @@ def test_free_store_still_captures_under_the_hook_budget(tmp_path, monkeypatch):
     receipt = result.receipts[0]
     assert os.path.isfile(receipt.artifact)
     assert preimages.receipt_valid(receipt, "rev-1")
+
+
+# --- F9: running size counter, single admission, dedupe ------------------------
+
+def _prepare(target, revision="rev-1"):
+    return preimages.prepare(
+        [str(target)], "Edit", 1 << 20, policy_revision=revision,
+        retention_config=_unlimited(),
+    )
+
+
+def test_archive_size_counter_matches_walk_and_falls_back_when_stale(
+        tmp_path, monkeypatch):
+    first = tmp_path / "a.txt"
+    first.write_text("a" * 3000, encoding="utf-8")
+    second = tmp_path / "b.txt"
+    second.write_text("b" * 5000, encoding="utf-8")
+    store.archive_file(str(first), mode="copy", retention_config=_unlimited())
+    store.archive_file(str(second), mode="copy", retention_config=_unlimited())
+    walked = store._archive_size_walk()
+    assert walked >= 8000
+    assert store.archive_size_bytes() == walked
+
+    def no_walk(*_args, **_kwargs):
+        raise AssertionError("archive_size_bytes walked although the counter was fresh")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store.os, "walk", no_walk)
+        assert store.archive_size_bytes() == walked
+
+    # A manifest the counter never saw (crash mid-write, older process) makes
+    # the counter stale: one walk, then the counter is fresh again.
+    stray = os.path.join(store.agw_home(), "transactions", "0" * 32 + ".json")
+    with open(stray, "w", encoding="utf-8") as handle:
+        handle.write("{}")
+    assert store._cached_archive_size() is None
+    assert store.archive_size_bytes() == walked
+    assert store._cached_archive_size() == walked
+
+    for bad in ('{"bytes": -1, "manifest_count": 3}', '{"bytes": "x"}', "garbage"):
+        with open(store._archive_size_state_path(), "w", encoding="utf-8") as handle:
+            handle.write(bad)
+        assert store._cached_archive_size() is None
+        assert store.archive_size_bytes() == walked
+    os.unlink(store._archive_size_state_path())
+    assert store.archive_size_bytes() == walked
+
+
+def test_prepare_admits_once_without_walking_or_locking(tmp_path, monkeypatch):
+    seed = tmp_path / "seed.txt"
+    seed.write_text("seed", encoding="utf-8")
+    store.archive_file(str(seed), mode="copy", retention_config=_unlimited())
+    assert store._cached_archive_size() is not None
+    walks = []
+    locked_maintenance = []
+    real_walk = store._archive_size_walk
+    real_locked = store._maintain_retention_locked
+
+    def counting_walk():
+        walks.append(1)
+        return real_walk()
+
+    def counting_locked(**kwargs):
+        locked_maintenance.append(kwargs)
+        return real_locked(**kwargs)
+
+    monkeypatch.setattr(store, "_archive_size_walk", counting_walk)
+    monkeypatch.setattr(store, "_maintain_retention_locked", counting_locked)
+    target = tmp_path / "edited.txt"
+    target.write_text("v1", encoding="utf-8")
+    result = _prepare(target)
+    assert result.ok, result.reason
+    assert walks == [], "a routine prepare must not walk the archive"
+    assert locked_maintenance == [], "a routine prepare must not take the prune path"
+    # The write advanced the counter instead of invalidating it.
+    assert store._cached_archive_size() == store._archive_size_walk()
+
+
+def test_size_check_does_not_need_the_store_lock_but_a_prune_does(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGW_HOOK_LOCK_BUDGET_S", "0.2")
+    seed = tmp_path / "seed.txt"
+    seed.write_text("s" * 2048, encoding="utf-8")
+    store.archive_file(str(seed), mode="copy", retention_class="mutation_preimage",
+                       retention_config=_unlimited())
+    current = store.archive_size_bytes()
+    roomy = retention_policy.RetentionPolicy(
+        max_bytes=current * 10, high_water_bytes=current * 9,
+        low_water_bytes=current * 8, min_protected_age_days=7,
+        inactive_collapse_age_days=30, max_candidates=256,
+        max_reclaim_bytes=1 << 30,
+    )
+    pressured = retention_policy.RetentionPolicy(
+        max_bytes=current + 1, high_water_bytes=current, low_water_bytes=1,
+        min_protected_age_days=7, inactive_collapse_age_days=30,
+        max_candidates=256, max_reclaim_bytes=1 << 30,
+    )
+    with store.Lock("recovery-store", timeout=1.0):
+        result = store.maintain_retention(
+            policy=roomy, incoming_bytes=10, lock_context=store.hook_lock()
+        )
+        assert result["lock_taken"] is False
+        assert result["applied"] is False
+        with pytest.raises(TimeoutError):
+            store.maintain_retention(
+                policy=pressured, incoming_bytes=1, lock_context=store.hook_lock()
+            )
+
+
+def test_prepare_dedupes_unchanged_content_and_extends_its_hold(tmp_path):
+    from core import archive_transactions as archive_tx
+    from core import retention
+
+    target = tmp_path / "stable.txt"
+    target.write_text("unchanged", encoding="utf-8")
+    first = _prepare(target)
+    assert first.ok, first.reason
+    first_record = archive_tx.load(store.agw_home(), first.receipts[0].transaction_id)
+    second = _prepare(target)
+    assert second.ok, second.reason
+    assert second.receipts[0].transaction_id == first.receipts[0].transaction_id
+    assert len(store.list_versions(str(target))) == 1
+    second_record = archive_tx.load(store.agw_home(), second.receipts[0].transaction_id)
+    assert second_record["protected_until_ns"] >= first_record["protected_until_ns"]
+    assert second_record["last_referenced_at_ns"] > 0
+    # The deduped entry is the newest version, so retention protects it at
+    # least as strongly as a fresh copy would have been protected.
+    snapshot = retention.inventory(store.agw_home())
+    reasons = retention.protection_map(snapshot)[first.receipts[0].transaction_id]
+    assert "active_hold" in reasons
+    assert any(reason.startswith("newest_") for reason in reasons)
+    # ...and it remains restorable through the verified path.
+    assert preimages.receipt_valid(second.receipts[0], "rev-1")
+    target.write_text("changed", encoding="utf-8")
+    store.restore(str(target))
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+    # A real change stores a new version; only the newest version dedupes.
+    target.write_text("different", encoding="utf-8")
+    third = _prepare(target)
+    assert third.ok, third.reason
+    assert third.receipts[0].transaction_id != first.receipts[0].transaction_id
+
+
+def test_dedupe_never_crosses_policy_revisions(tmp_path):
+    target = tmp_path / "policy.txt"
+    target.write_text("same bytes", encoding="utf-8")
+    old = _prepare(target, "rev-old")
+    assert old.ok, old.reason
+    new = _prepare(target, "rev-new")
+    assert new.ok, new.reason
+    assert new.receipts[0].transaction_id != old.receipts[0].transaction_id
+    assert new.receipts[0].policy_revision == "rev-new"
+    assert preimages.receipt_valid(new.receipts[0], "rev-new")
+    # A stale index must not make an older version look newest.
+    versions = [entry["version"] for entry in store.list_versions(str(target))]
+    assert versions == [1, 2]
