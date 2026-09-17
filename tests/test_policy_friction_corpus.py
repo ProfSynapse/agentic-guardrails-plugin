@@ -132,6 +132,56 @@ def test_a_real_source_tree_is_still_protected(hook, tmp_path, tool, command):
     assert "agw archive" in reason
 
 
+# --- G1: a project that happens to live under OneDrive ------------------------
+
+def _synced_project(tmp_path):
+    """A checkout inside a literal `OneDrive - Acme` folder."""
+    return _project(tmp_path / "OneDrive - Acme", "proj")
+
+
+PROJECT_LOCAL_DISCOVERY = [
+    ("PowerShell", "Get-ChildItem"),
+    ("PowerShell", "gci"),
+    ("PowerShell", "gci -Recurse"),
+    ("PowerShell", "Select-String -Path . -Pattern TODO -Recurse"),
+    ("Bash", "ls"),
+    ("Bash", "ls -R"),
+    ("Bash", "rg -n TODO ."),
+    ("Bash", "rg -n TODO src"),
+]
+
+
+@pytest.mark.parametrize("tool,command", PROJECT_LOCAL_DISCOVERY)
+def test_discovery_inside_a_synced_project_is_project_local(hook, tmp_path, tool,
+                                                            command):
+    """The README markets OneDrive, and every listing in one was denied.
+
+    A checkout is the unit of work wherever it lives; the cloud rule is about
+    a scope that escapes the project, not about the project itself.
+    """
+    project = _synced_project(tmp_path)
+    _tree(project, "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision != "deny", f"{command!r}: {reason}"
+    assert "cloud-synced tree" not in reason
+
+
+@pytest.mark.parametrize("tool,command", [
+    ("PowerShell", 'gci "{escape}" -Recurse'),
+    ("Bash", 'ls -R "{escape}"'),
+    ("Bash", 'rg -n TODO "{escape}"'),
+])
+def test_discovery_that_escapes_the_project_into_the_cloud_is_denied(
+        hook, tmp_path, tool, command):
+    project = _synced_project(tmp_path)
+    _tree(project, "src/app.py")
+    elsewhere = _project(tmp_path, "elsewhere")
+    escape = str(tmp_path / "OneDrive - Acme")
+    decision, reason = hook(tool, command.format(escape=escape), elsewhere)
+    assert decision == "deny"
+    assert "cloud-synced tree" in reason
+
+
 def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     """The operation-scope prompt is a floor for ASK only; DENY must not soften."""
     project = _project(tmp_path)

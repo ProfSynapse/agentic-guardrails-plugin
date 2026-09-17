@@ -1127,13 +1127,32 @@ _DISCOVERY_RISK_FLAGS = {
 }
 
 
+# Markers that identify a checkout the agent is actually working in. A folder
+# holding one of these is the unit of work, wherever it happens to live — a
+# repo under "OneDrive - Acme" is still a repo.
+_PROJECT_ROOT_MARKERS = (".git", "package.json", "pyproject.toml", ".agw")
+_PROJECT_ROOT_MARKER_GLOBS = ("*.sln",)
+
+
+def _is_project_root(path: str) -> bool:
+    if any(os.path.exists(os.path.join(path, marker))
+           for marker in _PROJECT_ROOT_MARKERS):
+        return True
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(fnmatch.fnmatch(name, pattern) for name in names
+               for pattern in _PROJECT_ROOT_MARKER_GLOBS)
+
+
 def _active_project_root(event: ToolEvent) -> str:
     cwd = os.path.realpath(event.cwd or os.getcwd())
     if os.path.isfile(cwd):
         cwd = os.path.dirname(cwd)
     current = cwd
     for _ in range(32):
-        if os.path.exists(os.path.join(current, ".git")):
+        if _is_project_root(current):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -1185,7 +1204,22 @@ def _discovery_scope_assessment(scopes: list[str], event: ToolEvent,
         parts = {value.casefold() for value in resolved.replace("\\", "/").split("/")}
         if _is_root_or_home(resolved):
             return False, "the scope is a filesystem or home-directory root", labels
-        if any(marker in part for part in parts for marker in _DISCOVERY_CLOUD_PARTS):
+        # A project that happens to live under OneDrive/Dropbox is still the
+        # unit of work: listing it is not an unbounded sweep of the user's
+        # cloud storage. So the cloud-tree test ignores the components the
+        # project root itself contributes, and still fires on a scope that
+        # escapes the project (`gci ~/OneDrive -Recurse` from a project
+        # elsewhere) or on a synced folder nested inside it.
+        cloud_parts = parts
+        if _within(resolved, project_root):
+            cloud_parts = {
+                value.casefold()
+                for value in os.path.relpath(resolved, project_root)
+                .replace("\\", "/").split("/")
+                if value not in ("", ".")
+            }
+        if any(marker in part for part in cloud_parts
+               for marker in _DISCOVERY_CLOUD_PARTS):
             return False, "the scope is inside a cloud-synced tree", labels
         if parts & _DISCOVERY_HEAVY_PARTS:
             return False, "the scope is a dependency, build, or cache tree", labels

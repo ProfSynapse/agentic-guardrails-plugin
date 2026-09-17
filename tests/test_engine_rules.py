@@ -672,6 +672,34 @@ def test_a_mixed_delete_keeps_full_preimage_coverage(tmp_path):
         assert engine.evaluate(event, engine.load_policy(REPO), REPO).action == DENY
 
 
+def test_every_project_marker_anchors_discovery_inside_a_synced_tree(tmp_path,
+                                                                     policy):
+    """G1: the project root walk knew only `.git`, so other stacks stayed blocked."""
+    for index, marker in enumerate(
+            (".git", "package.json", "pyproject.toml", "app.sln", ".agw")):
+        root = tmp_path / "OneDrive - Acme" / f"proj{index}"
+        (root / "src").mkdir(parents=True)
+        if marker in {".git", ".agw"}:
+            (root / marker).mkdir()
+        else:
+            (root / marker).write_text("{}\n", encoding="utf-8")
+        event = _ev(EXEC, tool="PowerShell", command="Get-ChildItem -Recurse",
+                    cwd=str(root))
+        decision = engine.evaluate(event, policy, REPO)
+        assert decision.action != DENY, marker
+        assert engine._active_project_root(event) == os.path.realpath(str(root))
+
+
+def test_discovery_below_a_marker_less_cwd_still_denies_a_synced_scope(tmp_path,
+                                                                      policy):
+    loose = tmp_path / "OneDrive - Acme" / "notes"
+    loose.mkdir(parents=True)
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="ls -R ..", cwd=str(loose)), policy, REPO)
+    assert decision.action == DENY
+    assert "cloud-synced tree" in decision.reason
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)
