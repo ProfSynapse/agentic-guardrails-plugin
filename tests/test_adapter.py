@@ -807,6 +807,45 @@ def test_audit_exception_leaves_claude_decisions_identical_and_never_prompts(
     assert _decision(failed) == expected
 
 
+def test_hook_import_line_does_not_pull_ctypes_off_windows():
+    """`core.approvals` imported ctypes and ctypes.wintypes on every platform.
+
+    They are only ever needed for the Windows TaskDialog, but the cost landed on
+    every PreToolUse call on every OS. The ABI is built on first touch instead.
+    """
+    if sys.platform == "win32":
+        pytest.skip("Windows builds the TaskDialog ABI eagerly, by design")
+    probe = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from core import approvals, auditlog, enforcement, engine, events, "
+        "launcher, mutations, preimages, presentation, remediation, "
+        "retention_policy, store\n"
+        "print('ctypes' in sys.modules, 'ctypes.wintypes' in sys.modules)\n"
+        % os.path.join(REPO, "scripts")
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False False", result.stdout
+
+
+def test_win32_dialog_abi_is_still_reachable_and_byte_identical():
+    """Laziness must not change the ABI, or the dialog misreads its own struct."""
+    import ctypes as real_ctypes
+
+    from core import approvals
+
+    # Touching the name through the module __getattr__ builds the ABI.
+    assert real_ctypes.sizeof(approvals.TASKDIALOGCONFIG) == 160
+    assert real_ctypes.sizeof(approvals.ACTCTXW) == 56
+    assert approvals.INVALID_HANDLE_VALUE == real_ctypes.c_void_p(-1).value
+    assert approvals.ULONG_PTR is real_ctypes.c_size_t
+    button = approvals.TASKDIALOG_BUTTON(100, "Allow once")
+    assert button.nButtonID == 100
+    with pytest.raises(AttributeError):
+        approvals.no_such_name
+
+
 class _RecordingStdout:
     """A stdout that remembers how many separate writes reached it."""
 

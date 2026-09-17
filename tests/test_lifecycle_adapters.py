@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "claude", "pretooluse.py")
 POST = os.path.join(REPO, "scripts", "claude", "posttooluse.py")
@@ -378,3 +380,51 @@ def test_sessionstart_uses_native_platform_launcher():
     assert "bin/agw" not in context
     assert "exact host-supplied `SKILL.md` location" in context
     assert "plugin-cache path" in context
+
+
+CODEX_START = os.path.join(REPO, "scripts", "codex", "sessionstart.py")
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_warns_about_a_corrupt_policy_pack(script, tmp_path):
+    """P3 in the 2026-09-17 audit: `except Exception: pass` around load_policy.
+
+    A corrupt pack produced no session-start signal at all, so the first the
+    user heard of it was a surprise block mid-task.
+    """
+    home = tmp_path / "home"
+    (home / "policies.d").mkdir(parents=True)
+    (home / "policies.d" / "broken.yaml").write_text(
+        "commands:\n  - pattern: [unclosed", encoding="utf-8")
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(home)})
+    out = json.loads(result.stdout)
+    message = out.get("systemMessage", "")
+    assert "DEGRADED" in message and "broken.yaml" in message, out
+    # The model is told too, so it knows why its calls behave differently.
+    assert message in out["hookSpecificOutput"]["additionalContext"]
+    # And the host's hook log carries it, which is where a support case starts.
+    assert "DEGRADED" in result.stderr
+    # The session still starts, with the full vocabulary intact.
+    assert "agentic-guardrails is active" in _context(result)
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_warns_when_the_policy_cannot_load_at_all(script, tmp_path):
+    empty_plugin = tmp_path / "empty-plugin"
+    empty_plugin.mkdir()
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(tmp_path / "home"),
+                             "CLAUDE_PLUGIN_ROOT": str(empty_plugin),
+                             "PLUGIN_ROOT": str(empty_plugin)})
+    message = json.loads(result.stdout).get("systemMessage", "")
+    assert "UNAVAILABLE" in message, result.stdout
+    assert "agentic-guardrails is active" in _context(result)
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_is_silent_when_the_policy_is_healthy(script, tmp_path):
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(tmp_path / "home")})
+    assert "systemMessage" not in json.loads(result.stdout)
+    assert result.stderr.strip() == ""
