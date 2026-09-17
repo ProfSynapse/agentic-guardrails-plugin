@@ -79,21 +79,34 @@ def interpreter_head(token: str) -> str:
     return _ARGV0_EXT_RE.sub("", head)
 
 
-def _inline_posix_script(argv):
-    """The script body of `bash -lc <script>` and friends, else ``None``."""
+def inline_posix_script_index(argv):
+    """Index of the inline script body in `bash -lc <script>`, else ``None``.
+
+    The index, not just the body: a caller that rewrites the body has to put it
+    back in the argv position it came from, so the interpreter wrapper the host
+    will actually exec survives the rewrite.
+    """
+    if not isinstance(argv, (list, tuple)) or not argv \
+            or not all(isinstance(token, str) for token in argv):
+        return None
     if interpreter_head(argv[0]) not in _POSIX_SHELL_HEADS:
         return None
     for index, token in enumerate(argv[1:], start=1):
         if _INLINE_SCRIPT_FLAG.fullmatch(token):
             if index + 1 >= len(argv):
                 return None
-            script = argv[index + 1]
-            return script if script.strip() else None
+            return index + 1 if argv[index + 1].strip() else None
         if not token.startswith("-"):
             # A script path or a positional argument: there is no inline body,
             # so the whole argv is handed on and parsed as written.
             return None
     return None
+
+
+def _inline_posix_script(argv):
+    """The script body of `bash -lc <script>` and friends, else ``None``."""
+    index = inline_posix_script_index(argv)
+    return None if index is None else argv[index]
 
 
 def argv_command(value):
