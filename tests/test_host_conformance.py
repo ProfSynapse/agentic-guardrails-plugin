@@ -598,6 +598,23 @@ def test_git_resolves_the_batch_launcher_to_crlf():
     assert "eol: crlf" in resolved.stdout, resolved.stdout
 
 
+def test_readme_release_banner_names_the_shipped_version():
+    """The banner is the first version a human reads, and it drifted.
+
+    It advertised `0.3.23` as the Windows-first stable release; no v0.3.23 tag
+    ever existed (tags jump v0.3.6 -> v0.3.26) while every manifest said 0.4.4.
+    """
+    version = json.loads(
+        (PLUGIN / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )["version"]
+    banner = next(line for line in (ROOT / "README.md").read_text(
+        encoding="utf-8").splitlines() if "**Release status:**" in line)
+    assert f"`{version}`" in banner, banner
+    # RELEASING.md must list the banner, or nothing makes the next bump happen.
+    releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    assert "Release status" in releasing and "README.md" in releasing
+
+
 def test_host_registry_marks_only_maintained_hosts_release_blocking():
     text = (ROOT / "docs" / "HOST_PARITY.md").read_text(encoding="utf-8").lower()
     assert "| claude code | supported | yes |" in text
