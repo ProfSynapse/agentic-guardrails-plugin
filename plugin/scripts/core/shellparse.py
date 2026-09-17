@@ -32,6 +32,19 @@ _SHELLS = {"bash", "sh", "zsh", "ksh", "dash", "ash"}
 # inside `bash -c`. We recurse their inner command line the same way.
 _PWSH = {"powershell", "pwsh"}
 _WIN_CMD = {"cmd"}
+# `wsl <command>` runs the command inside a Linux distro with the Windows drives
+# mounted under /mnt, so it reaches the user's files exactly as a native shell
+# does. Its inner command line is recursed in the POSIX dialect.
+_WSL = {"wsl"}
+# Value-taking `wsl` options: the token after them is the option's argument, not
+# the start of the inner command line.
+_WSL_VALUE_OPTIONS = {"-d", "--distribution", "-u", "--user", "--cd",
+                      "--shell-type"}
+# PowerShell's process launcher and its aliases. Only treated as a wrapper when
+# the launched image is itself an interpreter we already recurse.
+_START_PROCESS = {"start-process", "saps", "start"}
+# Images whose command line Start-Process is worth unwrapping.
+_RECURSED_IMAGES = _SHELLS | _PWSH | _WIN_CMD | _WSL
 
 # Windows spells one interpreter four ways: `bash`, `bash.exe`, a full path, and
 # a quoted full path with spaces in it. Every wrapper table above is keyed on the
@@ -115,6 +128,10 @@ class ParseResult:
     # -Command / -EncodedCommand, cmd /c). The engine scans these for
     # PowerShell/.NET deletion and for secret content that argv parsing misses.
     payloads: list = field(default_factory=list)
+    # Script paths a wrapper would run without the parser ever seeing their
+    # contents (`powershell -File wipe.ps1`). The engine asks about these rather
+    # than treating an uninspectable body as harmless.
+    uninspected: list = field(default_factory=list)
 
 FLAG_EVAL = "eval"                    # eval / source of dynamic strings
 FLAG_INDIRECT = "indirect-command"    # command name comes from a variable/substitution
@@ -122,6 +139,9 @@ FLAG_DECODE_PIPE = "decode-pipe"      # base64/xxd/openssl output piped into a s
 FLAG_DOWNLOAD_PIPE = "download-pipe"  # curl/wget piped into a shell
 FLAG_SUBSTITUTION = "substitution"    # contained $(...) or backticks (also recursed)
 FLAG_INNER_UNCERTAIN = "inner-parse-uncertain"
+# A wrapper hands an interpreter a command body this parser never sees: a
+# `-File` script, or a launcher argument list that is not a static literal.
+FLAG_UNINSPECTED_SCRIPT = "uninspected-script"
 
 _DECODERS = {"base64", "base32", "xxd", "openssl"}
 _DOWNLOADERS = {"curl", "wget"}
@@ -327,6 +347,7 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
             sub_result = extract_commands(inner, depth + 1, dialect=dialect)
             result.commands.extend(sub_result.commands)
             result.flags.update(sub_result.flags)
+            result.uninspected.extend(sub_result.uninspected)
         return "SUBST_OUT"
 
     if dialect == DIALECT_POSIX:
@@ -380,6 +401,72 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
                 result.flags.add(FLAG_DOWNLOAD_PIPE)
             prev_name = cmd.name
     return result
+
+
+# `Start-Process` parameters that take a value. Anything else beginning with `-`
+# is one of its switches (-Wait, -NoNewWindow, -PassThru, ...).
+_START_PROCESS_VALUE_PARAMS = {
+    "filepath", "fp", "argumentlist", "args", "workingdirectory", "wd",
+    "verb", "windowstyle", "credential", "redirectstandardoutput",
+    "redirectstandarderror", "redirectstandardinput",
+}
+# Characters that make a recovered -ArgumentList runtime-dependent: expansion,
+# subexpression, array, script block, splat, or an embedded statement. A
+# backslash is deliberately absent — Windows paths are full of them.
+_START_PROCESS_DYNAMIC_CHARS = frozenset("$@`{}[]();|&")
+
+
+def _start_process_shape(args: list):
+    """(image, argument tokens) for a Start-Process argument vector.
+
+    The argument tokens are ``None`` when an -ArgumentList is present but not a
+    static literal list — the shape that hides an arbitrary inner command line.
+    """
+    image = None
+    argument_text = None
+    saw_argument_list = False
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token.startswith("-") and token != "-":
+            name = token[1:]
+            attached = None
+            if ":" in name:
+                name, attached = name.split(":", 1)
+            name = name.lower()
+            if name in _START_PROCESS_VALUE_PARAMS:
+                if attached is None:
+                    if i + 1 >= len(args):
+                        return image, None
+                    attached = args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+                if name in ("filepath", "fp"):
+                    image = attached
+                elif name in ("argumentlist", "args"):
+                    saw_argument_list = True
+                    argument_text = attached
+                continue
+            i += 1
+            continue
+        if image is None:
+            image = token
+        elif not saw_argument_list:
+            saw_argument_list = True
+            argument_text = token
+        i += 1
+
+    if not saw_argument_list:
+        return image, []
+    if argument_text is None or any(
+            char in _START_PROCESS_DYNAMIC_CHARS for char in argument_text):
+        return image, None
+    # PowerShell writes the list as comma-separated elements; the outer
+    # tokenizer has already removed the element quoting, so split on the commas
+    # and rejoin the elements into one command line.
+    return image, [part for part in
+                   (piece.strip() for piece in argument_text.split(",")) if part]
 
 
 def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
@@ -474,6 +561,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
             return [SimpleCommand(argv=toks, dialect=dialect)]
         result.flags.update(inner.flags)
         result.payloads.extend(inner.payloads)
+        result.uninspected.extend(inner.uninspected)
         return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
 
     # bash -c "string" → recurse into the string. `head_base` is already the
@@ -484,8 +572,54 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
                 inner = extract_commands(toks[i + 1], depth + 1,
                                          dialect=DIALECT_POSIX)
                 result.flags.update(inner.flags)
+                result.uninspected.extend(inner.uninspected)
                 return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
         return [SimpleCommand(argv=toks, dialect=dialect)]
+
+    # wsl [options] <command ...> / wsl -e <command ...> / wsl -- <command ...>
+    # The Windows drives are mounted under /mnt, so the inner command reaches
+    # the same user files a native shell would.
+    if head_base in _WSL:
+        rest = toks[1:]
+        i = 0
+        inner_tokens = None
+        while i < len(rest):
+            tok = rest[i]
+            low = tok.lower()
+            if low in ("--", "-e", "--exec"):
+                inner_tokens = rest[i + 1:]
+                break
+            if low in _WSL_VALUE_OPTIONS:
+                i += 2          # the option and its argument
+                continue
+            if tok.startswith("-"):
+                i += 1          # a boolean switch (--system, --no-launch, ...)
+                continue
+            inner_tokens = rest[i:]
+            break
+        me = [SimpleCommand(argv=toks, dialect=dialect)]
+        if inner_tokens:
+            return me + _analyze_segment(inner_tokens, result, depth,
+                                         DIALECT_POSIX)
+        return me
+
+    # Start-Process / saps / start: a launcher, not an interpreter. It only
+    # hides a destructive command when the image it launches is one of the
+    # interpreters above and -ArgumentList carries that interpreter's command
+    # line, so that is the only shape we unwrap.
+    if head_base in _START_PROCESS and len(toks) > 1:
+        image, arguments = _start_process_shape(toks[1:])
+        if image and _normalized_head(image) in _RECURSED_IMAGES:
+            if arguments is None:
+                # An -ArgumentList we cannot read statically hides the whole
+                # inner command line: fail closed rather than pass the launcher
+                # off as a harmless process start. It is indirection, and the
+                # interpreter body is as uninspectable as a `-File` script.
+                result.flags.add(FLAG_INDIRECT)
+                result.flags.add(FLAG_UNINSPECTED_SCRIPT)
+                result.uninspected.append(image)
+                return [SimpleCommand(argv=toks, dialect=dialect)]
+            return _recurse_inner(" ".join([image] + arguments), dialect)
 
     # Windows interpreters. A destructive command can hide in their inner
     # command line exactly as it does in `bash -c`.
@@ -516,7 +650,12 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
                 # -Command consumes the remainder of the line as the script.
                 return _recurse_inner(" ".join(rest[i + 1:]), DIALECT_POWERSHELL)
             if stripped and _PWSH_FILE_RE.fullmatch(stripped):
-                break  # -File <script>: a path we cannot inspect
+                # -File <script>: the body never reaches this parser. Record it
+                # so the engine can ask instead of allowing an unread script.
+                if i + 1 < len(rest):
+                    result.uninspected.append(rest[i + 1])
+                    result.flags.add(FLAG_UNINSPECTED_SCRIPT)
+                break
             if stripped and _PWSH_VALUE_FLAG_RE.fullmatch(stripped):
                 i += 2  # skip the flag and its value
                 continue

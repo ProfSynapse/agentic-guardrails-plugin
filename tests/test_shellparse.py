@@ -2,8 +2,8 @@
 import pytest
 
 from core.shellparse import (DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_INDIRECT,
-                             FLAG_INNER_UNCERTAIN, ParseUncertain, extract_commands,
-                             extract_payloads)
+                             FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT,
+                             ParseUncertain, extract_commands, extract_payloads)
 
 
 def names(command):
@@ -211,3 +211,65 @@ def test_normalized_head_does_not_rename_the_wrapper_itself():
     # spelling downstream tables (and the launcher handshake) rely on.
     parsed = extract_commands("agw.cmd status")
     assert [c.name for c in parsed.commands] == ["agw.cmd"]
+
+
+# ---- F4: wsl, Start-Process, and the uninspected -File script ------------
+
+@pytest.mark.parametrize("command", [
+    "wsl rm -rf /mnt/c/Users/jo/Documents",
+    "wsl.exe rm -rf /mnt/c/x",
+    "wsl -d Ubuntu -u root rm -rf /mnt/c/x",
+    "wsl -e rm -rf /mnt/c/x",
+    "wsl --exec rm -rf /mnt/c/x",
+    "wsl -- rm -rf /mnt/c/x",
+    "wsl --cd /tmp rm -rf /mnt/c/x",
+    'wsl bash -c "rm -rf /mnt/c/x"',
+])
+def test_wsl_inner_command_is_recursed(command):
+    assert "rm" in names(command), command
+
+
+def test_wsl_without_an_inner_command_stays_one_command():
+    assert names("wsl --list --verbose") == ["wsl"]
+
+
+@pytest.mark.parametrize("command", [
+    "Start-Process powershell -ArgumentList '-Command','Remove-Item -Recurse C:\\x'",
+    "saps pwsh -ArgumentList '-c','Remove-Item y.txt'",
+    'Start-Process -FilePath cmd.exe -ArgumentList "/c del X"',
+    'start powershell -ArgumentList "-Command Remove-Item y.txt"',
+])
+def test_start_process_argument_list_is_recursed(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert {"remove-item", "del"} & {c.name for c in parsed.commands}, command
+
+
+def test_start_process_of_a_non_interpreter_is_not_unwrapped():
+    parsed = extract_commands("Start-Process notepad.exe README.md",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.name for c in parsed.commands] == ["start-process"]
+    assert not parsed.flags
+
+
+@pytest.mark.parametrize("command", [
+    "Start-Process powershell -ArgumentList $cmd",
+    "Start-Process powershell -ArgumentList @args",
+    "Start-Process powershell -ArgumentList (Get-Content list.txt)",
+    "Start-Process -FilePath pwsh -ArgumentList",
+])
+def test_start_process_with_a_dynamic_argument_list_fails_closed(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert FLAG_INDIRECT in parsed.flags, command
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags, command
+
+
+def test_powershell_file_records_the_uninspected_script():
+    parsed = extract_commands(r"powershell -NoProfile -File C:\tools\wipe.ps1")
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags
+    assert parsed.uninspected == [r"C:\tools\wipe.ps1"]
+
+
+def test_uninspected_script_survives_wrapper_recursion():
+    parsed = extract_commands('cmd /c "powershell -File wipe.ps1"')
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags
+    assert parsed.uninspected == ["wipe.ps1"]

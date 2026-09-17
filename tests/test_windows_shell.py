@@ -491,3 +491,49 @@ def test_quoted_diagnostic_pattern_is_not_treated_as_mutation(tmp_path):
 ])
 def test_suffixed_and_full_path_interpreters_are_denied(evaluate, command):
     assert evaluate(command).action == DENY, command
+
+
+# ---- F4: wsl / Start-Process / robocopy / xcopy / fsutil / -File ---------
+
+@pytest.mark.parametrize("command", [
+    "wsl rm -rf /mnt/c/Users/jo/Documents",
+    "wsl.exe -d Ubuntu -u root rm -rf /mnt/c/x",
+    "wsl -e rm -rf /mnt/c/x",
+    "wsl -- rm -rf /mnt/c/x",
+    "Start-Process powershell -ArgumentList '-Command','Remove-Item -Recurse C:\\x'",
+    'Start-Process -FilePath cmd.exe -ArgumentList "/c del X"',
+    "robocopy C:\\src C:\\dst /MIR",
+    "robocopy C:\\src C:\\dst /PURGE",
+    "robocopy C:\\src C:\\dst /MOV",
+    "robocopy C:\\src C:\\dst /MOVE",
+    "fsutil file setzerodata offset=0 length=4096 C:\\work\\notes.txt",
+])
+def test_unmodelled_windows_destroyers_are_denied(evaluate, command):
+    assert evaluate(command).action == DENY, command
+
+
+def test_robocopy_without_a_purge_switch_is_not_denied(evaluate):
+    assert evaluate("robocopy C:\\src C:\\dst /E").action != DENY
+
+
+def test_wsl_listing_is_not_denied(evaluate):
+    assert evaluate("wsl --list --verbose").action != DENY
+
+
+def test_xcopy_into_a_protected_path_is_denied(evaluate):
+    assert evaluate("xcopy notes.txt ~/.ssh/id_rsa /Y").action == DENY
+
+
+def test_xcopy_between_working_files_is_not_denied(evaluate):
+    assert evaluate("xcopy src dst /E /Y").action != DENY
+
+
+@pytest.mark.parametrize("command", [
+    r"powershell -File .\wipe.ps1",
+    r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\tools\build.ps1",
+    "Start-Process powershell -ArgumentList $cmd",
+])
+def test_uninspected_command_bodies_ask(evaluate, command):
+    decision = evaluate(command)
+    assert decision.action == ASK, f"{command} -> {decision.action}"
+    assert "not inspected" in decision.reason
