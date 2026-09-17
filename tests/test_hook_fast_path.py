@@ -251,7 +251,11 @@ def test_routine_read_agrees_with_the_engine(tmp_path, agw_home):
     assert outcomes["plain.txt"] == (True, "defer", "")
     assert outcomes["empty.txt"] == (True, "defer", "")
     assert outcomes["missing"] == (True, "defer", "")
-    assert outcomes["blank"] == (True, "defer", "")
+    # A blank path resolves to the cwd, a directory. On APFS a directory
+    # reports st_blocks == 0, which the placeholder heuristic treats as
+    # "not sure" and hands to the engine; on ext4 it takes the fast path.
+    # Either is correct: the loop above already proved agreement.
+    assert outcomes["blank"][1:] == ("defer", "")
     assert outcomes[".env"] == (False, "ask", "builtin:secret-file")
     assert outcomes["keys.txt"] == (False, "ask", "builtin:content-prescan")
     assert outcomes["notes.md"] == (False, "ask", "builtin:content-prescan")
