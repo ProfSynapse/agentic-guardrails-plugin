@@ -68,20 +68,50 @@ def _workflow_note(items, cwd: str) -> str:
     return note
 
 
+def _health_warning(policy, policy_health) -> str:
+    """One privacy-safe line naming a policy pack that did not load cleanly."""
+    if policy.health == policy_health.HEALTHY:
+        return ""
+    packs = ", ".join(os.path.basename(name) for name in policy.degraded)
+    return ("agentic-guardrails: the policy pack is %s%s. Guardrails fall back "
+            "to the fail-closed baseline until it is fixed; expect blocks on "
+            "operations that normally pass."
+            % (policy.health, f" ({packs})" if packs else ""))
+
+
 def main():
     note = ""
+    warning = ""
     try:
-        from core import engine, store, workflows
+        from core import engine, policy_health, store, workflows
         store.agw_home()  # ensures ~/.agw exists
-        policy = engine.load_policy(PLUGIN_ROOT)  # warms cache; validates packs
+        policy = engine.load_policy(PLUGIN_ROOT)  # validates the policy packs
+        warning = _health_warning(policy, policy_health)
         cfg = engine.resolve_settings(policy)
         note = _LEVEL_NOTE.get(cfg.get("level"), "")
         note += _workflow_note(workflows.list_trusted(), os.getcwd())
-    except Exception:
-        pass
-    json.dump({"hookSpecificOutput": {
+    except Exception as exc:
+        # A corrupt pack or an unreachable store must not take the session down,
+        # but swallowing it entirely was why a broken policy produced no
+        # session-start signal at all: the first the user heard of it was a
+        # surprise block mid-task.
+        warning = ("agentic-guardrails: could not load the guardrails policy "
+                   "(%s). Every tool call will fail closed until this is fixed."
+                   % type(exc).__name__)
+    out = {"hookSpecificOutput": {
         "hookEventName": "SessionStart",
-        "additionalContext": CONTEXT + note}}, sys.stdout)
+        "additionalContext": CONTEXT + note}}
+    if warning:
+        # stderr reaches the host's hook log; systemMessage reaches the user;
+        # additionalContext tells the model why its calls are about to behave
+        # differently. None of the three fails the session.
+        try:
+            sys.stderr.write(warning + "\n")
+        except Exception:
+            pass
+        out["systemMessage"] = warning
+        out["hookSpecificOutput"]["additionalContext"] += "\n" + warning
+    json.dump(out, sys.stdout)
 
 
 if __name__ == "__main__":

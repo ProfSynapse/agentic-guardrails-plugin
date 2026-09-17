@@ -13,9 +13,24 @@
 *.yaml  text eol=lf
 *.yml   text eol=lf
 *.md    text eol=lf
-bin/*   text eol=lf
+# A gitattributes pattern containing a slash is anchored to this file's
+# directory, so the old `bin/*` matched a repo-root `bin/` that has never
+# existed. The shim actually lives here.
+plugin/bin/* text eol=lf
 
-# Cowork lab fixtures are byte-exact test inputs: the product-plan.gdoc stub
-# deliberately keeps CRLF to mimic a Windows-authored Google Docs stub, and the
-# snapshot/restore probes assert on exact byte counts. Never normalize them.
-synthetic/cowork-safety-lab/workspace/** -text
+# Batch files are the one exception, and must come after `plugin/bin/*` to win.
+#
+# Why: cmd.exe does not read a batch file into memory. It seeks by byte offset
+# and re-reads after every command, so `goto :label` and parenthesised blocks
+# resolve against file positions. An LF-only batch file shifts those offsets
+# and is a known source of intermittent "label not found" and block-parsing
+# failures. agw.cmd uses both constructs.
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Safety-lab fixtures are byte-exact test inputs: the product-plan.gdoc stub
+# mimics a Windows-authored Google Docs stub, and the snapshot/restore probes
+# assert on exact byte counts. Never normalize them. (This line named
+# `synthetic/cowork-safety-lab/`, a path that has never existed, so the
+# fixtures were unprotected on Windows checkouts.)
+synthetic/safety-lab/workspace/** -text

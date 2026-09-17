@@ -821,3 +821,227 @@ def test_policy_ask_rule_is_not_upgraded_to_a_hard_deny(tmp_path):
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "Installing packages changes the environment." in reason
     assert "could not identify enough structured information" not in reason
+
+
+def test_hook_import_line_does_not_pull_ctypes_off_windows():
+    """`core.approvals` imported ctypes and ctypes.wintypes on every platform.
+
+    They are only ever needed for the Windows TaskDialog, but the cost landed on
+    every PreToolUse call on every OS. The ABI is built on first touch instead.
+    """
+    if sys.platform == "win32":
+        pytest.skip("Windows builds the TaskDialog ABI eagerly, by design")
+    probe = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from core import approvals, auditlog, enforcement, engine, events, "
+        "launcher, mutations, preimages, presentation, remediation, "
+        "retention_policy, store\n"
+        "print('ctypes' in sys.modules, 'ctypes.wintypes' in sys.modules)\n"
+        % os.path.join(REPO, "scripts")
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False False", result.stdout
+
+
+def test_win32_dialog_abi_is_still_reachable_and_byte_identical():
+    """Laziness must not change the ABI, or the dialog misreads its own struct."""
+    import ctypes as real_ctypes
+
+    from core import approvals
+
+    # Touching the name through the module __getattr__ builds the ABI.
+    assert real_ctypes.sizeof(approvals.TASKDIALOGCONFIG) == 160
+    assert real_ctypes.sizeof(approvals.ACTCTXW) == 56
+    assert approvals.INVALID_HANDLE_VALUE == real_ctypes.c_void_p(-1).value
+    assert approvals.ULONG_PTR is real_ctypes.c_size_t
+    button = approvals.TASKDIALOG_BUTTON(100, "Allow once")
+    assert button.nButtonID == 100
+    with pytest.raises(AttributeError):
+        approvals.no_such_name
+
+
+class _RecordingStdout:
+    """A stdout that remembers how many separate writes reached it."""
+
+    def __init__(self):
+        self.writes = []
+        self.flushes = 0
+
+    def write(self, text):
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self):
+        self.flushes += 1
+
+    def isatty(self):
+        return False
+
+
+@pytest.mark.parametrize("case", ["ask", "deny", "defer", "observe"])
+def test_decision_reaches_stdout_in_exactly_one_write(case, tmp_path, monkeypatch):
+    """P3 in the 2026-09-17 audit: `json.dump` streamed chunks at stdout.
+
+    A failure partway through leaves a truncated object, and the fail-closed
+    handler then appends a whole second one. The host can parse neither, and a
+    decision it cannot parse is an allow. Every exit must serialize first and
+    write once.
+    """
+    import io
+
+    from claude import pretooluse as ptu
+
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    payloads = {
+        "ask": {"tool_name": "Read", "tool_input": {"file_path": str(secret)}},
+        "deny": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+        "defer": {"tool_name": "Shell", "tool_input": {"command": "whatever"}},
+        "observe": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+    }
+    if case == "observe":
+        monkeypatch.setenv("AGW_ENFORCEMENT", "observe")
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    payload = {**payloads[case], "cwd": str(tmp_path),
+               "session_id": f"one-write-{case}", "event_id": f"ev-{case}",
+               "hook_event_name": "PreToolUse"}
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(ptu, "_EMITTED", False, raising=False)
+    ptu.main()
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    json.loads(recorder.writes[0])
+
+
+def test_fail_closed_handler_never_appends_a_second_object(tmp_path, monkeypatch):
+    from claude import pretooluse as ptu
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(ptu, "_EMITTED", False, raising=False)
+
+    # Nothing written yet: the handler must supply the fail-closed decision.
+    ptu._fail_closed()
+    assert len(recorder.writes) == 1
+    assert json.loads(recorder.writes[0])["hookSpecificOutput"][
+        "permissionDecision"] == "ask"
+
+    # A decision already on the wire: the handler must stay silent.
+    recorder.writes.clear()
+    ptu._emit({"systemMessage": "already decided"})
+    ptu._fail_closed()
+    assert len(recorder.writes) == 1, recorder.writes
+    json.loads(recorder.writes[0])
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_dispatcher_ask_is_one_write(host, monkeypatch):
+    """The dispatcher's last-resort ASK runs when an adapter could not even
+    start, so it is the one decision that must never arrive half-written."""
+    import importlib.util
+
+    path = os.path.join(REPO, "scripts", host, "_dispatch.py")
+    monkeypatch.setattr("sys.argv", [path, "pretooluse"])
+    spec = importlib.util.spec_from_file_location(f"_agw_test_{host}_dispatch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    module._ask("hit an internal error (ImportError)")
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    decision = json.loads(recorder.writes[0])["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "ask"
+    assert "failing closed" in decision["permissionDecisionReason"]
+
+
+def run_dispatch_raw(payload, event="pretooluse"):
+    """Drive the real hooks.json entry point and keep stdout/stderr separate."""
+    dispatch = os.path.join(REPO, "scripts", "claude", "_dispatch.py")
+    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=REPO)
+    return subprocess.run([sys.executable, dispatch, event],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=30)
+
+
+@pytest.mark.parametrize("payload,label", [
+    ({"tool_name": "Shell", "tool_input": {"command": "rm -rf ~/Documents"}},
+     "'Shell'"),
+    ({"tool_name": "MultiEdit", "tool_input": {"file_path": "/tmp/x"}},
+     "'MultiEdit'"),
+    ({"tool_input": {"command": "rm -rf ~/Documents"}}, "no tool name"),
+    ({"tool_name": "   ", "tool_input": {}}, "no tool name"),
+    ({"tool_name": 17, "tool_input": {}}, "no tool name"),
+])
+def test_unrecognized_tool_asks_instead_of_silently_allowing(payload, label):
+    # Regression for the fail-open in the 2026-09-17 audit (F2): an unmodeled
+    # tool name reached events.OTHER, the engine DEFERred, and empty stdout is
+    # a silent allow.
+    payload = dict(payload, cwd="/tmp", session_id="unknown-tool",
+                   hook_event_name="PreToolUse")
+    result = run_dispatch_raw(payload)
+    assert result.returncode == 0
+    assert result.stdout.strip(), "unrecognized tool produced no decision"
+    out = json.loads(result.stdout)
+    assert _decision(out) == "ask"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert label in reason
+    assert "update the plugin" in reason
+    # One diagnosable line on stderr, so a host-side fall-through is visible.
+    assert len([line for line in result.stderr.splitlines() if line.strip()]) == 1
+    assert "agentic-guardrails:" in result.stderr
+    assert label in result.stderr
+
+
+# TodoWrite/TaskCreate/TaskUpdate are recognized here but still denied further
+# down the pipeline by mutations.plan's name-based net for events.OTHER
+# (_MUTATION_WORDS matches "write"/"create"/"update" in the tool name). That is
+# a separate, pre-existing behavior in core/mutations.py; none of those tools is
+# in the hooks.json matcher, so the hook never sees them in practice.
+@pytest.mark.parametrize("tool", [
+    "Task", "Agent", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode",
+    "Skill", "SlashCommand", "ToolSearch", "BashOutput", "KillShell", "LS",
+    "WebFetch", "WebSearch", "TaskList", "TaskGet", "SendMessage",
+    "ListMcpResourcesTool",
+])
+def test_known_harmless_tools_still_pass_without_prompting(tool):
+    out = run_hook({"tool_name": tool, "tool_input": {},
+                    "cwd": "/tmp", "session_id": "inert",
+                    "hook_event_name": "PreToolUse"})
+    assert _decision(out) == "defer"
+
+
+def test_mcp_tools_are_recognized_by_prefix():
+    from claude.adapter_common import unrecognized_tool
+
+    assert unrecognized_tool({"tool_name": "mcp__brand_new__thing"}) is None
+    assert unrecognized_tool({"tool_name": "Bash"}) is None
+    assert unrecognized_tool({"tool_name": "Shell"}) == "Shell"
+    assert unrecognized_tool("not-a-dict") is not None
+
+
+def test_matcher_tools_claude_models_never_prompt_as_unrecognized():
+    """Every tool this adapter models must also be one the matcher delivers.
+
+    A modeled tool missing from the matcher is a dead guard; a matcher tool the
+    adapter cannot model prompts on every call. `apply_patch` is deliberately in
+    the matcher and deliberately unmodeled here: Claude does not ship it, and if
+    it ever does, asking beats silently passing a patch we cannot read.
+    """
+    from claude.adapter_common import unrecognized_tool
+
+    manifest = json.loads(
+        open(os.path.join(REPO, "hooks", "hooks.json"), encoding="utf-8").read()
+    )
+    matcher = set(manifest["hooks"]["PreToolUse"][0]["matcher"].split("|"))
+    for name in matcher - {"mcp__.*", "apply_patch"}:
+        assert unrecognized_tool({"tool_name": name}) is None, name
+    assert unrecognized_tool({"tool_name": "apply_patch"}) == "apply_patch"
+    # Tools the adapter models must be tools the host actually sends us.
+    assert {"Bash", "PowerShell", "Monitor", "Write", "Edit", "NotebookEdit",
+            "Read"} <= matcher

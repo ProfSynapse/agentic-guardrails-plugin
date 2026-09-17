@@ -37,7 +37,29 @@ FAIL_CLOSED = {
     }
 }
 
-from adapter_common import to_events  # noqa: E402
+from adapter_common import to_events, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
+
+# Set once anything has reached stdout, so the fail-closed handler never
+# appends a second object to a stream that already carries a decision.
+_EMITTED = False
+
+
+def _emit(out):
+    """Write one decision object in a single, already-serialized write.
+
+    `json.dump` streams chunks straight at stdout: a failure partway through
+    leaves a truncated object, and the fail-closed handler then appends a whole
+    second one. The host can parse neither, and a decision it cannot parse is
+    no decision at all - which is an allow. Serializing first keeps stdout
+    untouched unless the whole object is ready.
+    """
+    global _EMITTED
+    text = json.dumps(out)
+    _EMITTED = True
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 # Codex has no hook-driven approval prompt (permissionDecision "ask" is parsed
@@ -101,6 +123,21 @@ def main(approval_provider=None):
                 f"instead of removing it.",
                 "builtin:patch-delete",
                 enforcement_class=events.NON_WAIVABLE_INVARIANT))
+        if ev.extra.get("unrecognized_tool"):
+            # A tool identity this adapter cannot map to any guarded event.
+            # events.OTHER alone DEFERs and emits nothing, which Codex reads as
+            # allow. Ask instead — on Codex that routes through the approval
+            # provider, whose absence or timeout denies — and log one stderr
+            # line so the fall-through is diagnosable from the hook log.
+            reason = unrecognized_tool_reason(
+                unrecognized_tool(evaluation_payload)
+            )
+            sys.stderr.write("agentic-guardrails: %s\n" % reason)
+            d = d.merge(engine.Decision(
+                events.ASK, reason + ".", "builtin:unrecognized-tool",
+                policy_revision=policy.revision, policy_health=policy.health,
+                enforcement_class=events.NON_WAIVABLE_INVARIANT,
+                presentation_context=events.DecisionContext.UNKNOWN))
         if ev.extra.get("opaque"):
             d = d.merge(engine.Decision(
                 events.ASK,
@@ -230,17 +267,17 @@ def main(approval_provider=None):
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
         out = {"systemMessage": f"agentic-guardrails ({label}): would have "
                                 f"{decision.action.upper()} - {decision.reason}"}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
 
     # Codex can't render a hook 'ask' prompt, so an emitted ASK would silently
@@ -323,15 +360,27 @@ def main(approval_provider=None):
         )
 
     if out:
-        json.dump(out, sys.stdout)
+        _emit(out)
+
+
+def _fail_closed():
+    """Last-resort decision for a failure the evaluation path did not catch.
+
+    Only speaks if nothing already did. Appending a second object to a stream
+    that already carries a decision makes both unparseable, and a decision the
+    host cannot parse is no decision at all - which is an allow.
+    """
+    if _EMITTED:
+        return
+    try:
+        _emit(FAIL_CLOSED)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        try:
-            json.dump(FAIL_CLOSED, sys.stdout)
-        except Exception:
-            print(json.dumps(FAIL_CLOSED))
+        _fail_closed()
         sys.exit(0)

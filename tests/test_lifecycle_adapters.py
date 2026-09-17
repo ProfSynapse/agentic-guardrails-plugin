@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
 PRE = os.path.join(REPO, "scripts", "claude", "pretooluse.py")
 POST = os.path.join(REPO, "scripts", "claude", "posttooluse.py")
@@ -232,6 +234,115 @@ def test_posttooluse_never_crashes_on_garbage():
     assert result.returncode == 0
 
 
+# --- Codex PostToolUse: the same verification, not a bare grant ---------------
+
+CODEX_POST = os.path.join(REPO, "scripts", "codex", "posttooluse.py")
+
+
+def _codex_ask_decision(payload):
+    """Evaluate a Codex payload the way both Codex adapters evaluate it."""
+    from codex.adapter_common import to_events
+    from core import engine, events
+
+    policy = engine.load_policy(REPO)
+    evlist = to_events(payload)
+    decision = events.worst([engine.evaluate(ev, policy, REPO) for ev in evlist])
+    return policy, evlist, decision
+
+
+def test_codex_posttooluse_needs_a_pending_approval_to_grant(tmp_path):
+    """Audit G8: Codex granted a session approval for *any* decision carrying a
+    memo key - no pending record, no fingerprint, no revision or ASK check. A
+    tool having run is not evidence that this operation was the one approved."""
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    home = tmp_path / "home"
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-unverified",
+               "event_id": "codex-unverified-1",
+               "hook_event_name": "PostToolUse"}
+    _run(CODEX_POST, payload, env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-unverified.json").exists()
+
+
+def test_codex_posttooluse_grants_on_a_verified_pending_record(tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("DB_PASSWORD=hunter2hunter2")
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-verified",
+               "event_id": "codex-verified-1"}
+    from core import approvals, events, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    assert decision.action == events.ASK and decision.memo_key
+    assert approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse"},
+         env_extra={"AGW_HOME": str(home)})
+    record = home / "sessions" / "codex-verified.json"
+    assert record.exists(), "the verified pending record granted nothing"
+    approved = json.loads(record.read_text())["approved"]
+    assert any(item.endswith(f":secret-file:{os.path.abspath(secret)}")
+               for item in approved)
+
+
+def test_codex_posttooluse_mismatch_consumes_without_approval(tmp_path, monkeypatch):
+    first = tmp_path / ".env"
+    second = tmp_path / "credentials.json"
+    first.write_text("DB_PASSWORD=hunter2hunter2")
+    second.write_text('{"password":"another-secret"}')
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(first)},
+               "cwd": str(tmp_path), "session_id": "codex-mismatch",
+               "event_id": "codex-mismatch-1"}
+    from core import approvals, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+
+    # A different file under the same host event id must not ride the record,
+    # and must retire it: the candidate is one-use whatever the outcome.
+    mismatch = {**payload, "tool_input": {"file_path": str(second)},
+                "hook_event_name": "PostToolUse"}
+    _run(CODEX_POST, mismatch, env_extra={"AGW_HOME": str(home)})
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse"},
+         env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-mismatch.json").exists()
+    assert not list((home / "pending-approvals").iterdir())
+
+
+def test_codex_posttooluse_skips_recording_on_tool_error(tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=abc123abc123")
+    home = tmp_path / "home"
+    monkeypatch.setenv("AGW_HOME", str(home))
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(secret)},
+               "cwd": str(tmp_path), "session_id": "codex-error",
+               "event_id": "codex-error-1"}
+    from core import approvals, presentation
+
+    policy, evlist, decision = _codex_ask_decision(payload)
+    approvals.record_pending_approval(
+        payload, payload["session_id"], decision.memo_key, policy.revision,
+        presentation.operation_fingerprint(payload, evlist, policy.revision))
+    _run(CODEX_POST, {**payload, "hook_event_name": "PostToolUse",
+                      "tool_error": "permission denied"},
+         env_extra={"AGW_HOME": str(home)})
+    assert not (home / "sessions" / "codex-error.json").exists()
+    assert not list((home / "pending-approvals").iterdir())
+
+
+def test_codex_posttooluse_never_crashes_on_garbage():
+    assert _run(CODEX_POST, None, stdin="NOT JSON AT ALL").returncode == 0
+
+
 # --- SessionStart: context injection -----------------------------------------
 
 def _context(result):
@@ -269,3 +380,51 @@ def test_sessionstart_uses_native_platform_launcher():
     assert "bin/agw" not in context
     assert "exact host-supplied `SKILL.md` location" in context
     assert "plugin-cache path" in context
+
+
+CODEX_START = os.path.join(REPO, "scripts", "codex", "sessionstart.py")
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_warns_about_a_corrupt_policy_pack(script, tmp_path):
+    """P3 in the 2026-09-17 audit: `except Exception: pass` around load_policy.
+
+    A corrupt pack produced no session-start signal at all, so the first the
+    user heard of it was a surprise block mid-task.
+    """
+    home = tmp_path / "home"
+    (home / "policies.d").mkdir(parents=True)
+    (home / "policies.d" / "broken.yaml").write_text(
+        "commands:\n  - pattern: [unclosed", encoding="utf-8")
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(home)})
+    out = json.loads(result.stdout)
+    message = out.get("systemMessage", "")
+    assert "DEGRADED" in message and "broken.yaml" in message, out
+    # The model is told too, so it knows why its calls behave differently.
+    assert message in out["hookSpecificOutput"]["additionalContext"]
+    # And the host's hook log carries it, which is where a support case starts.
+    assert "DEGRADED" in result.stderr
+    # The session still starts, with the full vocabulary intact.
+    assert "agentic-guardrails is active" in _context(result)
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_warns_when_the_policy_cannot_load_at_all(script, tmp_path):
+    empty_plugin = tmp_path / "empty-plugin"
+    empty_plugin.mkdir()
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(tmp_path / "home"),
+                             "CLAUDE_PLUGIN_ROOT": str(empty_plugin),
+                             "PLUGIN_ROOT": str(empty_plugin)})
+    message = json.loads(result.stdout).get("systemMessage", "")
+    assert "UNAVAILABLE" in message, result.stdout
+    assert "agentic-guardrails is active" in _context(result)
+
+
+@pytest.mark.parametrize("script", [START, CODEX_START])
+def test_sessionstart_is_silent_when_the_policy_is_healthy(script, tmp_path):
+    result = _run(script, {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(tmp_path / "home")})
+    assert "systemMessage" not in json.loads(result.stdout)
+    assert result.stderr.strip() == ""

@@ -13,6 +13,9 @@ The following distributable release surfaces must remain aligned:
 2. `plugin/.codex-plugin/plugin.json`
 3. the plugin entry in `.claude-plugin/marketplace.json`
 4. the corresponding release ref in `.agents/plugins/marketplace.json`
+5. the **Release status** banner near the top of `README.md` — it is the first
+   version a human reads, and it drifted to a `0.3.23` that never had a tag
+   while every manifest said `0.4.4`
 
 The two manifests and Claude catalog carry the plain version. During candidate
 validation both catalogs use `main`; after the tag-exists gate both use the same
@@ -27,7 +30,8 @@ release must bump the version.
 1. Keep `source.ref` on `main` while validating. Never point it at
    `v0.4.4` before that tag exists.
 
-2. Confirm all three version fields are `0.4.4` and both refs are `main`, then run:
+2. Confirm all three version fields and the README banner read `0.4.4` and both
+   refs are `main`, then run:
 
    ```bash
    python -m pytest -q
@@ -63,8 +67,11 @@ release must bump the version.
    SessionStart adapter, installer, or launcher may persistently modify user or
    machine PATH.
 
-   Windows hook commands must use `py.exe -3` with the host-provided plugin
-   root. A bare `agw.cmd` is never trusted by basename: tests must prove its
+   Windows hook commands must probe `py.exe -3` and then `python`, both with the
+   host-provided plugin root; the POSIX legs probe `python3` and fall back to
+   `python` only on exit 127. Changing a hook command changes the hook
+   definition Codex pins, so call it out prominently in the release notes.
+   A bare `agw.cmd` is never trusted by basename: tests must prove its
    resolved origin is exactly the packaged launcher and that a workspace or
    PATH shim receives no Guardrails privileges. Monitor coverage validates only
    the documented literal `tool_input.command` normalization contract; do not

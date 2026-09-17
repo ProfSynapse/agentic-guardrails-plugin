@@ -36,17 +36,41 @@ def main():
 
     # If this call corresponded to an access-type ask, the fact that it ran
     # means it was approved - remember it so we don't re-prompt this session.
-    if not payload.get("tool_error"):
-        try:
-            from core import engine, store
-            policy = engine.load_policy(PLUGIN_ROOT)
-            if engine.resolve_settings(policy).get("session_memory"):
-                for ev in events_list:
-                    decision = engine.evaluate(ev, policy, PLUGIN_ROOT)
-                    if decision.memo_key:
-                        store.session_approve(session, decision.memo_key)
-        except Exception:
-            pass
+    # "It ran" is not on its own evidence that *this* operation was approved,
+    # so the grant is gated exactly as the Claude adapter gates it: a pending
+    # record written by PreToolUse, a healthy policy at the same revision, a
+    # decision that is still an ASK carrying a memo key, and a fingerprint plus
+    # approval identity that both match the record. Any mismatch retires the
+    # candidate and grants nothing.
+    try:
+        from core import approvals, engine, events, policy_health, presentation, store
+        # Consume first. Every terminal outcome, including tool failure and a
+        # verification mismatch, permanently retires this one-use candidate.
+        pending = approvals.consume_pending_approval(payload, session)
+        if payload.get("tool_error") or not pending:
+            return
+        policy = engine.load_policy(PLUGIN_ROOT)
+        if policy.health != policy_health.HEALTHY \
+                or policy.revision != pending["policy_revision"]:
+            return
+        if not engine.resolve_settings(policy).get("session_memory"):
+            return
+        decision = events.worst([
+            engine.evaluate(ev, policy, PLUGIN_ROOT) for ev in events_list
+        ])
+        if decision.action != events.ASK or not decision.memo_key \
+                or decision.policy_revision != policy.revision:
+            return
+        fingerprint = presentation.operation_fingerprint(
+            payload, events_list, policy.revision
+        )
+        identity = approvals.approval_identity(decision.memo_key, policy.revision)
+        if fingerprint != pending["operation_fingerprint"] \
+                or identity != pending["approval_identity"]:
+            return
+        store.session_approve(session, decision.memo_key)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -25,14 +25,57 @@ FAIL_CLOSED = {
 }
 
 
-from adapter_common import to_event  # noqa: E402
+from adapter_common import to_event, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
 
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 
 
+# Set once anything has reached stdout, so the fail-closed handler never
+# appends a second object to a stream that already carries a decision.
+_EMITTED = False
+
+
+def _emit(out):
+    """Write one decision object in a single, already-serialized write.
+
+    `json.dump` streams chunks straight at stdout: a failure partway through
+    leaves a truncated object, and the fail-closed handler then appends a whole
+    second one. The host can parse neither, and a decision it cannot parse is
+    no decision at all - which is an allow. Serializing first keeps stdout
+    untouched unless the whole object is ready.
+    """
+    global _EMITTED
+    text = json.dumps(out)
+    _EMITTED = True
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _unrecognized_tool_decision(label):
+    """Fail closed on a tool identity we cannot map to any guarded event.
+
+    An unmodeled tool name reaches the engine as events.OTHER, which DEFERs;
+    an empty stdout is a silent allow. The day the host renames Write or ships
+    a new file-mutating tool, that is exactly the wrong answer, so ask instead
+    and say why on stderr, where the host's hook log makes it diagnosable.
+    """
+    reason = unrecognized_tool_reason(label)
+    sys.stderr.write("agentic-guardrails: %s\n" % reason)
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason + ".",
+    }}
+
+
 def main():
     payload = json.load(sys.stdin)
+    unknown = unrecognized_tool(payload)
+    if unknown is not None:
+        _emit(_unrecognized_tool_decision(unknown))
+        return
     from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
         preimages, presentation, remediation, retention_policy, store
     from core.decisions import GuardrailDecision
@@ -179,17 +222,17 @@ def main():
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
         out = {"systemMessage": f"agentic-guardrails ({label}): would have "
                                 f"{decision.action.upper()} — {decision.reason}"}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
 
     action = effective.action
@@ -257,15 +300,27 @@ def main():
         )
 
     if out:
-        json.dump(out, sys.stdout)
+        _emit(out)
+
+
+def _fail_closed():
+    """Last-resort decision for a failure the evaluation path did not catch.
+
+    Only speaks if nothing already did. Appending a second object to a stream
+    that already carries a decision makes both unparseable, and a decision the
+    host cannot parse is no decision at all - which is an allow.
+    """
+    if _EMITTED:
+        return
+    try:
+        _emit(FAIL_CLOSED)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        try:
-            json.dump(FAIL_CLOSED, sys.stdout)
-        except Exception:
-            print(json.dumps(FAIL_CLOSED))
+        _fail_closed()
         sys.exit(0)

@@ -63,3 +63,70 @@ def to_event(payload):
                                     extra={"mcp_tool": tool, "input": ti}, **common)
         return events.ToolEvent(kind=events.MCP, extra={"input": ti}, **common)
     return events.ToolEvent(kind=events.OTHER, extra={"input": ti}, **common)
+
+
+# Every host tool this adapter is prepared to see. Two kinds of entry:
+#   * modeled - to_event() maps it onto a guarded ToolEvent kind;
+#   * inert   - it cannot read or modify a file and cannot run a command, so
+#               letting the engine DEFER on it is correct.
+# A name outside this set is not harmless by default: it means the host renamed
+# a tool we guard or shipped a new one, and the guardrails cannot say what it
+# does. PreToolUse turns that into an ASK rather than a silent allow.
+MODELED_TOOLS = frozenset({
+    "Bash", "PowerShell", "Monitor",      # shell execution -> EXEC
+    "Write",                              # file creation   -> WRITE
+    "Edit", "NotebookEdit",               # file mutation   -> EDIT
+    "Read",                               # file read       -> READ
+    "Glob", "Grep",                       # scoped search   -> READ
+})
+# Tools that neither execute a command nor touch the filesystem themselves.
+# Whatever they delegate to (a subagent's Bash, a slash command's Edit) arrives
+# as its own hook call and is guarded there.
+INERT_TOOLS = frozenset({
+    # planning and bookkeeping
+    "TodoWrite", "ExitPlanMode", "EnterPlanMode", "AskUserQuestion",
+    # delegation; the delegate's own tool calls re-enter this hook
+    "Task", "Agent", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+    "TaskStop", "SlashCommand", "Skill", "SendMessage",
+    # capability discovery (metadata only)
+    "ToolSearch", "ListSkills", "SearchSkills", "ListPlugins", "SearchPlugins",
+    # shell lifecycle; the command itself was guarded when Bash launched it
+    "BashOutput", "KillShell", "KillBash",
+    # directory listing and network reads
+    "LS", "WebFetch", "WebSearch",
+    # MCP plumbing (the mcp__* tools themselves are modeled above)
+    "ListMcpResourcesTool", "ReadMcpResourceTool",
+    # host-managed VCS plumbing; edits inside a worktree still arrive as Edit
+    "EnterWorktree", "ExitWorktree",
+    # published artifacts are not local files
+    "Artifact", "ArtifactComments", "ArtifactData",
+})
+KNOWN_TOOLS = MODELED_TOOLS | INERT_TOOLS
+
+# Label used when the payload carries no usable tool name at all.
+MISSING_TOOL = "(no tool_name)"
+
+
+def unrecognized_tool(payload):
+    """Return a label for a tool this adapter cannot model, else ``None``.
+
+    ``None`` means "recognized; evaluate normally". Any other return value is a
+    display label for the ASK. A missing, blank, or non-string ``tool_name`` is
+    unrecognized too: a call we cannot identify is a call we cannot guard.
+    """
+    tool = payload.get("tool_name") if isinstance(payload, dict) else None
+    if not isinstance(tool, str) or not tool.strip():
+        return MISSING_TOOL
+    tool = tool.strip()
+    if tool in KNOWN_TOOLS or tool.startswith("mcp__"):
+        return None
+    return tool
+
+
+def unrecognized_tool_reason(label):
+    """User-facing reason text for an unrecognized-tool ASK."""
+    if label == MISSING_TOOL:
+        return ("agentic-guardrails received a tool call with no tool name; "
+                "approve to proceed or update the plugin")
+    return ("agentic-guardrails does not recognize tool %r; approve to proceed "
+            "or update the plugin" % label)
