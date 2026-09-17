@@ -1025,6 +1025,34 @@ def test_mcp_tools_are_recognized_by_prefix():
     assert unrecognized_tool("not-a-dict") is not None
 
 
+def test_multiedit_stays_outside_the_claude_matcher_and_registry():
+    """`MultiEdit` is deliberately neither matched nor modeled.
+
+    The question comes up because a batched-edit tool would need mapping to
+    EDIT with the concatenated `edits[].new_string` content. The only record of
+    the name anywhere in this repo is the unrecognized-tool corpus above, where
+    it stands in for "a tool name the host does not send"; no doc, manifest,
+    policy, or fixture treats it as a live Claude Code tool. Adding it to the
+    matcher on that evidence would register a guard for a tool that never
+    arrives, and adding it to the registry would silently clear a name the
+    adapter has never seen a payload for.
+
+    If Claude Code ships it, this test is the place the decision gets revisited:
+    until then an unknown `MultiEdit` payload asks, which is the correct
+    fail-closed answer for a file mutation nobody modeled.
+    """
+    from claude.adapter_common import KNOWN_TOOLS, unrecognized_tool
+
+    manifest = json.loads(
+        open(os.path.join(REPO, "hooks", "hooks.json"), encoding="utf-8").read()
+    )
+    for lifecycle in ("PreToolUse", "PostToolUse"):
+        matcher = manifest["hooks"][lifecycle][0]["matcher"].split("|")
+        assert "MultiEdit" not in matcher, lifecycle
+    assert "MultiEdit" not in KNOWN_TOOLS
+    assert unrecognized_tool({"tool_name": "MultiEdit"}) == "MultiEdit"
+
+
 def test_matcher_tools_claude_models_never_prompt_as_unrecognized():
     """Every tool this adapter models must also be one the matcher delivers.
 

@@ -77,6 +77,18 @@ release must bump the version.
    the documented literal `tool_input.command` normalization contract; do not
    describe it as a live-host probe.
 
+   **Hook definition changed in this release.** `plugin/hooks/hooks-codex.json`
+   gained `shell`, `local_shell`, `exec_command`, and `write_stdin` in the
+   PreToolUse and PostToolUse matchers, so builds that emit Codex's native tool
+   names are guarded instead of running unmatched. Codex pins the exact hook
+   definition hash, and a *matcher* change moves that hash just as a command
+   change does: **every existing install must re-trust the hooks** (`/hooks` in
+   Codex CLI, or the desktop trust dialog) or Codex silently skips them and the
+   session runs unguarded. Say so at the top of the release notes, not in a
+   changelog tail - an install that quietly stops enforcing looks identical to
+   one that has nothing to enforce. Enterprise fleets shipping managed hooks via
+   `requirements.toml` must roll the updated definition out at the same time.
+
    Approval-copy tests must cover the maintained prompt families using only
    closed rule/context mappings and safe category/count labels. Raw commands,
    detailed paths, free-form reasons, exceptions, and audit canaries must never

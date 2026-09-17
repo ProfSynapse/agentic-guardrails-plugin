@@ -51,6 +51,50 @@ def test_maintained_hooks_register_every_shell_surface(manifest, lifecycle):
     assert {"Bash", "PowerShell", "Monitor"} <= set(matcher)
 
 
+# Codex builds differ in which tool names they emit: some send the Claude-style
+# names above, others send Codex's own exec surfaces. A matcher that lists only
+# the first set leaves every call in the second set unguarded - the hook never
+# fires, so there is no decision, no audit record, and no denial.
+CODEX_NATIVE_EXEC_TOOLS = {"shell", "local_shell", "exec_command", "write_stdin"}
+
+
+@pytest.mark.parametrize("lifecycle", ["PreToolUse", "PostToolUse"])
+def test_codex_hooks_register_every_native_exec_surface(lifecycle):
+    matcher = set(_hooks("hooks-codex.json")[lifecycle][0]["matcher"].split("|"))
+    assert CODEX_NATIVE_EXEC_TOOLS <= matcher
+    # The Claude-style names stay: a build may still send either spelling.
+    assert {"Bash", "PowerShell", "Monitor", "apply_patch"} <= matcher
+
+
+def test_codex_matcher_and_adapter_registry_agree_on_native_tools():
+    """Each native name the matcher delivers must be one the adapter models.
+
+    The matcher also carries Claude-style names Codex does not model
+    (`Write`/`Edit`/`NotebookEdit`): Codex routes mutation through
+    `apply_patch`, and if a build ever sent one of those, asking beats passing
+    it. That is deliberate and unchanged here. The native exec surfaces must
+    not join them - a tool that runs commands and only ever prompts is a tool
+    agents route around.
+    """
+    matcher = set(
+        _hooks("hooks-codex.json")["PreToolUse"][0]["matcher"].split("|")
+    )
+    assert CODEX_NATIVE_EXEC_TOOLS <= matcher
+    assert CODEX_NATIVE_EXEC_TOOLS <= set(codex_adapter.MODELED_TOOLS)
+    for name in CODEX_NATIVE_EXEC_TOOLS - {"write_stdin"}:
+        payload = {"tool_name": name,
+                   "tool_input": {"command": ["git", "status"],
+                                  "cmd": "git status"}}
+        assert codex_adapter.unrecognized_tool(payload) is None, name
+        evlist = to_events(dict(payload, cwd="/repo", session_id="c"))
+        assert [ev.kind for ev in evlist] == [events.EXEC], name
+        assert evlist[0].command == "git status", name
+    # write_stdin is always uninspectable by design: it asks on every call.
+    assert codex_adapter.unrecognized_tool(
+        {"tool_name": "write_stdin", "tool_input": {"chars": "y\n"}}
+    ) is not None
+
+
 @pytest.mark.parametrize("manifest,root_name", [
     ("hooks.json", "CLAUDE_PLUGIN_ROOT"),
     ("hooks-codex.json", "PLUGIN_ROOT"),

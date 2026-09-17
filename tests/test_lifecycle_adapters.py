@@ -50,6 +50,21 @@ def test_hooks_config_matches_shell_exec_tools():
             assert tool in matcher, f"{ev} does not cover the {tool} shell-exec tool"
 
 
+def test_codex_hooks_config_matches_native_shell_exec_tools():
+    # Codex builds may emit their own exec surfaces instead of the Claude-style
+    # names: `shell`/`local_shell` (argv list), `exec_command` (unified exec),
+    # and `write_stdin` (keystrokes into a running exec session). A name absent
+    # from the matcher never reaches the hook, so it runs completely unguarded.
+    hooks = json.loads(
+        Path(REPO, "hooks", "hooks-codex.json").read_text(encoding="utf-8")
+    )
+    for ev in ("PreToolUse", "PostToolUse"):
+        matcher = hooks["hooks"][ev][0]["matcher"].split("|")
+        for tool in ("Bash", "PowerShell", "Monitor",
+                     "shell", "local_shell", "exec_command", "write_stdin"):
+            assert tool in matcher, f"{ev} does not cover the {tool} tool"
+
+
 def test_sessionstart_bootstrap_failure_is_stable_and_forbids_cache_discovery():
     context = _context(_run(START, {"hook_event_name": "SessionStart"}))
     assert "launcher_unavailable" in context
