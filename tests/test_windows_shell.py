@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from core import engine, mutations, preimages
+from core import engine, mutations, powershell_bind, preimages
 from core.events import ALLOW, ASK, DENY, DEFER, EXEC, ToolEvent
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
@@ -551,3 +551,47 @@ def test_multi_line_benign_powershell_is_not_denied(evaluate):
     assert evaluate(
         "Copy-Item README.md README.bak `\n  -Force"
     ).action != DENY
+
+
+# ---- G4: an unresolvable path is a question, not an invariant ------------
+
+def _bind(command):
+    parsed = engine.extract_commands(command, dialect="powershell")
+    return powershell_bind.bind(parsed.commands[0].argv, "powershell")
+
+
+@pytest.mark.parametrize("command", [
+    "Set-Content @params",
+    "Remove-Item @splat",
+    "Set-Content -Path $target -Value 'hi'",
+    "Copy-Item -Path $source -Destination out.bak",
+    "Out-File -FilePath $log",
+    "Set-Content -Path -Value 'hi'",
+])
+def test_unresolvable_path_binding_is_askable(command):
+    binding = _bind(command)
+    assert binding.recognized and not binding.complete, command
+    assert binding.kind == powershell_bind.UNRESOLVED_PATH, command
+    assert binding.askable, command
+
+
+@pytest.mark.parametrize("command", [
+    "Set-Content --% -Path out.txt",
+    "Set-Content -Bogus x out.txt",
+    "Remove-Item a.txt b.txt c.txt d.txt",
+])
+def test_unsupported_command_shape_stays_fail_closed(command):
+    binding = _bind(command)
+    assert binding.recognized and not binding.complete, command
+    assert binding.kind == powershell_bind.UNSUPPORTED_SHAPE, command
+    assert not binding.askable, command
+
+
+def test_a_complete_binding_is_neither():
+    binding = _bind("Set-Content -Path out.txt -Value 'hi'")
+    assert binding.complete and binding.kind == "" and not binding.askable
+
+
+def test_unresolved_path_ask_line_names_the_way_forward():
+    assert powershell_bind.UNRESOLVED_PATH_ASK == (
+        "path could not be statically resolved; approve to proceed")
