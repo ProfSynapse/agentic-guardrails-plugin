@@ -633,10 +633,14 @@ class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
     def __init__(self, values=(), complete=True, reason="", covered=False,
-                 skipped=()):
+                 skipped=(), incomplete_kind=""):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
+        # Why the analysis is incomplete, as one of the powershell_bind kind
+        # constants. A caller routes on it: an unresolved path is a question
+        # for the user, an unsupported shape stays a fail-closed invariant.
+        self.incomplete_kind = incomplete_kind
         # True when a recognized mutator was fully analyzed but legitimately
         # needs no pre-image (for example mkdir -p on an existing directory).
         self.covered = covered
@@ -813,6 +817,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     absent_dir_roots = set()
     complete = True
     incomplete_reason = ""
+    incomplete_kind = ""
     covered = False
     skipped = []
     try:
@@ -853,6 +858,8 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                 continue
             if binding.recognized:
                 if not binding.complete:
+                    if complete:
+                        incomplete_kind = binding.kind
                     complete = False
                     incomplete_reason = incomplete_reason or binding.reason
                     continue
@@ -959,7 +966,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
     return TargetList(values, complete, incomplete_reason, covered=covered,
-                      skipped=skipped)
+                      skipped=skipped, incomplete_kind=incomplete_kind)
 
 
 def _zone_rule_for(path: str, policy: Policy):

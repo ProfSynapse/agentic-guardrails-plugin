@@ -49,6 +49,11 @@ _COPY_BY_RULE = {
         "Guardrails found a possible write call but could not confirm this invocation writes files.",
         "The script could change files that have no verified recovery copy.",
     ),
+    "builtin:powershell-path-unresolved": (
+        "The agent wants to write a file whose name the command supplies at run time.",
+        "Guardrails recognized the write but could not read its target path statically.",
+        "A file that cannot be named here may be created or replaced.",
+    ),
     "builtin:patch-opaque": (
         "The agent wants to apply a file change whose targets are unclear.",
         "Guardrails could not identify every file in the proposed change.",

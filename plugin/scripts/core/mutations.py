@@ -7,8 +7,13 @@ import hashlib
 import os
 import re
 
-from . import events, workflows
+from . import events, powershell_bind, workflows
 from .shellparse import ParseUncertain, extract_commands
+
+# Re-exported so an adapter can recognize the one incomplete plan that is a
+# question for the user rather than a fail-closed invariant, without reaching
+# past this planner for the binder's own constants.
+UNRESOLVED_PATH_ASK = powershell_bind.UNRESOLVED_PATH_ASK
 
 
 _LOCAL_MUTATION = re.compile(
@@ -737,6 +742,14 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
                     or _looks_locally_mutating(ev.command, dialect=dialect)
                 if not getattr(targets, "complete", True):
                     result.mutating = True
+                    if getattr(targets, "incomplete_kind", "") \
+                            == powershell_bind.UNRESOLVED_PATH:
+                        # A recognized write cmdlet whose path only exists at
+                        # run time (splatting, a variable, a here-string). The
+                        # operation is not itself dangerous, so it belongs at a
+                        # waivable review rather than a non-waivable invariant.
+                        result.review_required = True
+                        raise ValueError(powershell_bind.UNRESOLVED_PATH_ASK)
                     raise ValueError(getattr(targets, "reason", "") or
                                      "PowerShell target binding was incomplete")
                 if looks_mutating:

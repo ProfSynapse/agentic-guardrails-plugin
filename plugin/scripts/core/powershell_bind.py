@@ -151,6 +151,28 @@ def _literal(token: str) -> bool:
     return not any(char in token for char in "`$@{}[](),;|&*?")
 
 
+# A variable (`$path`), a splatted hashtable (`@params`) or a here-string body
+# names exactly one file that simply is not knowable yet — a question for the
+# user. Everything else `_literal` rejects is an ambiguity about *which* file:
+# a backtick escape whose meaning depends on what follows it, a wildcard that
+# may match many, an array or sub-expression. Those stay fail-closed.
+_RUNTIME_VALUE_CHARS = "$@"
+_AMBIGUOUS_VALUE_CHARS = "`{}[](),;|&*?"
+
+
+def _runtime_value(token: str) -> bool:
+    """Whether a non-literal value is merely deferred, not ambiguous."""
+    if token is None or token in {"SUBST_OUT", "--%"}:
+        return False
+    return (any(char in token for char in _RUNTIME_VALUE_CHARS)
+            and not any(char in token for char in _AMBIGUOUS_VALUE_CHARS))
+
+
+def _unbindable(reason: str, value: str) -> BindingResult:
+    """Report an unreadable value under the kind its shape earns."""
+    return _unresolved(reason) if _runtime_value(value) else _incomplete(reason)
+
+
 def _resolve_parameter(name: str, spec: CommandSpec):
     lowered = name.lower()
     if lowered in spec.parameters:
@@ -234,8 +256,8 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
                 f"PowerShell command did not identify a literal {role}"
             )
         if not _literal(value):
-            return _unresolved(
-                f"PowerShell {role} does not have a static literal value"
+            return _unbindable(
+                f"PowerShell {role} does not have a static literal value", value
             )
         targets.append(value)
 
@@ -244,16 +266,18 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
     if canonical in {"copy-item", "move-item"}:
         source = bound.get("path")
         if not source or not _literal(source):
-            return _unresolved(
-                "PowerShell source path uses a dynamic value or wildcard"
+            return _unbindable(
+                "PowerShell source path uses a dynamic value or wildcard",
+                source or "",
             )
         result.sources.append(source)
     if canonical == "new-item" and str(bound.get("itemtype", "")).lower() in {
             "symboliclink", "junction"}:
         source = bound.get("target")
         if not source or not _literal(source):
-            return _unresolved(
-                "PowerShell link creation did not identify a literal target path"
+            return _unbindable(
+                "PowerShell link creation did not identify a literal target path",
+                source or "",
             )
         result.sources.append(source)
     return result
