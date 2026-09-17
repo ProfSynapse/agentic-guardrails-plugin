@@ -73,3 +73,82 @@ def test_rf_on_a_read_only_head_schedules_no_pre_image(command, project,
     assert list(targets) == []
     action, reason = run_hook(command, project, agw_home)
     assert action == "allow", reason
+
+
+# --- xcopy / robocopy destinations ------------------------------------------
+
+def test_xcopy_schedules_a_pre_image_for_its_destination(project):
+    targets = engine.clobber_targets("xcopy notes.txt out.txt /Y", project,
+                                     dialect="powershell")
+    assert list(targets) == [os.path.join(project, "out.txt")]
+
+
+def test_an_xcopy_switch_is_not_read_as_the_destination(project):
+    targets = engine.clobber_targets("xcopy notes.txt out.txt /Y /I /E", project,
+                                     dialect="powershell")
+    assert list(targets) == [os.path.join(project, "out.txt")]
+
+
+def test_xcopy_into_a_directory_names_the_file_it_replaces(project):
+    with open(os.path.join(project, "dst", "notes.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    targets = engine.clobber_targets("xcopy notes.txt dst /Y", project,
+                                     dialect="powershell")
+    assert list(targets) == [os.path.join(project, "dst", "notes.txt")]
+
+
+def test_robocopy_schedules_a_pre_image_for_the_destination_it_replaces(project):
+    """`robocopy src dst` clobbers `dst/a.txt`, which is what gets snapshotted.
+
+    The destination *directory* is deliberately not the target: a directory has
+    no pre-image, so naming it would fail the snapshot step and deny every
+    routine copy instead of protecting anything.
+    """
+    with open(os.path.join(project, "dst", "a.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    targets = engine.clobber_targets("robocopy src dst /E", project,
+                                     dialect="powershell")
+    assert list(targets) == [os.path.join(project, "dst", "a.txt")]
+
+
+def test_a_robocopy_switch_is_not_read_as_a_positional(project):
+    """`_CMD_SWITCH_RE` matches one letter, so `/MIR` had to be filtered by `/`."""
+    with open(os.path.join(project, "dst", "a.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    for command in ("robocopy /NP src dst", "robocopy src dst /MIR /NP"):
+        targets = engine.clobber_targets(command, project, dialect="powershell")
+        assert list(targets) == [os.path.join(project, "dst", "a.txt")], command
+
+
+def test_robocopy_named_files_narrow_the_destination_set(project):
+    with open(os.path.join(project, "dst", "a.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    with open(os.path.join(project, "dst", "b.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    targets = engine.clobber_targets("robocopy src dst a.txt", project,
+                                     dialect="powershell")
+    assert list(targets) == [os.path.join(project, "dst", "a.txt")]
+
+
+def test_a_dynamic_bulk_copy_destination_is_incomplete(project):
+    targets = engine.clobber_targets("robocopy src $dest /E", project,
+                                     include_absent=True, dialect="powershell")
+    assert targets.complete is False
+
+
+def test_the_hook_still_allows_a_plain_bulk_copy(project, agw_home):
+    with open(os.path.join(project, "dst", "a.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("old\n")
+    action, reason = run_hook("robocopy src dst /E", project, agw_home,
+                              tool="PowerShell")
+    assert action == "allow", reason
+    archived = []
+    for base, _dirs, files in os.walk(os.path.join(agw_home, "archive")):
+        archived.extend(files)
+    assert any(name.endswith("a.txt") for name in archived), archived

@@ -665,6 +665,26 @@ def _absent_creation_root(path: str) -> str:
     return root
 
 
+# A bulk directory copy names no files, so the set it would overwrite has to
+# be read off the source. Only immediate entries are listed, and only that many
+# of them: the point is to protect the files a routine `robocopy src dst` would
+# replace, not to model every recursive switch. A deeper collision still has no
+# pre-image, which is the same gap the copy had before it was analyzed at all.
+_TREE_COPY_SCAN_LIMIT = 512
+
+
+def _tree_copy_sources(source: str) -> list:
+    """Immediate entries of a copied directory, for destination planning."""
+    try:
+        entries = sorted(os.listdir(source))[:_TREE_COPY_SCAN_LIMIT]
+    except OSError:
+        return []
+    # Files only: a subdirectory has no pre-image of its own, and naming one
+    # as a target would fail the pre-image step instead of protecting anything.
+    return [os.path.join(source, entry) for entry in entries
+            if os.path.isfile(os.path.join(source, entry))]
+
+
 def _covered_by_absent_root(path: str, roots: set[str]) -> bool:
     """Whether removing a planned absent ancestor also removes this path."""
     for root in roots:
@@ -960,6 +980,45 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                        if not a.startswith("-") and not _CMD_SWITCH_RE.fullmatch(a)]
                 if len(pos) >= 2:
                     targets.add(_abs(pos[-1]))
+            elif name in ("xcopy", "robocopy"):
+                # Both overwrite their destination and neither is modeled by
+                # the PowerShell binder. Their switches are multi-letter and
+                # `/`-prefixed (`/Y`, `/MIR`, `/XF`), so `_CMD_SWITCH_RE` —
+                # which matches one letter — would read `/MIR` as a path.
+                pos = [a for a in cmd.argv[1:]
+                       if not a.startswith("/") and not a.startswith("-")]
+                if len(pos) < 2:
+                    continue
+                # xcopy: `<source> <destination>`, destination last.
+                # robocopy: `<source> <destination> [files...]`, so the
+                # destination is the second positional and the rest name
+                # individual files inside it.
+                dest = pos[-1] if name == "xcopy" else pos[1]
+                sources = ([pos[0]] if name == "xcopy"
+                           else [os.path.join(pos[0], value) for value in pos[2:]])
+                if not _static_shell_path(dest) or any(
+                        not _static_shell_path(source) for source in sources):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        f"{name} source or destination uses runtime expansion or a wildcard"
+                    continue
+                covered = True
+                dest_abs = _abs(dest)
+                if os.path.isdir(dest_abs) or dest_abs in planned_dirs \
+                        or dest.endswith(("/", "\\")):
+                    # A directory destination is not itself replaced and has no
+                    # pre-image; the files copied into it are what get
+                    # clobbered. Naming the directory as a target instead would
+                    # fail the pre-image step and deny every routine copy.
+                    for source in (sources or _tree_copy_sources(_abs(pos[0]))):
+                        destination = os.path.join(
+                            dest_abs, os.path.basename(source)
+                        )
+                        if not _covered_by_absent_root(
+                                destination, absent_dir_roots):
+                            targets.add(destination)
+                else:
+                    targets.add(dest_abs)
     # [IO.File]::WriteAllText("path", ...) in the raw line or a wrapper payload.
     for text in [command] + (parsed.payloads if parsed else []):
         for m in _WRITEALLTEXT_RE.finditer(text):
