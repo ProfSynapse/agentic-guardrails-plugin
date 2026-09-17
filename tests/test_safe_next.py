@@ -2,6 +2,8 @@ import json
 import os
 import sys
 
+import pytest
+
 from core import mutations, remediation, store, workflows
 from core.decisions import GuardrailDecision
 from core.events import DENY, EXEC, Decision, ToolEvent
@@ -352,3 +354,94 @@ def test_a_capacity_denial_renders_the_reclaim_instruction_not_the_fallback():
     feedback = presentation.build_denial_feedback(decision, "", [_event()])
     assert "agw prune" in feedback
     assert "Propose a narrower, reversible operation" not in feedback
+
+
+# --- Interpreter wrappers -------------------------------------------------
+# `bash.exe -c "rm X"` and `wsl rm X` are denied by the inner `rm`, so the
+# advice must name the same host path a bare `rm X` would; two deletions in
+# one line (wrapped or not) still get no recommendation.
+
+def _ps_event(command, cwd=None):
+    return ToolEvent(
+        kind=EXEC, tool="PowerShell", command=command,
+        cwd=cwd or os.getcwd(),
+    )
+
+
+def test_bash_c_wrapped_delete_gets_the_inner_archive_advice():
+    event = _event('bash -c "rm -rf notes"')
+    advice = remediation.for_event(Decision(DENY, rule_id="builtin:rm"), event)
+
+    assert advice.safe_to_retry is True
+    assert advice.recommended_argv == (
+        "agw", "archive", os.path.join(event.cwd, "notes"),
+    )
+    assert advice.source.component == "engine"
+    assert advice.source.command_parse == "parsed-literal"
+    assert remediation.ASSUMPTION_WRAPPER_UNWRAPPED in advice.assumptions
+    assert advice.missing_fields == ()
+    assert "bash -c" not in str(advice.as_dict())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive-mount translation is Windows-only")
+def test_bash_exe_wrapped_delete_with_a_drive_path_is_translated_on_windows():
+    advice = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _ps_event('bash.exe -c "rm -rf F:/proj/.tmp/scratch"', cwd=r"F:\proj"),
+    )
+    assert advice.recommended_argv == ("agw", "archive", r"F:\proj\.tmp\scratch")
+
+    msys = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _ps_event('bash.exe -c "rm -rf /f/proj/.tmp/scratch"', cwd=r"F:\proj"),
+    )
+    assert msys.recommended_argv == ("agw", "archive", r"F:\proj\.tmp\scratch")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive-mount translation is Windows-only")
+def test_wsl_wrapped_delete_maps_the_mnt_path_back_to_the_drive():
+    advice = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _ps_event("wsl rm -rf /mnt/f/proj/.tmp/scratch", cwd=r"F:\proj"),
+    )
+    assert advice.safe_to_retry is True
+    assert advice.recommended_argv == ("agw", "archive", r"F:\proj\.tmp\scratch")
+    assert remediation.ASSUMPTION_WRAPPER_UNWRAPPED in advice.assumptions
+
+
+def test_wrapped_delete_of_a_path_with_no_host_equivalent_fails_closed():
+    # A distro-internal path is not reachable by `agw archive` on the host.
+    advice = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _ps_event("wsl rm -rf /home/me/scratch"),
+    )
+    assert advice.safe_to_retry is False
+    assert advice.recommended_argv == ()
+
+    home = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _event('bash -c "rm -rf ~/scratch"'),
+    )
+    assert home.recommended_argv == ()
+
+
+def test_wrapped_compound_deletion_still_gets_no_recommendation():
+    advice = remediation.for_event(
+        Decision(DENY, rule_id="builtin:rm"),
+        _event('bash -c "rm -rf a; rm -rf b"'),
+    )
+    assert advice.safe_to_retry is False
+    assert advice.recommended_argv == ()
+    assert "recommended_argv" in advice.missing_fields
+
+
+def test_wrapper_kind_classifies_every_recursed_interpreter_spelling():
+    from core.shellparse import wrapper_kind
+    assert wrapper_kind("bash") == "shell"
+    assert wrapper_kind("bash.exe") == "shell"
+    assert wrapper_kind(r'"C:\Program Files\Git\bin\bash.exe"') == "shell"
+    assert wrapper_kind("wsl") == "wsl"
+    assert wrapper_kind("cmd") == "cmd"
+    assert wrapper_kind("pwsh") == "pwsh"
+    assert wrapper_kind("rm") == ""
+    assert wrapper_kind("") == ""
