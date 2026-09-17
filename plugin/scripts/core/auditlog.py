@@ -6,7 +6,7 @@ not inspect or modify ``AGW_HOME`` or any legacy audit/quarantine artifacts.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import namedtuple
 
 
 SCHEMA = "agw-audit-disabled"
@@ -17,10 +17,11 @@ QUARANTINE_DIR = ""
 ALLOWED_OUTPUT_KEYS = frozenset()
 
 
-@dataclass(frozen=True)
-class AuditStatus:
-    ok: bool = True
-    code: str = "host-history"
+# A namedtuple rather than a dataclass: this module is imported on every hook
+# call and dataclasses pulls in inspect (about a dozen milliseconds) for a
+# two-field record that never changes.
+AuditStatus = namedtuple("AuditStatus", ("ok", "code"))
+AuditStatus.__new__.__defaults__ = (True, "host-history")
 
 
 _STATUS = AuditStatus()

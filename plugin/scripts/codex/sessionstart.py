@@ -78,13 +78,48 @@ def _health_warning(policy, policy_health) -> str:
             % (policy.health, f" ({packs})" if packs else ""))
 
 
+def _warm_bytecode():
+    """Compile the hook's modules once, so a call only ever reads bytecode.
+
+    Best effort and silent: compileall reports through its return value, and
+    with quiet=2 writes nothing to stdout, which carries this hook's JSON. The
+    dispatcher has already pointed sys.pycache_prefix at $AGW_HOME/pycache if
+    the plugin root cannot hold a __pycache__, so the bytecode lands where
+    the next call will look for it.
+    """
+    try:
+        import compileall
+        scripts = os.path.dirname(_HERE)
+        for name in ("core", "claude", "codex", "agw"):
+            directory = os.path.join(scripts, name)
+            if os.path.isdir(directory):
+                compileall.compile_dir(directory, quiet=2, force=False)
+        if sys.pycache_prefix:
+            # The prefix redirects the standard library's bytecode lookups as
+            # well, so seed it with every source module this process loaded
+            # (a superset of what a hook call imports). compile_file skips a
+            # module whose cached bytecode is already current.
+            for module in list(sys.modules.values()):
+                source = getattr(module, "__file__", None)
+                if isinstance(source, str) and source.endswith(".py"):
+                    try:
+                        compileall.compile_file(source, quiet=2, force=False)
+                    except Exception:  # noqa: BLE001 - per-file, best effort
+                        pass
+    except Exception:  # noqa: BLE001 - a cache is never worth a failed session
+        pass
+
+
 def main():
     note = ""
     warning = ""
     try:
         from core import engine, policy_health, store, workflows
         store.agw_home()  # ensures ~/.agw exists
-        policy = engine.load_policy(PLUGIN_ROOT)  # validates the policy packs
+        # Validates the policy packs and, when they are healthy, writes the
+        # persisted policy cache every later hook call reads instead of
+        # parsing the packs again.
+        policy = engine.load_policy(PLUGIN_ROOT)
         warning = _health_warning(policy, policy_health)
         cfg = engine.resolve_settings(policy)
         note = _LEVEL_NOTE.get(cfg.get("level"), "")
@@ -97,6 +132,9 @@ def main():
         warning = ("agentic-guardrails: could not load the guardrails policy "
                    "(%s). Every tool call will fail closed until this is fixed."
                    % type(exc).__name__)
+    # Independent of the policy outcome: a broken pack must not leave every
+    # later call recompiling as well.
+    _warm_bytecode()
     out = {"hookSpecificOutput": {
         "hookEventName": "SessionStart",
         "additionalContext": CONTEXT + note}}

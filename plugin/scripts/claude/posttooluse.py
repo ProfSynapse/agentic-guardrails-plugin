@@ -33,13 +33,17 @@ def main():
     # If this call corresponded to an access-type ask, the fact that it ran
     # means it was approved — remember it so we don't re-prompt this session.
     try:
-        from adapter_common import to_event
-        from core import approvals, engine, events, policy_health, presentation, store
         # Consume first. Every terminal outcome, including tool failure and a
         # verification mismatch, permanently retires this one-use candidate.
-        pending = approvals.consume_pending_approval(payload, session)
+        # The record is the sole gate, and on nearly every call there is none:
+        # check it with the light module before loading the engine, the store
+        # and the prompt renderers, which only the grant path below needs.
+        from core import pending_approvals
+        pending = pending_approvals.consume_pending_approval(payload, session)
         if payload.get("tool_error") or not pending:
             return
+        from adapter_common import to_event
+        from core import approvals, engine, events, policy_health, presentation, store
         policy = engine.load_policy(PLUGIN_ROOT)
         if policy.health != policy_health.HEALTHY \
                 or policy.revision != pending["policy_revision"]:

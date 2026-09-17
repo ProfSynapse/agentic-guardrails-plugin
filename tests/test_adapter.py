@@ -427,7 +427,14 @@ def test_host_history_boundary_never_persists_raw_command(tmp_path):
               "tool_input": {"command": "rm -rf /x && export AWS_KEY=AKIAIOSFODNN7EXAMPLE"},
               "cwd": "/tmp", "session_id": "t1", "hook_event_name": "PreToolUse"},
              env_extra={"AGW_HOME": str(home)})
-    assert not home.exists()
+    # The hook may leave its policy/profile caches behind (built from the
+    # policy packs, never from the event); nothing else, and nothing that
+    # carries the command.
+    persisted = [p for p in home.rglob("*") if p.is_file()] if home.exists() else []
+    assert all(p.name.endswith("-cache.json") for p in persisted), persisted
+    for path in persisted:
+        data = path.read_bytes()
+        assert b"AKIAIOSFODNN7EXAMPLE" not in data and b"rm -rf /x" not in data
 
 
 def test_shell_clobber_snapshots_pre_image(tmp_path):
