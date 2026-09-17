@@ -429,7 +429,7 @@ class Lock:
             self._close_gate()
 
 
-def _append_jsonl(path: str, record: dict):
+def _append_jsonl(path: str, record: dict, durable: bool = True):
     record.setdefault("schema_version", SCHEMA_VERSION)
     record.setdefault("ts", _ts())
     # Archive projections already carry the authoritative transaction creation
@@ -449,7 +449,8 @@ def _append_jsonl(path: str, record: dict):
             f.write("\n")
         f.write(line + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        if durable:
+            os.fsync(f.fileno())
 
 
 def _preserve_malformed_jsonl(path: str, line_number: int, raw: str,
@@ -500,21 +501,28 @@ def _read_jsonl_resilient(path: str) -> tuple[list, list]:
     return records, malformed
 
 
-def _append_jsonl_unique(path: str, record: dict) -> tuple[bool, list]:
+def _append_jsonl_unique(path: str, record: dict,
+                         durable: bool = True) -> tuple[bool, list]:
     records, malformed = _read_jsonl_resilient(path)
     transaction_id = record.get("transaction_id")
     if transaction_id and any(
             item.get("transaction_id") == transaction_id for item in records):
         return False, malformed
-    _append_jsonl(path, record)
+    _append_jsonl(path, record, durable=durable)
     return True, malformed
 
 
-def oplog_append(op: dict):
+def _oplog_append(op: dict, durable: bool) -> tuple[bool, list]:
     with Lock("oplog"):
         return _append_jsonl_unique(
-            os.path.join(agw_home(), "oplog.jsonl"), outcomes.project_record(op)
+            os.path.join(agw_home(), "oplog.jsonl"), outcomes.project_record(op),
+            durable=durable,
         )
+
+
+def oplog_append(op: dict):
+    """Durably append one operation record (restore, undo, mutation ...)."""
+    return _oplog_append(op, True)
 
 
 def oplog_read() -> list:
@@ -793,18 +801,20 @@ def _materialize_committed_transaction(transaction_id: str,
     file_dir = _file_dir(record["src"])
     manifest = os.path.join(file_dir, "manifest.jsonl")
     malformed = []
+    # Both indexes are projections of the durable COMMITTED manifest and are
+    # re-derived idempotently by recovery, so none of these writes is fsynced.
     with Lock(_folder_key(os.path.dirname(record["src"]))):
-        _appended, issues = _append_jsonl_unique(manifest, entry)
+        _appended, issues = _append_jsonl_unique(manifest, entry, durable=False)
         malformed.extend(issues)
     if crash_after == "DERIVED_INDEX_APPENDED":
         raise archive_tx.SimulatedCrash("simulated crash after DERIVED_INDEX_APPENDED")
-    archive_tx.update(agw_home(), transaction_id, derived_index=True)
+    archive_tx.note_derived(agw_home(), transaction_id, derived_index=True)
 
-    _appended, issues = oplog_append(entry)
+    _appended, issues = _oplog_append(entry, False)
     malformed.extend(issues)
     if crash_after == "DERIVED_OPLOG_APPENDED":
         raise archive_tx.SimulatedCrash("simulated crash after DERIVED_OPLOG_APPENDED")
-    archive_tx.update(agw_home(), transaction_id, derived_oplog=True)
+    archive_tx.note_derived(agw_home(), transaction_id, derived_oplog=True)
     return malformed
 
 

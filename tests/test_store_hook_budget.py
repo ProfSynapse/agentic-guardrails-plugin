@@ -298,3 +298,137 @@ def test_streamed_capture_refuses_a_digest_hint_that_no_longer_matches(tmp_path)
         )
     assert source.read_text(encoding="utf-8") == "current bytes"
     assert not dest.exists()
+
+
+# --- fsync batching ------------------------------------------------------------
+
+_PROC_FDS = os.path.isdir("/proc/self/fd")
+
+
+def _record_fsyncs(monkeypatch):
+    """Record what every fsync flushed, classified by the descriptor's path.
+
+    Inode numbers are reused as soon as an atomic replace frees them, so the
+    classification uses the path behind the descriptor (a manifest write is
+    fsynced on its temp before the rename) and, for manifests, the state
+    inside the file being flushed.
+    """
+    import json
+
+    real_fsync = os.fsync
+    events = []
+    home = store.agw_home()
+    transactions = os.path.join(home, "transactions")
+    archive = os.path.join(home, "archive") + os.sep
+    locks = os.path.join(home, "locks") + os.sep
+
+    def recording_fsync(fd):
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        if path == transactions:
+            kind, detail = "transactions-dir", ""
+        elif path.startswith(transactions + os.sep):
+            with open(path, encoding="utf-8") as handle:
+                kind, detail = "manifest", json.load(handle).get("state", "")
+        elif path.startswith(locks):
+            kind, detail = "lock", ""
+        elif path.startswith(archive):
+            kind = "artifact-dir" if os.path.isdir(path) else "artifact"
+            detail = path
+        else:
+            kind, detail = "other", path
+        events.append((kind, detail))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    return events
+
+
+@pytest.mark.skipif(not _PROC_FDS, reason="classifies fsyncs via /proc/self/fd")
+def test_copy_capture_fsyncs_the_artifact_then_the_commit_marker_last(
+        tmp_path, monkeypatch):
+    from core import archive_transactions as archive_tx
+
+    seed = tmp_path / "seed.txt"
+    seed.write_text("seed", encoding="utf-8")
+    store.archive_file(str(seed), mode="copy", retention_config=_unlimited())
+    target = tmp_path / "edited.txt"
+    target.write_text("about to be edited", encoding="utf-8")
+    events = _record_fsyncs(monkeypatch)
+    result = _prepare(target)
+    assert result.ok, result.reason
+    kinds = [kind for kind, _detail in events]
+    manifests = [detail for kind, detail in events if kind == "manifest"]
+    # One manifest fsync, and it is the commit marker.
+    assert manifests == [archive_tx.COMMITTED], events
+    assert kinds.count("artifact") == 1 and kinds.count("artifact-dir") == 1
+    assert kinds.count("transactions-dir") == 1
+    assert "other" not in kinds, events
+    # Order: artifact bytes, artifact directory entry, commit marker, its
+    # directory entry.
+    assert kinds.index("artifact") < kinds.index("artifact-dir") \
+        < kinds.index("manifest") < kinds.index("transactions-dir"), events
+    # After the commit marker only lock-owner metadata is flushed.
+    assert set(kinds[kinds.index("transactions-dir") + 1:]) <= {"lock"}, events
+    # Budget: lock owners (4) + artifact + artifact dir + manifest + its dir.
+    assert len(events) <= 8, events
+
+
+@pytest.mark.skipif(not _PROC_FDS, reason="classifies fsyncs via /proc/self/fd")
+def test_move_capture_makes_artifact_verified_durable_before_removing_source(
+        tmp_path, monkeypatch):
+    from core import archive_transactions as archive_tx
+
+    source = tmp_path / "moved.txt"
+    source.write_text("moved away", encoding="utf-8")
+    events = _record_fsyncs(monkeypatch)
+    real_remove = archive_tx._remove
+    seen = {}
+
+    def checked_remove(path, kind):
+        records = [item["record"] for item in store.discover_archive_transactions()
+                   if item.get("record")]
+        assert len(records) == 1
+        record = records[0]
+        kinds = [event_kind for event_kind, _detail in events]
+        seen["on_disk_state"] = record["state"]
+        seen["durable_manifest_states"] = [
+            detail for event_kind, detail in events if event_kind == "manifest"
+        ]
+        seen["artifact_durable"] = "artifact" in kinds
+        seen["artifact_dir_durable"] = "artifact-dir" in kinds
+        seen["marker_dir_durable"] = "transactions-dir" in kinds
+        return real_remove(path, kind)
+
+    monkeypatch.setattr(archive_tx, "_remove", checked_remove)
+    entry = store.archive_file(str(source), mode="move", retention_config=_unlimited())
+    assert not source.exists()
+    assert seen == {
+        "on_disk_state": archive_tx.ARTIFACT_VERIFIED,
+        "durable_manifest_states": [archive_tx.ARTIFACT_VERIFIED],
+        "artifact_durable": True,
+        "artifact_dir_durable": True,
+        "marker_dir_durable": True,
+    }
+    assert archive_tx.load(store.agw_home(), entry["transaction_id"])["state"] \
+        == archive_tx.COMMITTED
+    # The commit marker was flushed last, after the durable ARTIFACT_VERIFIED.
+    manifests = [detail for kind, detail in events if kind == "manifest"]
+    assert manifests[-1] == archive_tx.COMMITTED
+
+
+def test_bound_policy_revision_is_not_rewritten_after_commit(tmp_path, monkeypatch):
+    from core import archive_transactions as archive_tx
+
+    target = tmp_path / "bound.txt"
+    target.write_text("bound", encoding="utf-8")
+    entry = store.archive_file(
+        str(target), mode="copy", retention_config=_unlimited(),
+        policy_revision="rev-1",
+    )
+    manifest = archive_tx._manifest_path(store.agw_home(), entry["transaction_id"])
+    before = os.stat(manifest).st_ino
+    record = archive_tx.bind_policy_revision(store.agw_home(), entry["transaction_id"], "rev-1")
+    assert record["policy_revision"] == "rev-1"
+    assert os.stat(manifest).st_ino == before, "an already-bound manifest was rewritten"
+    with pytest.raises(ValueError, match="different policy revision"):
+        archive_tx.bind_policy_revision(store.agw_home(), entry["transaction_id"], "rev-2")

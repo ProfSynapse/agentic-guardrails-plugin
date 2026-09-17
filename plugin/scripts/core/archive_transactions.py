@@ -165,16 +165,26 @@ def _flush_directory(path: str):
         pass
 
 
-def _persist(home: str, record: dict):
+def _persist(home: str, record: dict, durable: bool = True):
+    """Atomically replace a manifest.
+
+    ``durable=False`` skips the file and directory fsync: the write is still
+    atomic and immediately visible to other processes, but a power loss may
+    roll it back to the previous durable manifest. Only intermediate states
+    whose loss recovery handles identically to the prior state use it; the
+    commit marker (and, in move mode, ARTIFACT_VERIFIED) is always durable.
+    """
     path = _manifest_path(home, record["transaction_id"])
     temp = path + f".{uuid.uuid4().hex}.tmp"
     with open(temp, "x", encoding="utf-8") as handle:
         json.dump(record, handle, ensure_ascii=False, sort_keys=True)
         handle.write("\n")
         handle.flush()
-        os.fsync(handle.fileno())
+        if durable:
+            os.fsync(handle.fileno())
     os.replace(temp, path)
-    _flush_directory(os.path.dirname(path))
+    if durable:
+        _flush_directory(os.path.dirname(path))
 
 
 def _persist_new(home: str, record: dict):
@@ -371,6 +381,22 @@ def update(home: str, transaction_id: str, **fields) -> dict:
     return record
 
 
+def note_derived(home: str, transaction_id: str, **fields) -> dict:
+    """Record derived-index bookkeeping without an fsync.
+
+    The compatibility indexes are re-materialized idempotently from
+    COMMITTED manifests, so losing one of these flags to a power loss costs
+    a repeated (deduplicated) append on the next recovery, never data.
+    """
+    record = load(home, transaction_id)
+    record.update(fields)
+    if record.get("fixed_id_transaction") is True:
+        _persist_fixed_update(home, record)
+    else:
+        _persist(home, record, durable=False)
+    return record
+
+
 def discover(home: str) -> list[dict]:
     """Return every manifest, including corrupt manifests as explicit errors."""
     root = _root(home)
@@ -518,12 +544,12 @@ def _remove(path: str, kind: str):
         os.unlink(path)
 
 
-def _transition(home: str, record: dict, state: str):
+def _transition(home: str, record: dict, state: str, durable: bool = True):
     record["state"] = state
     if record.get("fixed_id_transaction") is True:
         _persist_fixed_update(home, record)
     else:
-        _persist(home, record)
+        _persist(home, record, durable=durable)
 
 
 def _crash(crash_after: str | None, point: str):
@@ -610,10 +636,17 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
         "excluded_paths": excluded_paths,
         **({"fixed_id_transaction": True} if supplied_transaction_id else {}),
     }
+    # Durability plan for an ordinary (non fixed-id) capture: every manifest
+    # state before COMMITTED is written atomically but not fsynced. If power
+    # is lost, recovery sees the previous durable manifest (or none) and, in
+    # copy mode, the untouched source; nothing is lost because the caller
+    # only proceeds after COMMITTED is durable. Move mode additionally fsyncs
+    # ARTIFACT_VERIFIED, because the source is removed right after it.
+    batched = not supplied_transaction_id
     if supplied_transaction_id:
         _persist_new(home, record)
     else:
-        _persist(home, record)
+        _persist(home, record, durable=False)
     _crash(crash_after, PREPARING)
 
     if supplied_transaction_id:
@@ -637,13 +670,19 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
     if supplied_transaction_id:
         _persist_fixed_update(home, record)
     else:
-        _persist(home, record)
+        _persist(home, record, durable=False)
     os.replace(temp, dest)
-    _flush_directory(os.path.dirname(dest))
+    if not batched:
+        _flush_directory(os.path.dirname(dest))
     _crash(crash_after, "ARTIFACT_PUBLISHED")
     if _artifact_fingerprint(dest, artifact_kind) != (artifact_kind, digest, size):
         raise OSError("published archive artifact failed verification")
-    _transition(home, record, ARTIFACT_VERIFIED)
+    if mode == "move" and batched:
+        # The source is about to be removed: its replacement must be on disk
+        # first, so make the artifact's publication durable here.
+        _flush_directory(os.path.dirname(dest))
+    _transition(home, record, ARTIFACT_VERIFIED,
+                durable=not batched or mode == "move")
     _crash(crash_after, ARTIFACT_VERIFIED)
 
     if mode == "move":
@@ -654,9 +693,17 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
         record["source_action"] = "removed"
     else:
         record["source_action"] = "preserved"
-    _transition(home, record, SOURCE_MUTATED)
+    _transition(home, record, SOURCE_MUTATED, durable=not batched or mode == "move")
     _crash(crash_after, SOURCE_MUTATED)
-    _transition(home, record, COMMITTED)
+    # Commit marker. Invariant: this is the last thing flushed, and everything
+    # it vouches for is flushed before it, in order: the artifact's bytes
+    # (fsynced by the copy), the artifact's directory entry (flushed here),
+    # then the manifest and its directory. A reader that finds COMMITTED
+    # durable can therefore rely on the artifact; a reader that does not
+    # finds an earlier state whose recovery never deletes anything.
+    if batched:
+        _flush_directory(os.path.dirname(dest))
+    _transition(home, record, COMMITTED, durable=True)
     _crash(crash_after, COMMITTED)
     return entry_from_record(record)
 
@@ -699,6 +746,9 @@ def bind_policy_revision(home: str, transaction_id: str, policy_revision: str) -
     existing = str(record.get("policy_revision") or "")
     if existing and existing != policy_revision:
         raise ValueError("archive is already bound to a different policy revision")
+    if existing == policy_revision:
+        # Bound at creation and covered by the commit marker's fsync.
+        return record
     record["policy_revision"] = policy_revision
     _persist(home, record)
     return record
