@@ -90,6 +90,83 @@ def test_undo_move(tmp_path):
     assert src.exists() and not dest.exists()
 
 
+def test_undo_archive_restores_a_verified_copy_and_keeps_the_artifact(tmp_path):
+    f = tmp_path / "x.txt"
+    f.write_text("data")
+    entry = store.archive_file(str(f), mode="move")
+    result = store.undo_last()
+    assert result == {"undone": "archive", "restored": str(f),
+                      "transaction_id": entry["transaction_id"]}
+    assert f.read_text() == "data"
+    # The artifact is copied back, not moved out of the store.
+    assert os.path.exists(entry["dest"])
+    assert store.list_versions(str(f))[-1]["transaction_id"] == entry["transaction_id"]
+    undo_rows = [op for op in store.oplog_read() if op.get("op") == "undo"]
+    assert undo_rows[-1]["undid"]["transaction_id"] == entry["transaction_id"]
+    # The undo row is the durable marker: the same archive is never inverted
+    # twice, even though its artifact is still present.
+    f.unlink()
+    with pytest.raises(LookupError, match="nothing to undo"):
+        store.undo_last()
+    assert not f.exists()
+
+
+def test_undo_archive_refuses_a_tampered_artifact_and_leaves_it_in_place(tmp_path):
+    f = tmp_path / "x.txt"
+    f.write_text("data")
+    entry = store.archive_file(str(f), mode="move")
+    with open(entry["dest"], "w") as handle:
+        handle.write("tampered")
+    with pytest.raises(ValueError, match="failed verification"):
+        store.undo_last()
+    assert not f.exists()
+    assert os.path.exists(entry["dest"])
+    assert open(entry["dest"]).read() == "tampered"
+    assert not [op for op in store.oplog_read() if op.get("op") == "undo"]
+
+
+def test_undo_archive_refuses_to_displace_a_target_that_reappeared(tmp_path):
+    f = tmp_path / "x.txt"
+    f.write_text("data")
+    entry = store.archive_file(str(f), mode="move")
+    f.write_text("newer work")
+    with pytest.raises(FileExistsError, match="agw restore"):
+        store.undo_last()
+    assert f.read_text() == "newer work"
+    assert os.path.exists(entry["dest"])
+
+
+def test_undo_move_preserves_the_moved_content_in_the_store(tmp_path):
+    src = tmp_path / "a.txt"
+    src.write_text("1")
+    dest = tmp_path / "sub" / "b.txt"
+    store.logged_move(str(src), str(dest))
+    result = store.undo_last()
+    assert result["undone"] == "move" and result["restored"] == str(src)
+    assert src.read_text() == "1" and not dest.exists()
+    captured = store.list_versions(str(dest))
+    assert len(captured) == 1
+    assert captured[0]["transaction_id"] == result["transaction_id"]
+    assert captured[0]["retention_class"] == "safety_archive"
+    assert open(captured[0]["dest"]).read() == "1"
+    src.write_text("changed")
+    with pytest.raises(LookupError):
+        store.undo_last()
+
+
+def test_undo_last_runs_under_the_recovery_store_lock(tmp_path, monkeypatch):
+    f = tmp_path / "x.txt"
+    f.write_text("data")
+    store.archive_file(str(f), mode="move")
+    monkeypatch.setattr(store, "CLI_LOCK_TIMEOUT_S", 0.2)
+    with store.Lock("recovery-store", timeout=1.0):
+        with pytest.raises(TimeoutError):
+            store.undo_last()
+    assert not f.exists()
+    store.undo_last()
+    assert f.read_text() == "data"
+
+
 def test_pre_image_dedupe(tmp_path):
     f = tmp_path / "doc.txt"
     f.write_text("same content")

@@ -10,6 +10,7 @@ import uuid
 
 from . import archive_transactions as archive_tx
 from . import recovery_contracts
+from . import remediation
 from . import retention_policy
 from . import store
 
@@ -58,6 +59,12 @@ class PreimageResult:
     receipts: list[PreimageReceipt] = field(default_factory=list)
     reason: str = ""
     failed_target: str = ""
+    # Stable machine-readable failure class. ``recovery_store_busy`` marks a
+    # transient condition an adapter may surface as retryable.
+    error_code: str = ""
+
+
+ERROR_STORE_BUSY = "recovery_store_busy"
 
 
 def allocated_size(path: str, st=None) -> int:
@@ -89,13 +96,30 @@ def _nearest_existing_parent(path: str) -> str:
     return os.path.realpath(parent)
 
 
-def _plain_failure(path: str, detail: str) -> PreimageResult:
+def _plain_failure(path: str, detail: str, error_code: str = "") -> PreimageResult:
     name = os.path.basename(path) or path or "the target"
     return PreimageResult(
         False,
         reason=(f"Guardrails blocked this change because it could not create and verify "
                 f"a recovery point for {name}. {detail} Nothing was changed by this operation."),
         failed_target=path,
+        error_code=error_code,
+    )
+
+
+def _busy_failure(path: str) -> PreimageResult:
+    """The store lock did not free up inside the hook budget.
+
+    Returning a legible refusal here is what keeps the host from killing the
+    hook at its own deadline and running the tool call with no pre-image.
+    """
+    budget = store.hook_lock_budget_s()
+    return _plain_failure(
+        path,
+        "The recovery store is busy with another Guardrails operation and did "
+        f"not become available within {budget:g} seconds. Retry this same "
+        "change in a moment; nothing needs to be changed first.",
+        error_code=ERROR_STORE_BUSY,
     )
 
 
@@ -169,10 +193,11 @@ def prepare(targets, label: str, max_file_bytes: int,
         except OSError as exc:
             return _plain_failure(path, f"The file could not be read safely ({exc}).")
 
+    first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
         store.maintain_retention(
             policy=retention_config, incoming_bytes=required_bytes,
-            lock_context=store.Lock("recovery-store", timeout=30.0),
+            lock_context=store.hook_lock(),
         )
         if required_bytes:
             capacity_root = _nearest_existing_parent(
@@ -182,44 +207,58 @@ def prepare(targets, label: str, max_file_bytes: int,
                 return _plain_failure(
                     present[0][0], "The recovery store does not have enough free disk space."
                 )
-    except store.ArchiveCapacityError:
-        target = present[0][0] if present else (targets[0] if targets else "")
+    except store.ArchiveCapacityError as exc:
+        # Contract 3: this refusal must name the door out. The error code is
+        # embedded so hosts that only see the reason text can classify it.
         return _plain_failure(
-            target,
-            "The recovery store does not have enough configured capacity; "
-            "its protected rollback points cannot be pruned safely.",
+            first_target,
+            remediation.capacity_instruction(exc.details)
+            + f" (error code {remediation.CAPACITY_ERROR_CODE})",
+            error_code=remediation.CAPACITY_ERROR_CODE,
         )
+    except TimeoutError:
+        # Must precede OSError: TimeoutError is an OSError subclass.
+        return _busy_failure(first_target)
     except OSError as exc:
-        target = present[0][0] if present else (targets[0] if targets else "")
-        return _plain_failure(target, f"Recovery-store capacity could not be verified ({exc}).")
+        return _plain_failure(first_target, f"Recovery-store capacity could not be verified ({exc}).")
 
     for path, before_identity in present:
         try:
-            before_hash = store.file_sha256(path)
+            # Admission ran once above for every target; the store must not
+            # re-walk per file. Dedupe keeps an unchanged file from storing a
+            # second full copy: the verified newest version is refreshed and
+            # its hold extended to this capture's deadline instead.
             entry = store.archive_file(
-                path, mode="copy", dedupe=False,
+                path, mode="copy", dedupe=True,
                 reason=f"verified pre-image before {label}", actor="guardrails-hook",
                 retention_class="mutation_preimage",
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 retention_config=retention_config,
+                lock_context=store.hook_lock(),
+                policy_revision=policy_revision,
+                _admission_checked=True,
             )
             artifact = str(entry.get("dest") or "")
             transaction_id = str(entry.get("transaction_id") or "")
-            if not artifact or not transaction_id or not os.path.isfile(artifact):
+            before_hash = str(entry.get("sha256") or "")
+            if not artifact or not transaction_id or not before_hash \
+                    or not os.path.isfile(artifact):
                 return _plain_failure(path, "The recovery copy was not retrievable after it was created.")
             record = archive_tx.bind_policy_revision(
                 store.agw_home(), transaction_id, policy_revision
             )
-            if str(record.get("policy_revision") or "") != policy_revision:
+            if str(record.get("policy_revision") or "") != policy_revision \
+                    or str(record.get("sha256") or "") != before_hash:
                 return _plain_failure(
                     path, "The recovery copy was not bound to the active safety policy."
                 )
-            artifact_hash = store.file_sha256(artifact)
+            # The store hashed the source once while copying it and verified
+            # the published artifact once against that digest. The tamper
+            # gate here is the source's identity: any write between the first
+            # stat and the finished copy changes size, mtime or ctime.
             after_stat = os.stat(path, follow_symlinks=False)
-            after_hash = store.file_sha256(path)
-            if artifact_hash != before_hash or after_hash != before_hash \
-                    or _identity(after_stat) != before_identity:
+            if _identity(after_stat) != before_identity:
                 return _plain_failure(path, "The file changed while its recovery copy was being verified.")
             receipts.append(PreimageReceipt(
                 path, "PRESENT", artifact=artifact, sha256=before_hash,
@@ -228,6 +267,8 @@ def prepare(targets, label: str, max_file_bytes: int,
                 recovery_record_kind="archive",
                 recovery_record_state=str(record.get("state") or ""),
             ))
+        except TimeoutError:
+            return _busy_failure(path)
         except (OSError, ValueError, TypeError) as exc:
             return _plain_failure(path, f"The recovery copy could not be completed ({exc}).")
         except Exception:

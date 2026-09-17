@@ -57,6 +57,7 @@ REASON_NARROW = "narrow-reversible-operation"
 REASON_DECLINED = "approval-declined"
 REASON_PROVIDER = "approval-provider-unavailable"
 REASON_BOUNDED_DISCOVERY = "bounded-guardrails-discovery"
+REASON_CAPACITY = "reclaim-recovery-cache"
 _REASON_CODES = frozenset({
     REASON_ARCHIVE, REASON_WORKFLOW, REASON_DIRECT, REASON_INSPECT,
     REASON_SECRET, REASON_READ_ONLY, REASON_FILTERED_DELETE,
@@ -64,8 +65,67 @@ _REASON_CODES = frozenset({
     REASON_AUTHORIZED_COPY, REASON_CLOUD_DOCUMENT, REASON_OFFLINE,
     REASON_LAUNCHER, REASON_AGW_HELP, REASON_POLICY_HEALTH,
     REASON_REMOVE_SECRET, REASON_NARROW, REASON_DECLINED, REASON_PROVIDER,
-    REASON_BOUNDED_DISCOVERY,
+    REASON_BOUNDED_DISCOVERY, REASON_CAPACITY,
 })
+
+# The recovery store refuses to grow. The store raises this code; the
+# pre-image layer embeds it in its refusal text so a host that only sees the
+# decision reason can still recognize the condition.
+CAPACITY_ERROR_CODE = "archive_capacity_exceeded"
+CAPACITY_ENV_OVERRIDE = "AGW_ARCHIVE_MAX_BYTES"
+CAPACITY_POLICY_SETTING = "archive_max_bytes"
+
+
+def capacity_instruction(details=None) -> str:
+    """Return the door out of a full recovery cache.
+
+    Retrying the same or a "more direct" operation can never succeed here:
+    every remaining rollback point is protected. The only moves are a
+    human-gated prune or a larger cap, so the instruction names both.
+    """
+    details = dict(details or {})
+    try:
+        maximum = int(details.get("maximum_bytes") or 0)
+    except (TypeError, ValueError):
+        maximum = 0
+    try:
+        required = int(details.get("required_free_bytes") or 0)
+    except (TypeError, ValueError):
+        required = 0
+    sizing = ""
+    if maximum > 0:
+        sizing = f" The cap is {maximum:,} bytes"
+        if required > 0:
+            sizing += f" and this change needs {required:,} more"
+        sizing += "."
+    return (
+        "The recovery cache has reached its configured capacity and its "
+        "remaining rollback points are protected, so no new pre-image can be "
+        "stored." + sizing + " Do not "
+        "retry the same change yet. Ask the user to run `agw status` and then "
+        "`agw prune --yes-i-am-a-human` to reclaim expired pre-images, or to "
+        f"raise the cap with the {CAPACITY_ENV_OVERRIDE} environment variable "
+        f"(or `{CAPACITY_POLICY_SETTING}` in the policy settings). Then retry "
+        "the same change."
+    )
+
+
+def is_capacity_denial(decision) -> bool:
+    return CAPACITY_ERROR_CODE in str(getattr(decision, "reason", "") or "")
+
+
+def _capacity_advice(rule_id: str, event=None) -> SafeNext:
+    kind = getattr(event, "kind", "") if event is not None else ""
+    cwd = getattr(event, "cwd", "") if event is not None else ""
+    return SafeNext(
+        REASON_CAPACITY,
+        requires_user_choice=True,
+        source=RemediationSource(
+            "engine", rule_id, kind, COMMAND_UNAVAILABLE,
+            CWD_EVENT if cwd else CWD_MISSING,
+        ),
+        missing_fields=("recommended_argv",),
+    )
 
 
 @dataclass(frozen=True)
@@ -323,6 +383,10 @@ def for_event(decision, event) -> Optional[SafeNext]:
     if getattr(decision, "action", "") != events.DENY:
         return None
     rule_id = str(getattr(decision, "rule_id", "") or "")
+    if is_capacity_denial(decision):
+        # A full store is not a "be more specific" problem; the direct-retry
+        # advice the prestate rule normally carries would loop forever.
+        return _capacity_advice(rule_id, event)
     parsed = _literal_event(event)
     if parsed is None:
         return incomplete(rule_id, event)
@@ -370,10 +434,14 @@ def for_events(decision, evlist) -> Optional[SafeNext]:
     """Public adapter seam; multiple events never have their argv combined."""
     events_list = list(evlist or ())
     if len(events_list) != 1:
+        if getattr(decision, "action", "") != events.DENY:
+            return None
+        rule_id = str(getattr(decision, "rule_id", "") or "")
+        if is_capacity_denial(decision):
+            return _capacity_advice(rule_id)
         return incomplete(
-            str(getattr(decision, "rule_id", "") or ""),
-            component="decision-fallback", extra_missing=("single_event",),
-        ) if getattr(decision, "action", "") == events.DENY else None
+            rule_id, component="decision-fallback", extra_missing=("single_event",),
+        )
     return for_event(decision, events_list[0])
 
 

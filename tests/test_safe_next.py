@@ -279,3 +279,45 @@ def test_multiple_events_never_combine_recommendations():
     assert advice.safe_to_retry is False
     assert advice.recommended_argv == ()
     assert "single_event" in advice.missing_fields
+
+
+def test_capacity_instruction_names_prune_and_the_cap_override():
+    text = remediation.capacity_instruction({
+        "maximum_bytes": 20 * 1024 * 1024, "required_free_bytes": 4096,
+    })
+    assert "agw prune" in text
+    assert "--yes-i-am-a-human" in text
+    assert "agw status" in text
+    assert "AGW_ARCHIVE_MAX_BYTES" in text
+    assert "archive_max_bytes" in text
+    assert "20,971,520" in text and "4,096" in text
+    assert "Retry with one direct" not in text
+    # Robust to missing or malformed details.
+    assert "agw prune" in remediation.capacity_instruction(None)
+    assert "agw prune" in remediation.capacity_instruction({"maximum_bytes": "x"})
+
+
+def test_capacity_denial_gets_reclaim_advice_not_direct_retry():
+    reason = (
+        "Guardrails blocked this change because it could not create and verify "
+        "a recovery point for a.txt. " + remediation.capacity_instruction({})
+        + f" (error code {remediation.CAPACITY_ERROR_CODE})"
+    )
+    decision = Decision(DENY, reason, "invariant:prestate-unavailable")
+    from core.events import EDIT, ToolEvent
+    event = ToolEvent(kind=EDIT, tool="Edit", paths=["a.txt"], cwd=os.getcwd())
+
+    advice = remediation.for_event(decision, event)
+    assert advice.reason_code == remediation.REASON_CAPACITY
+    assert advice.requires_user_choice is True
+    assert advice.safe_to_retry is False
+    assert advice.recommended_argv == ()
+    assert advice.source.rule_id == "invariant:prestate-unavailable"
+    assert remediation.for_events(decision, [event]).reason_code \
+        == remediation.REASON_CAPACITY
+    assert remediation.for_events(decision, [event, event]).reason_code \
+        == remediation.REASON_CAPACITY
+
+    # An ordinary prestate refusal keeps the direct-operation advice.
+    plain = Decision(DENY, "could not identify the target", "invariant:prestate-unavailable")
+    assert remediation.for_event(plain, event).reason_code == remediation.REASON_DIRECT
