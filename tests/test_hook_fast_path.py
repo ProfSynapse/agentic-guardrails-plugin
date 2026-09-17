@@ -324,3 +324,66 @@ def test_sensitive_reads_still_ask_through_the_hook(host, tmp_path):
         assert result.returncode == 0
         # Codex resolves ASK through the headless provider, which denies.
         assert _decision(result) == ("ask" if host == "claude" else "deny"), (path, result.stdout)
+
+
+# --- P3: bytecode survives a root that cannot hold a __pycache__ -------------
+
+def _pycache_files(home):
+    return list((home / "pycache").rglob("*.pyc")) if (home / "pycache").exists() else []
+
+
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_sessionstart_compiles_into_agw_home_when_bytecode_writes_are_off(
+        host, plain_file, tmp_path):
+    """PYTHONDONTWRITEBYTECODE stands in for a read-only plugin root: nothing
+    may be written next to the sources, so every call would recompile."""
+    home = tmp_path / "home"
+    env = {"AGW_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1"}
+    result = _run(host, "sessionstart", {"hook_event_name": "SessionStart"}, env_extra=env)
+    assert result.returncode == 0
+    assert "agentic-guardrails is active" in json.loads(result.stdout)[
+        "hookSpecificOutput"]["additionalContext"]  # stdout is still one clean object
+    names = {path.name.split(".")[0] for path in _pycache_files(home)}
+    assert {"readfast", "readscan", "policycache", "engine", "store", "sessionstart"} <= names
+    # ...and the next call reads its code from there instead of compiling.
+    read = _run(host, "pretooluse", _payload("Read", file_path=plain_file),
+                verbose=True, env_extra=env)
+    assert read.returncode == 0
+    assert _decision(read) == "defer", read.stdout
+    loaded_from = re.findall(r"# code object from '([^']+)'", read.stderr)
+    assert any(path.startswith(str(home / "pycache")) and "readfast" in path
+               for path in loaded_from), loaded_from[-5:]
+
+
+def test_a_writable_root_keeps_its_default_pycache(tmp_path):
+    home = tmp_path / "home"
+    result = _run("claude", "sessionstart", {"hook_event_name": "SessionStart"},
+                  env_extra={"AGW_HOME": str(home)})
+    assert result.returncode == 0
+    assert not (home / "pycache").exists()
+    assert os.path.isdir(os.path.join(SCRIPTS, "core", "__pycache__"))
+
+
+@pytest.mark.skipif(os.name == "nt" or getattr(os, "geteuid", lambda: 0)() == 0,
+                    reason="mode bits do not bind root or Windows")
+def test_a_read_only_plugin_root_routes_bytecode_to_agw_home(tmp_path):
+    import shutil
+    import stat
+    root = tmp_path / "ro-plugin"
+    shutil.copytree(REPO, root, ignore=shutil.ignore_patterns("__pycache__"))
+    for dirpath, _dirs, _files in os.walk(root):
+        os.chmod(dirpath, stat.S_IRUSR | stat.S_IXUSR)
+    home = tmp_path / "home"
+    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(root), PLUGIN_ROOT=str(root),
+               AGW_HOME=str(home))
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    try:
+        result = subprocess.run(
+            [sys.executable, str(root / "scripts" / "claude" / "_dispatch.py"), "sessionstart"],
+            input="{}", capture_output=True, text=True, env=env, timeout=60)
+        assert result.returncode == 0
+        assert {p.name.split(".")[0] for p in _pycache_files(home)} >= {"engine", "readfast"}
+        assert not list(root.rglob("__pycache__"))
+    finally:
+        for dirpath, _dirs, _files in os.walk(root):
+            os.chmod(dirpath, stat.S_IRWXU)

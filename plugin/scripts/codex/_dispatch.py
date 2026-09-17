@@ -35,6 +35,28 @@ def _configure_utf8_stdio():
             reconfigure(encoding="utf-8", errors=errors)
 
 
+def _route_bytecode_cache():
+    """Point bytecode at $AGW_HOME/pycache when the default cache is unusable.
+
+    A plugin root that is read-only (Program Files, a locked-down install, an
+    AV that blocks .pyc writes) or an interpreter told not to write bytecode
+    makes every hook call recompile every module it imports, which costs more
+    than the whole decision. SessionStart compiles the scripts into the same
+    location this selects, so a call only ever reads. When the default
+    __pycache__ next to the sources is writable, nothing changes.
+    """
+    try:
+        core = os.path.join(os.path.dirname(_HERE), "core")
+        default = os.path.join(core, "__pycache__")
+        usable = os.access(default if os.path.isdir(default) else core, os.W_OK)
+        if usable and not sys.dont_write_bytecode:
+            return
+        home = os.environ.get("AGW_HOME") or os.path.join(os.path.expanduser("~"), ".agw")
+        sys.pycache_prefix = os.path.join(home, "pycache")
+    except Exception:  # noqa: BLE001 - a cache decision must never break a hook
+        pass
+
+
 def _ask(reason):
     """Emit a PreToolUse ASK decision. No-op for events that cannot block."""
     if EVENT != "pretooluse":
@@ -66,6 +88,7 @@ def main():
         return
     try:
         _configure_utf8_stdio()
+        _route_bytecode_cache()
         sys.argv = [target]
         runpy.run_path(target, run_name="__main__")
     except SystemExit:
