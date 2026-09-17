@@ -561,15 +561,11 @@ def _size_or_zero(path: str) -> int:
         return 0
 
 
-def _latest_indexed_version(src: str, file_dir: str, digest: str = ""):
-    """Return the verified newest version of ``src`` using only its own index.
+def _newest_index_row(file_dir: str):
+    """The per-file index row with the highest version, or ``None``.
 
-    ``list_versions`` scans every transaction manifest in the store; this
-    reads the per-file ``manifest.jsonl``, loads the one authoritative record
-    it names, and verifies it. If the index lags the directory (a crash
-    between COMMITTED and the derived append) the newest version is unknown
-    and ``None`` is returned so the caller stores a fresh copy. With
-    ``digest`` a content mismatch returns early before the artifact is read.
+    ``None`` also when the index lags the directory (a crash between
+    COMMITTED and the derived append): the newest version is then unknown.
     """
     manifest = os.path.join(file_dir, "manifest.jsonl")
     if not os.path.exists(manifest):
@@ -580,6 +576,21 @@ def _latest_indexed_version(src: str, file_dir: str, digest: str = ""):
         return None
     newest = max(rows, key=lambda row: int(row.get("version") or 0))
     if int(newest.get("version") or 0) < _next_version(file_dir) - 1:
+        return None
+    return newest
+
+
+def _latest_indexed_version(src: str, file_dir: str, digest: str = "",
+                            newest=None):
+    """Return the verified newest version of ``src`` using only its own index.
+
+    ``list_versions`` scans every transaction manifest in the store; this
+    reads the per-file ``manifest.jsonl``, loads the one authoritative record
+    it names, and verifies it. With ``digest`` a content mismatch returns
+    early before the artifact is read.
+    """
+    newest = newest or _newest_index_row(file_dir)
+    if newest is None:
         return None
     if digest and newest.get("sha256") != digest:
         return None
@@ -598,9 +609,25 @@ def _latest_indexed_version(src: str, file_dir: str, digest: str = ""):
     return entry
 
 
+def _dedupe_digest(src: str, newest) -> str:
+    """Hash the source for dedupe only when the newest version could match.
+
+    A size difference is a certain miss, so the common edit (content grew or
+    shrank) costs no extra read of the source.
+    """
+    if newest is None:
+        return ""
+    try:
+        if int(newest.get("size") or 0) != int(os.path.getsize(src)):
+            return ""
+        return file_sha256(src)
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
 def _dedupe_candidate(src: str, file_dir: str, digest: str,
-                      retention_class: str, policy_revision: str):
-    last = _latest_indexed_version(src, file_dir, digest)
+                      retention_class: str, policy_revision: str, newest=None):
+    last = _latest_indexed_version(src, file_dir, digest, newest)
     if not last or last.get("sha256") != digest:
         return None
     if retention_class and last.get("retention_class") != retention_class:
@@ -637,7 +664,8 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     if not os.path.lexists(src):
         raise FileNotFoundError(src)
     link = archive_tx.link_metadata(src)
-    digest = file_sha256(src) if link is None and os.path.isfile(src) else ""
+    ordinary_file = link is None and os.path.isfile(src)
+    digest = ""
     try:
         incoming_bytes = int(os.path.getsize(src)) if os.path.isfile(src) \
             else int(archive_tx.artifact_fingerprint(src)[2])
@@ -655,9 +683,13 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
             # Directory publication shares parents with every archive from this
             # source folder, so it belongs inside the same lock as versioning.
             file_dir = _file_dir(src)
+            if dedupe and ordinary_file:
+                newest = _newest_index_row(file_dir)
+                digest = _dedupe_digest(src, newest)
             if dedupe and digest:
                 last = _dedupe_candidate(
-                    src, file_dir, digest, retention_class, policy_revision
+                    src, file_dir, digest, retention_class, policy_revision,
+                    newest,
                 )
                 if last is not None:
                     if retention_class == "mutation_preimage":
@@ -687,6 +719,7 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                 capture_group_id=capture_group_id,
                 transaction_id=_transaction_id,
                 recovery_source_identity=_recovery_source_identity,
+                source_sha256=digest,
             )
         _materialize_committed_transaction(entry["transaction_id"], _crash_after)
         _account_archive_growth_locked(

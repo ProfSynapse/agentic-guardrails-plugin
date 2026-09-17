@@ -305,10 +305,12 @@ def test_preimage_hash_read_failure_is_hard_failure(tmp_path, monkeypatch):
     target = tmp_path / "unreadable.txt"
     target.write_text("content")
 
-    def fail_hash(path):
+    def fail_read(source, destination):
         raise OSError("simulated read failure")
 
-    monkeypatch.setattr(preimages.store, "file_sha256", fail_hash)
+    # The source is read exactly once, by the hashing copy; a read failure
+    # there must surface as a hard, legible refusal.
+    monkeypatch.setattr(preimages.archive_tx, "_copy_file_hashed", fail_read)
     result = preimages.prepare(
         [str(target)], "test edit", 1024, policy_revision="test-revision"
     )

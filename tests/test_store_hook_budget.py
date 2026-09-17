@@ -224,3 +224,77 @@ def test_dedupe_never_crosses_policy_revisions(tmp_path):
     # A stale index must not make an older version look newest.
     versions = [entry["version"] for entry in store.list_versions(str(target))]
     assert versions == [1, 2]
+
+
+# --- single-pass capture -------------------------------------------------------
+
+def _count_read_opens(monkeypatch, target: str):
+    import builtins
+
+    real_open = builtins.open
+    counts = {"source": 0, "artifact": 0}
+    archive_root = os.path.join(store.agw_home(), "archive")
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, str) and "r" in mode and "+" not in mode:
+            if os.path.abspath(file) == target:
+                counts["source"] += 1
+            elif os.path.abspath(file).startswith(archive_root + os.sep) \
+                    and not os.path.basename(file).endswith(".jsonl"):
+                counts["artifact"] += 1
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    return counts
+
+
+def test_prepare_reads_the_source_once_and_the_artifact_once(tmp_path, monkeypatch):
+    target = tmp_path / "once.txt"
+    target.write_bytes(b"x" * 70_000)
+    counts = _count_read_opens(monkeypatch, str(target))
+    result = _prepare(target)
+    during_prepare = dict(counts)
+    assert result.ok, result.reason
+    assert during_prepare == {"source": 1, "artifact": 1}, during_prepare
+    receipt = result.receipts[0]
+    assert receipt.sha256 == store.file_sha256(str(target))
+    assert store.file_sha256(receipt.artifact) == receipt.sha256
+    assert preimages.receipt_valid(receipt, "rev-1")
+
+
+def test_prepare_refuses_a_source_that_changes_while_it_is_copied(
+        tmp_path, monkeypatch):
+    from core import archive_transactions as archive_tx
+
+    target = tmp_path / "moving.txt"
+    target.write_text("first draft", encoding="utf-8")
+    real_copy = archive_tx._copy_file_hashed
+
+    def copy_then_mutate(source, destination):
+        result = real_copy(source, destination)
+        with open(source, "a", encoding="utf-8") as handle:
+            handle.write(" plus a late write")
+        return result
+
+    monkeypatch.setattr(archive_tx, "_copy_file_hashed", copy_then_mutate)
+    result = _prepare(target)
+    assert result.ok is False
+    assert "changed while its recovery copy was being verified" in result.reason
+    assert result.failed_target == str(target)
+    assert target.read_text(encoding="utf-8") == "first draft plus a late write"
+
+
+def test_streamed_capture_refuses_a_digest_hint_that_no_longer_matches(tmp_path):
+    from core import archive_transactions as archive_tx
+
+    source = tmp_path / "hinted.txt"
+    source.write_text("current bytes", encoding="utf-8")
+    dest = tmp_path / "store" / "v001_hinted.txt"
+    dest.parent.mkdir()
+    with pytest.raises(OSError, match="source changed before capture"):
+        archive_tx.create_archive(
+            store.agw_home(), str(source), str(dest), "copy", 1,
+            source_sha256="0" * 64,
+        )
+    assert source.read_text(encoding="utf-8") == "current bytes"
+    assert not dest.exists()

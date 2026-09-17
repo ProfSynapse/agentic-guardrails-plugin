@@ -433,6 +433,41 @@ def artifact_fingerprint(path: str) -> tuple[str, str, int]:
     return _fingerprint(path)
 
 
+def _source_kind(path: str) -> str:
+    """Classify a source without reading its content."""
+    if link_metadata(path) is not None:
+        return "link"
+    if os.path.isfile(path):
+        return "file"
+    if os.path.isdir(path):
+        return "directory"
+    raise OSError(f"archive source is not a readable file, folder, or link: {path}")
+
+
+def _copy_file_hashed(source: str, destination: str) -> tuple[str, int]:
+    """Copy one regular file, hashing the bytes as they stream through.
+
+    The digest describes exactly the bytes written to ``destination``, so the
+    source is read once and the published artifact is verified once instead
+    of the source being hashed before and after a separate copy. The copy is
+    fsynced here because it is the recovery point the caller will rely on.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(source, "rb") as reader, open(destination, "xb") as writer:
+        for chunk in iter(lambda: reader.read(1 << 20), b""):
+            digest.update(chunk)
+            writer.write(chunk)
+            size += len(chunk)
+        writer.flush()
+        os.fsync(writer.fileno())
+    try:
+        shutil.copystat(source, destination)
+    except OSError:
+        pass
+    return digest.hexdigest(), size
+
+
 def _artifact_fingerprint(path: str, artifact_kind: str) -> tuple[str, str, int]:
     if artifact_kind != "link-metadata":
         return _fingerprint(path)
@@ -504,11 +539,18 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
                    protected_until_ns: int = 0,
                    capture_group_id: str = "",
                    transaction_id: str = "",
-                   recovery_source_identity=None) -> dict:
+                   recovery_source_identity=None,
+                   source_sha256: str = "") -> dict:
     """Create and commit one archive transaction.
 
     The source is never removed until a published artifact has been verified
     and ARTIFACT_VERIFIED is durably persisted.
+
+    An ordinary file is captured in one streaming pass: its digest is taken
+    from the bytes copied, recorded in the manifest before publication, and
+    checked once against the published artifact. ``source_sha256`` is an
+    optional digest the caller already holds; a mismatch with the streamed
+    digest means the source changed under us and the capture is refused.
     """
     if mode not in {"copy", "move"}:
         raise ValueError("archive mode must be 'copy' or 'move'")
@@ -525,7 +567,13 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
     src = os.path.abspath(src)
     dest = os.path.abspath(dest)
     excluded_paths = [os.path.realpath(home), os.path.realpath(dest)]
-    kind, digest, size = _fingerprint(src, excluded_paths)
+    kind = _source_kind(src)
+    streamed = kind == "file" and not supplied_transaction_id
+    if streamed:
+        # Filled in by the teed copy below, before publication.
+        digest, size = "", 0
+    else:
+        kind, digest, size = _fingerprint(src, excluded_paths)
     link = link_metadata(src) if kind == "link" else None
     if link and link.get("link_type") == "junction":
         _validate_junction_command_paths(src, link.get("target", ""))
@@ -573,9 +621,16 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
             raise ValueError("fixed-id publication rollback capture requires a file")
         preparation_identity = _allocate_fixed_preparation(home, record)
         _write_fixed_preparation(record, preparation_identity)
+    elif streamed:
+        digest, size = _copy_file_hashed(src, temp)
+        if source_sha256 and digest != source_sha256:
+            raise OSError("source changed before capture; source was preserved")
+        record["sha256"] = digest
+        record["size"] = size
     else:
         _copy(src, temp, kind, excluded_paths, link=link)
-    if _artifact_fingerprint(temp, artifact_kind) != (artifact_kind, digest, size):
+    if not streamed and _artifact_fingerprint(temp, artifact_kind) \
+            != (artifact_kind, digest, size):
         raise OSError("temporary archive artifact did not match its source")
     # Persist verification metadata while still PREPARING so a crash immediately
     # after publish can be discovered and verified without trusting filenames.

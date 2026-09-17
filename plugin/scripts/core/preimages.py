@@ -220,7 +220,6 @@ def prepare(targets, label: str, max_file_bytes: int,
 
     for path, before_identity in present:
         try:
-            before_hash = store.file_sha256(path)
             # Admission ran once above for every target; the store must not
             # re-walk per file. Dedupe keeps an unchanged file from storing a
             # second full copy: the verified newest version is refreshed and
@@ -238,20 +237,24 @@ def prepare(targets, label: str, max_file_bytes: int,
             )
             artifact = str(entry.get("dest") or "")
             transaction_id = str(entry.get("transaction_id") or "")
-            if not artifact or not transaction_id or not os.path.isfile(artifact):
+            before_hash = str(entry.get("sha256") or "")
+            if not artifact or not transaction_id or not before_hash \
+                    or not os.path.isfile(artifact):
                 return _plain_failure(path, "The recovery copy was not retrievable after it was created.")
             record = archive_tx.bind_policy_revision(
                 store.agw_home(), transaction_id, policy_revision
             )
-            if str(record.get("policy_revision") or "") != policy_revision:
+            if str(record.get("policy_revision") or "") != policy_revision \
+                    or str(record.get("sha256") or "") != before_hash:
                 return _plain_failure(
                     path, "The recovery copy was not bound to the active safety policy."
                 )
-            artifact_hash = store.file_sha256(artifact)
+            # The store hashed the source once while copying it and verified
+            # the published artifact once against that digest. The tamper
+            # gate here is the source's identity: any write between the first
+            # stat and the finished copy changes size, mtime or ctime.
             after_stat = os.stat(path, follow_symlinks=False)
-            after_hash = store.file_sha256(path)
-            if artifact_hash != before_hash or after_hash != before_hash \
-                    or _identity(after_stat) != before_identity:
+            if _identity(after_stat) != before_identity:
                 return _plain_failure(path, "The file changed while its recovery copy was being verified.")
             receipts.append(PreimageReceipt(
                 path, "PRESENT", artifact=artifact, sha256=before_hash,
