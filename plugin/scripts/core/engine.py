@@ -24,7 +24,8 @@ from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     ToolEvent, worst
 from .shellparse import DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, \
-    FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, ParseUncertain, SimpleCommand, \
+    FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT, \
+    ParseUncertain, SimpleCommand, \
     _HEREDOC_RE, extract_commands, extract_payloads, redirect_targets
 
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
@@ -229,7 +230,16 @@ def _code_view(command: str, parsed) -> str:
                 view = view.replace(tok, " " * len(tok), 1)  # blank first occurrence
     return "\n".join([view] + parsed.payloads)
 
-_MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate"}
+_MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate",
+                 # Windows bulk copiers. Both overwrite their destination, and
+                 # robocopy's mirroring switches below also delete from it.
+                 "xcopy", "robocopy"}
+
+# robocopy switches that destroy files rather than copy them: /MIR and /PURGE
+# delete everything in the destination that is not in the source, and
+# /MOV|/MOVE deletes the source once it has been copied.
+_ROBOCOPY_PURGE_SWITCHES = {"/mir", "/purge"}
+_ROBOCOPY_MOVE_SWITCHES = {"/mov", "/move"}
 
 # File/dir deletion verbs across shells. `name` is the lowered argv0 basename,
 # so PowerShell `Remove-Item` arrives as "remove-item" and its aliases/cmd
@@ -1419,6 +1429,25 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
     if FLAG_EVAL in parsed.flags:
         decisions.append(Decision(ASK, "eval/source of dynamic content — review carefully.",
                                   "builtin:eval"))
+    if FLAG_UNINSPECTED_SCRIPT in parsed.flags:
+        scripts = [str(value) for value in parsed.uninspected if str(value).strip()]
+        decisions.append(Decision(
+            ASK,
+            "This hands a command body to a shell interpreter that guardrails never "
+            "sees — a `-File` script, or a launcher argument list that is not a "
+            "literal. Its contents are not inspected, so guardrails cannot tell which "
+            "files it changes. Confirm you know what it runs, or pass the commands "
+            "inline so they can be checked.",
+            "builtin:uninspected-script",
+            presentation_context=DecisionContext.FILE_CHANGE,
+            presentation_details={
+                "operation": "run an uninspected command body",
+                "targets": scripts,
+                "target_kind": "file",
+                "signal": "script contents not inspected",
+                "trigger": "A shell wrapper was handed a command body guardrails "
+                           "cannot read.",
+            }))
     if FLAG_INDIRECT in parsed.flags:
         if _has_mutation_evidence(event.command):
             decisions.append(Decision(
@@ -1711,6 +1740,20 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
             a.lower().strip("'\"") in _NULL_SINKS for a in cmd.argv[1:]):
         return Decision(DENY, "Moving or renaming a file into a null sink (NUL/$null) "
                               "destroys it. " + ARCHIVE_REDIRECT, "builtin:move-null")
+    if name == "robocopy":
+        switches = {a.lower() for a in cmd.argv[1:] if a.startswith("/")}
+        if switches & _ROBOCOPY_MOVE_SWITCHES:
+            return Decision(DENY, "`robocopy /MOV` (or `/MOVE`) deletes the source "
+                                  "files once they are copied. " + ARCHIVE_REDIRECT,
+                            "builtin:robocopy-move")
+        if switches & _ROBOCOPY_PURGE_SWITCHES:
+            return Decision(DENY, "`robocopy /MIR` (or `/PURGE`) deletes every file in "
+                                  "the destination that is not in the source tree. "
+                                  + ARCHIVE_REDIRECT, "builtin:robocopy-purge")
+    if name == "fsutil" and [a.lower() for a in cmd.argv[1:3]] == ["file", "setzerodata"]:
+        return Decision(DENY, "`fsutil file setzerodata` overwrites a file's contents "
+                              "with zeros in place. " + ARCHIVE_REDIRECT,
+                        "builtin:fsutil-zerodata")
     if name == "find" and ("-delete" in cmd.argv):
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:find-delete")
     if name == "dd" and any(a.startswith("of=/dev/") for a in cmd.argv):

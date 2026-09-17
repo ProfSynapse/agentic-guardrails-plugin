@@ -4,6 +4,13 @@ The static metadata below mirrors ``Get-Command``/``CommandMetadata`` for the
 supported commands.  It intentionally models only literal command lines; any
 runtime-dependent binding is reported as incomplete so prestate enforcement
 can fail closed.
+
+An incomplete binding also carries a ``kind``.  ``UNRESOLVED_PATH`` means the
+cmdlet is recognized but its path cannot be read without running the command
+(splatting, a variable, a here-string); that is a question for the user, and a
+caller should route it to a waivable ASK rather than a non-waivable invariant.
+``UNSUPPORTED_SHAPE`` means the command line is outside this binder's model at
+all, and stays fail-closed.
 """
 from __future__ import annotations
 
@@ -91,6 +98,25 @@ _ALIASES = {
 }
 
 
+# Why a binding is incomplete.
+#
+# ``UNRESOLVED_PATH``: a recognized mutation cmdlet whose path simply cannot be
+# read without running it — splatting (``Set-Content @params``), a variable, a
+# here-string body. Nothing about it says the operation is dangerous, only that
+# guardrails cannot name the file, so it is a question for the user and belongs
+# at a standard-level ASK rather than a non-waivable invariant.
+#
+# ``UNSUPPORTED_SHAPE``: the command line itself is outside what this binder
+# models (stop-parsing, an unknown parameter, a duplicated role). That stays
+# fail-closed, because we cannot even say which cmdlet would run.
+UNRESOLVED_PATH = "unresolved-path"
+UNSUPPORTED_SHAPE = "unsupported-shape"
+
+# The single line a caller should show the user for an UNRESOLVED_PATH result.
+UNRESOLVED_PATH_ASK = ("path could not be statically resolved; "
+                       "approve to proceed")
+
+
 @dataclass
 class BindingResult:
     recognized: bool = False
@@ -99,10 +125,22 @@ class BindingResult:
     sources: list[str] = field(default_factory=list)
     append: bool = False
     reason: str = ""
+    kind: str = ""
+
+    @property
+    def askable(self) -> bool:
+        """Whether this failure is a question for the user, not an invariant."""
+        return (self.recognized and not self.complete
+                and self.kind == UNRESOLVED_PATH)
 
 
-def _incomplete(reason: str) -> BindingResult:
-    return BindingResult(recognized=True, complete=False, reason=reason)
+def _incomplete(reason: str, kind: str = UNSUPPORTED_SHAPE) -> BindingResult:
+    return BindingResult(recognized=True, complete=False, reason=reason,
+                         kind=kind)
+
+
+def _unresolved(reason: str) -> BindingResult:
+    return _incomplete(reason, UNRESOLVED_PATH)
 
 
 def _literal(token: str) -> bool:
@@ -166,7 +204,9 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
                 continue
             if attached is None:
                 if i + 1 >= len(args) or args[i + 1].startswith("-"):
-                    return _incomplete(f"PowerShell parameter '-{raw}' is missing its value")
+                    return _unresolved(
+                        f"PowerShell parameter '-{raw}' is missing its value"
+                    )
                 attached = args[i + 1]
                 i += 2
             else:
@@ -190,9 +230,11 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
     for role in spec.path_roles:
         value = bound.get(role)
         if not value:
-            return _incomplete(f"PowerShell command did not identify a literal {role}")
+            return _unresolved(
+                f"PowerShell command did not identify a literal {role}"
+            )
         if not _literal(value):
-            return _incomplete(
+            return _unresolved(
                 f"PowerShell {role} does not have a static literal value"
             )
         targets.append(value)
@@ -202,7 +244,7 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
     if canonical in {"copy-item", "move-item"}:
         source = bound.get("path")
         if not source or not _literal(source):
-            return _incomplete(
+            return _unresolved(
                 "PowerShell source path uses a dynamic value or wildcard"
             )
         result.sources.append(source)
@@ -210,7 +252,7 @@ def bind(argv: list[str], dialect: str) -> BindingResult:
             "symboliclink", "junction"}:
         source = bound.get("target")
         if not source or not _literal(source):
-            return _incomplete(
+            return _unresolved(
                 "PowerShell link creation did not identify a literal target path"
             )
         result.sources.append(source)

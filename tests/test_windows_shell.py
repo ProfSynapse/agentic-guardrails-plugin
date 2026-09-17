@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from core import engine, mutations, preimages
+from core import engine, mutations, powershell_bind, preimages
 from core.events import ALLOW, ASK, DENY, DEFER, EXEC, ToolEvent
 
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin")
@@ -474,3 +474,124 @@ def test_quoted_diagnostic_pattern_is_not_treated_as_mutation(tmp_path):
     assert not plan.mutating
     assert plan.complete
     assert plan.targets == []
+
+
+# ---- F3: .exe-suffixed and full-path interpreters -------------------------
+
+@pytest.mark.parametrize("command", [
+    'bash.exe -c "rm -rf X"',
+    'sh.exe -c "rm file"',
+    'BASH.EXE -c "rm -rf X"',
+    r"C:\Windows\System32\cmd.exe /c del X",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    r' -Command "Remove-Item -Recurse -Force C:\work\notes"',
+    '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c '
+    '"Remove-Item -Recurse -Force C:\\work\\notes"',
+    r'"C:\Program Files\PortableShell\bin\bash.exe" -c "rm -rf X"',
+])
+def test_suffixed_and_full_path_interpreters_are_denied(evaluate, command):
+    assert evaluate(command).action == DENY, command
+
+
+# ---- F4: wsl / Start-Process / robocopy / xcopy / fsutil / -File ---------
+
+@pytest.mark.parametrize("command", [
+    "wsl rm -rf /mnt/c/Users/jo/Documents",
+    "wsl.exe -d Ubuntu -u root rm -rf /mnt/c/x",
+    "wsl -e rm -rf /mnt/c/x",
+    "wsl -- rm -rf /mnt/c/x",
+    "Start-Process powershell -ArgumentList '-Command','Remove-Item -Recurse C:\\x'",
+    'Start-Process -FilePath cmd.exe -ArgumentList "/c del X"',
+    "robocopy C:\\src C:\\dst /MIR",
+    "robocopy C:\\src C:\\dst /PURGE",
+    "robocopy C:\\src C:\\dst /MOV",
+    "robocopy C:\\src C:\\dst /MOVE",
+    "fsutil file setzerodata offset=0 length=4096 C:\\work\\notes.txt",
+])
+def test_unmodelled_windows_destroyers_are_denied(evaluate, command):
+    assert evaluate(command).action == DENY, command
+
+
+def test_robocopy_without_a_purge_switch_is_not_denied(evaluate):
+    assert evaluate("robocopy C:\\src C:\\dst /E").action != DENY
+
+
+def test_wsl_listing_is_not_denied(evaluate):
+    assert evaluate("wsl --list --verbose").action != DENY
+
+
+def test_xcopy_into_a_protected_path_is_denied(evaluate):
+    assert evaluate("xcopy notes.txt ~/.ssh/id_rsa /Y").action == DENY
+
+
+def test_xcopy_between_working_files_is_not_denied(evaluate):
+    assert evaluate("xcopy src dst /E /Y").action != DENY
+
+
+@pytest.mark.parametrize("command", [
+    r"powershell -File .\wipe.ps1",
+    r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\tools\build.ps1",
+    "Start-Process powershell -ArgumentList $cmd",
+])
+def test_uninspected_command_bodies_ask(evaluate, command):
+    decision = evaluate(command)
+    assert decision.action == ASK, f"{command} -> {decision.action}"
+    assert "not inspected" in decision.reason
+
+
+# ---- G5: multi-line PowerShell is parsed, not waved through --------------
+
+def test_multi_line_powershell_deletion_is_denied(evaluate):
+    assert evaluate(
+        "Remove-Item `\n  -Recurse `\n  -Force C:\\work\\notes"
+    ).action == DENY
+
+
+def test_multi_line_benign_powershell_is_not_denied(evaluate):
+    assert evaluate(
+        "Copy-Item README.md README.bak `\n  -Force"
+    ).action != DENY
+
+
+# ---- G4: an unresolvable path is a question, not an invariant ------------
+
+def _bind(command):
+    parsed = engine.extract_commands(command, dialect="powershell")
+    return powershell_bind.bind(parsed.commands[0].argv, "powershell")
+
+
+@pytest.mark.parametrize("command", [
+    "Set-Content @params",
+    "Remove-Item @splat",
+    "Set-Content -Path $target -Value 'hi'",
+    "Copy-Item -Path $source -Destination out.bak",
+    "Out-File -FilePath $log",
+    "Set-Content -Path -Value 'hi'",
+])
+def test_unresolvable_path_binding_is_askable(command):
+    binding = _bind(command)
+    assert binding.recognized and not binding.complete, command
+    assert binding.kind == powershell_bind.UNRESOLVED_PATH, command
+    assert binding.askable, command
+
+
+@pytest.mark.parametrize("command", [
+    "Set-Content --% -Path out.txt",
+    "Set-Content -Bogus x out.txt",
+    "Remove-Item a.txt b.txt c.txt d.txt",
+])
+def test_unsupported_command_shape_stays_fail_closed(command):
+    binding = _bind(command)
+    assert binding.recognized and not binding.complete, command
+    assert binding.kind == powershell_bind.UNSUPPORTED_SHAPE, command
+    assert not binding.askable, command
+
+
+def test_a_complete_binding_is_neither():
+    binding = _bind("Set-Content -Path out.txt -Value 'hi'")
+    assert binding.complete and binding.kind == "" and not binding.askable
+
+
+def test_unresolved_path_ask_line_names_the_way_forward():
+    assert powershell_bind.UNRESOLVED_PATH_ASK == (
+        "path could not be statically resolved; approve to proceed")

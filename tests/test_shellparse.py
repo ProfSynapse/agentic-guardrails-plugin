@@ -1,9 +1,10 @@
 """Shell parser unit tests."""
 import pytest
 
-from core.shellparse import (DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_INDIRECT,
-                             FLAG_INNER_UNCERTAIN, ParseUncertain, extract_commands,
-                             extract_payloads)
+from core.shellparse import (DIALECT_POSIX, DIALECT_POWERSHELL, FLAG_DECODE_PIPE,
+                             FLAG_INDIRECT, FLAG_INNER_UNCERTAIN,
+                             FLAG_UNINSPECTED_SCRIPT, ParseUncertain,
+                             _detect_dialect, extract_commands, extract_payloads)
 
 
 def names(command):
@@ -164,7 +165,6 @@ def test_powershell_static_backtick_escape_table(escaped, canonical):
     'Set-Content victim`"name changed',
     "Set-Content victim`n.txt changed",
     "Set-Content victim` changed",
-    "Set-Content victim`\n.txt changed",
 ])
 def test_powershell_ambiguous_backtick_escapes_are_uncertain(script):
     with pytest.raises(ParseUncertain):
@@ -186,3 +186,184 @@ def test_encoded_powershell_inner_failure_preserves_payload_provenance():
     parsed = extract_commands(f"pwsh -EncodedCommand {encoded}")
     inner = next(cmd for cmd in parsed.commands if cmd.name == "set-content")
     assert inner.dialect == DIALECT_POWERSHELL
+
+
+# ---- F3: one normalized interpreter head before every wrapper test --------
+
+@pytest.mark.parametrize("command, inner", [
+    ('bash.exe -c "rm -rf X"', "rm"),
+    ('BASH.EXE -c "rm -rf X"', "rm"),
+    ('sh.exe -c "rm file"', "rm"),
+    ('"C:\\Program Files\\PortableShell\\bin\\bash.exe" -c "rm -rf X"', "rm"),
+    (r"C:\Windows\System32\cmd.exe /c del X", "del"),
+    (r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+     r' -Command "Remove-Item -Recurse -Force C:\x"', "remove-item"),
+    ('"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c '
+     '"Remove-Item -Recurse -Force C:\\x"', "remove-item"),
+    (r"cmd.bat /c del X", "del"),
+])
+def test_suffixed_and_full_path_interpreters_are_recursed(command, inner):
+    assert inner in names(command)
+
+
+def test_normalized_head_does_not_rename_the_wrapper_itself():
+    # Only the wrapper *lookup* is normalized; SimpleCommand.name keeps the
+    # spelling downstream tables (and the launcher handshake) rely on.
+    parsed = extract_commands("agw.cmd status")
+    assert [c.name for c in parsed.commands] == ["agw.cmd"]
+
+
+# ---- F4: wsl, Start-Process, and the uninspected -File script ------------
+
+@pytest.mark.parametrize("command", [
+    "wsl rm -rf /mnt/c/Users/jo/Documents",
+    "wsl.exe rm -rf /mnt/c/x",
+    "wsl -d Ubuntu -u root rm -rf /mnt/c/x",
+    "wsl -e rm -rf /mnt/c/x",
+    "wsl --exec rm -rf /mnt/c/x",
+    "wsl -- rm -rf /mnt/c/x",
+    "wsl --cd /tmp rm -rf /mnt/c/x",
+    'wsl bash -c "rm -rf /mnt/c/x"',
+])
+def test_wsl_inner_command_is_recursed(command):
+    assert "rm" in names(command), command
+
+
+def test_wsl_without_an_inner_command_stays_one_command():
+    assert names("wsl --list --verbose") == ["wsl"]
+
+
+@pytest.mark.parametrize("command", [
+    "Start-Process powershell -ArgumentList '-Command','Remove-Item -Recurse C:\\x'",
+    "saps pwsh -ArgumentList '-c','Remove-Item y.txt'",
+    'Start-Process -FilePath cmd.exe -ArgumentList "/c del X"',
+    'start powershell -ArgumentList "-Command Remove-Item y.txt"',
+])
+def test_start_process_argument_list_is_recursed(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert {"remove-item", "del"} & {c.name for c in parsed.commands}, command
+
+
+def test_start_process_of_a_non_interpreter_is_not_unwrapped():
+    parsed = extract_commands("Start-Process notepad.exe README.md",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.name for c in parsed.commands] == ["start-process"]
+    assert not parsed.flags
+
+
+@pytest.mark.parametrize("command", [
+    "Start-Process powershell -ArgumentList $cmd",
+    "Start-Process powershell -ArgumentList @args",
+    "Start-Process powershell -ArgumentList (Get-Content list.txt)",
+    "Start-Process -FilePath pwsh -ArgumentList",
+])
+def test_start_process_with_a_dynamic_argument_list_fails_closed(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert FLAG_INDIRECT in parsed.flags, command
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags, command
+
+
+def test_powershell_file_records_the_uninspected_script():
+    parsed = extract_commands(r"powershell -NoProfile -File C:\tools\wipe.ps1")
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags
+    assert parsed.uninspected == [r"C:\tools\wipe.ps1"]
+
+
+def test_uninspected_script_survives_wrapper_recursion():
+    parsed = extract_commands('cmd /c "powershell -File wipe.ps1"')
+    assert FLAG_UNINSPECTED_SCRIPT in parsed.flags
+    assert parsed.uninspected == ["wipe.ps1"]
+
+
+# ---- F7: $var heads and a cmdlet-shaped dialect detector -----------------
+
+@pytest.mark.parametrize("command", [
+    "$deleter -Recurse C:\\work",
+    "$cmd notes.txt",
+    "& $tool -Force x",
+])
+def test_powershell_variable_head_is_flagged_indirect(command):
+    parsed = extract_commands(command, dialect=DIALECT_POWERSHELL)
+    assert parsed.commands, command
+    assert FLAG_INDIRECT in parsed.flags, command
+
+
+def test_powershell_pipeline_current_object_is_not_indirection():
+    parsed = extract_commands("Get-ChildItem | % { $_.Name }",
+                              dialect=DIALECT_POWERSHELL)
+    assert FLAG_INDIRECT not in parsed.flags
+
+
+@pytest.mark.parametrize("command", [
+    'curl -H "Content-Type: application/json" https://x.test',
+    'curl -H "X-Request-Id: abc" https://x.test',
+    "echo Foo-Bar",
+    "grep My-App src/",
+    "make Build-All",
+])
+def test_hyphenated_words_are_not_powershell(command):
+    assert _detect_dialect(command) == DIALECT_POSIX, command
+
+
+@pytest.mark.parametrize("command", [
+    "Get-ChildItem .",
+    "Remove-Item -Recurse x",
+    "Start-Process notepad",
+    "ConvertTo-Json $x",
+    "$env:PATH = 'x'",
+    "echo $PSItem",
+])
+def test_real_cmdlet_shapes_are_powershell(command):
+    assert _detect_dialect(command) == DIALECT_POWERSHELL, command
+
+
+def test_variable_head_on_the_bash_tool_is_no_longer_dialect_confused():
+    # `My-Documents` used to match the loose cmdlet regex, switch the line into
+    # the PowerShell dialect, and vanish through the `$var` early return.
+    parsed = extract_commands("$RM -rf ~/My-Documents")
+    assert [c.argv for c in parsed.commands] == [["$RM", "-rf", "~/My-Documents"]]
+    assert FLAG_INDIRECT in parsed.flags
+
+
+# ---- G5: backtick line continuation ------------------------------------
+
+def test_powershell_line_continuation_is_collapsed_not_uncertain():
+    parsed = extract_commands("Copy-Item README.md README.bak `\n  -Force",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.argv for c in parsed.commands] == \
+        [["Copy-Item", "README.md", "README.bak", "-Force"]]
+
+
+def test_powershell_multi_line_deletion_is_parsed():
+    parsed = extract_commands(
+        "Remove-Item `\n  -Recurse `\n  -Force C:\\work\\notes",
+        dialect=DIALECT_POWERSHELL)
+    assert [c.name for c in parsed.commands] == ["remove-item"]
+
+
+def test_powershell_line_continuation_joins_the_token():
+    # PowerShell consumes the backtick and the newline entirely, so the
+    # characters on either side end up in one token.
+    parsed = extract_commands("Set-Content victim`\n.txt changed",
+                              dialect=DIALECT_POWERSHELL)
+    assert parsed.commands[0].argv == ["Set-Content", "victim.txt", "changed"]
+
+
+def test_powershell_crlf_line_continuation_is_collapsed():
+    parsed = extract_commands("Copy-Item a.txt b.txt `\r\n  -Force",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.argv for c in parsed.commands] == \
+        [["Copy-Item", "a.txt", "b.txt", "-Force"]]
+
+
+@pytest.mark.parametrize("script", [
+    # A backtick-space is an escaped space; the statement really does end at
+    # the newline, so joining the lines would parse a command that never runs.
+    "Write-Output a` \nRemove-Item -Recurse -Force C:\\work",
+    "Write-Output a`b",
+    "Write-Output a`",
+    "Set-Content victim`'name changed",
+])
+def test_unpaired_backticks_elsewhere_stay_uncertain(script):
+    with pytest.raises(ParseUncertain):
+        extract_commands(script, dialect=DIALECT_POWERSHELL)
