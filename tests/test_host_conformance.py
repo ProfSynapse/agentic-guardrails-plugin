@@ -2,7 +2,9 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -60,7 +62,97 @@ def test_windows_hooks_use_python3_launcher_and_plugin_root(manifest, root_name)
         # stable and put runtime/encoding changes in the dispatcher instead.
         assert command.startswith("py.exe -3 ")
         assert "-X utf8" not in command
-        assert "${" + root_name + "}" in command
+        # Microsoft Store Python and conda installs have no py.exe. A hook that
+        # cannot spawn is a host hook error, and the tool call then proceeds
+        # unguarded, so the launcher must fall back to a bare `python`.
+        primary, _, fallback = command.partition(" || ")
+        assert fallback.startswith("python "), command
+        # Both legs address the same dispatcher, with the plugin root still
+        # quoted so an install path containing spaces survives cmd.exe.
+        target = '"${%s}\\scripts\\' % root_name
+        assert primary.count(target) == 1 and fallback.count(target) == 1
+        assert primary.endswith(lifecycle.lower()) and \
+            fallback.endswith(lifecycle.lower())
+
+
+@pytest.mark.parametrize("manifest,root_name", [
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT"),
+    ("hooks-codex.json", "PLUGIN_ROOT"),
+])
+def test_posix_hook_fallback_only_fires_when_python3_is_absent(manifest, root_name):
+    """A plain `||` reruns the adapter on *any* non-zero exit.
+
+    Both legs read the same stdin, so the second one gets a drained pipe and
+    appends a second JSON object to a stream that already holds a decision -
+    which the host cannot parse, and an unparseable decision is an allow.
+    Restrict the fallback to exit 127, the shell's "no such interpreter".
+    """
+    for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
+        command = _hooks(manifest)[lifecycle][0]["hooks"][0]["command"]
+        assert command.startswith("python3 ")
+        assert "[ $? -eq 127 ]" in command
+        assert '"${%s}/scripts/' % root_name in command
+        # No bare `|| python`: that is the fail-open spelling this guards.
+        assert "|| python " not in command
+
+
+def _json_objects(text):
+    """Split a stdout blob into the top-level JSON objects it actually holds."""
+    decoder = json.JSONDecoder()
+    objects, index = [], 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        value, index = decoder.raw_decode(text, index)
+        objects.append(value)
+    return objects
+
+
+def _shim_path_without_python3(tmp_path):
+    """A PATH directory that offers `python` but no `python3` at all."""
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "python"
+    shim.write_text('#!/bin/sh\nexec "%s" "$@"\n' % sys.executable, encoding="utf-8")
+    shim.chmod(0o755)
+    return shim_dir
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hook command string")
+@pytest.mark.parametrize("manifest,root_name,shadow", [
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT", False),
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT", True),
+    ("hooks-codex.json", "PLUGIN_ROOT", False),
+    ("hooks-codex.json", "PLUGIN_ROOT", True),
+])
+def test_posix_hook_command_emits_exactly_one_decision(
+        manifest, root_name, shadow, tmp_path):
+    """Spawn the literal manifest command the way the host does.
+
+    With `python3` present the first leg answers. With `python3` absent the
+    shell reports 127 and the fallback answers. Either way the host must find
+    exactly one JSON object on stdout - two would be unparseable, and an
+    unparseable decision is an allow.
+    """
+    command = _hooks(manifest)["PreToolUse"][0]["hooks"][0]["command"]
+    shell = shutil.which("sh")
+    assert shell, "no POSIX shell to run the hook command with"
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"),
+               AGW_APPROVAL_PROVIDER="headless", AGW_TEST_MODE="1")
+    env[root_name] = str(PLUGIN)
+    if shadow:
+        env["PATH"] = str(_shim_path_without_python3(tmp_path))
+    payload = {"tool_name": "Shell", "cwd": str(tmp_path),
+               "tool_input": {"command": "rm -rf ~/Documents"},
+               "session_id": "one-object", "hook_event_name": "PreToolUse"}
+    result = subprocess.run([shell, "-c", command], input=json.dumps(payload),
+                            capture_output=True, text=True, env=env, timeout=60)
+    objects = _json_objects(result.stdout)
+    assert len(objects) == 1, (result.stdout, result.stderr)
+    decision = objects[0]["hookSpecificOutput"]["permissionDecision"]
+    # Claude asks; Codex has no hook-level ask and denies through the provider.
+    assert decision in ("ask", "deny")
 
 
 @pytest.mark.parametrize("tool,command", [

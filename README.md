@@ -64,9 +64,11 @@ guard and a smoke test to confirm interception on your build — is in
 
 ### Requirements
 
-Python 3.9+. Windows hooks require it as `python`; the bundled `agw.cmd`
-launcher tries `python` and then `py.exe -3`. POSIX hooks try `python3` and
-then `python`. Optional: `pandoc` (docx↔markdown) and `openpyxl`
+Python 3.9+, reachable on `PATH` under any one of the names each probe tries.
+Windows hooks try `py.exe -3` and then `python`; the bundled `agw.cmd` launcher
+tries `python` and then `py.exe -3`. POSIX hooks try `python3`, falling back to
+`python` only when `python3` is not installed at all. Optional: `pandoc`
+(docx↔markdown) and `openpyxl`
 (xlsx→csv) for high-fidelity document checkout; without them files are checked
 out in plain-copy mode. Fleet rollout: see
 [plugin/enterprise/DEPLOYMENT.md](plugin/enterprise/DEPLOYMENT.md).
