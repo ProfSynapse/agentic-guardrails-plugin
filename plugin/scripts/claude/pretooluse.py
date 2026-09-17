@@ -121,6 +121,10 @@ def main():
         regenerable=cfg.get("regenerable"),
     )
     invariant_failure = ""
+    # Structured detail behind the refusal. Only the capacity failure has any,
+    # and `render_safe_next` needs it to print the cap and the shortfall rather
+    # than a sizeless "the cache is full".
+    invariant_details = {}
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
             if mutation_plan.review_required:
@@ -197,11 +201,13 @@ def main():
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason
+                    invariant_details = dict(receipt.details)
     if invariant_failure:
         decision = engine.Decision(
             events.DENY, invariant_failure, "invariant:prestate-unavailable",
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
+            presentation_details=invariant_details,
         )
         decision.safe_next = None
         decision.safe_next = remediation.for_events(decision, [event])
