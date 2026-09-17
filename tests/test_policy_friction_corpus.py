@@ -98,6 +98,12 @@ REGENERABLE_DELETES = [
     ("PowerShell", "rm -r -fo dist"),
     ("Bash", "rm -rf node_modules"),
     ("Bash", "rm -rf build"),
+    ("Bash", "rm -rf node_modules/x"),
+    # Shapes the PowerShell binder cannot model: the allowance decides them
+    # from the raw operands, so the plan has to as well.
+    ("PowerShell", "del /s /q build"),
+    ("PowerShell", "rd /s /q dist"),
+    ("PowerShell", "Remove-Item -LiteralPath node_modules -Recurse -Force"),
 ]
 
 
@@ -123,6 +129,8 @@ def test_regenerable_delete_is_allowed_when_the_tree_exists(hook, tmp_path, tool
     ("Bash", "rm -rf src"),
     ("PowerShell", "Remove-Item -Recurse -Force src"),
     ("Bash", "rm -rf node_modules src"),
+    ("PowerShell", "del /s /q src"),
+    ("PowerShell", "Remove-Item @params"),
 ])
 def test_a_real_source_tree_is_still_protected(hook, tmp_path, tool, command):
     project = _project(tmp_path)

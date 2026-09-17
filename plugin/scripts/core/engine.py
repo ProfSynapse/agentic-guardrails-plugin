@@ -760,9 +760,9 @@ def _regenerable_delete_operands(cmd: SimpleCommand, binding, regenerable: set):
         return []
     if binding.recognized and binding.complete:
         operands = list(binding.targets)
-    elif binding.recognized:
-        return []
     else:
+        # Same operand filter the allowance itself uses, so a shape the binder
+        # cannot model (`del /s /q build`) is planned the way it is decided.
         operands = [value for value in cmd.argv[1:]
                     if not value.startswith("-")
                     and not (name in _CMD_SWITCH_VERBS
@@ -1180,11 +1180,16 @@ def _is_project_root(path: str) -> bool:
            for marker in _PROJECT_ROOT_MARKERS):
         return True
     try:
-        names = os.listdir(path)
+        # Streamed and short-circuited: this runs once per ancestor on the
+        # discovery path, and a home directory can hold a lot of entries.
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if any(fnmatch.fnmatch(entry.name, pattern)
+                       for pattern in _PROJECT_ROOT_MARKER_GLOBS):
+                    return True
     except OSError:
         return False
-    return any(fnmatch.fnmatch(name, pattern) for name in names
-               for pattern in _PROJECT_ROOT_MARKER_GLOBS)
+    return False
 
 
 def _active_project_root(event: ToolEvent) -> str:
