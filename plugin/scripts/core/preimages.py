@@ -58,6 +58,12 @@ class PreimageResult:
     receipts: list[PreimageReceipt] = field(default_factory=list)
     reason: str = ""
     failed_target: str = ""
+    # Stable machine-readable failure class. ``recovery_store_busy`` marks a
+    # transient condition an adapter may surface as retryable.
+    error_code: str = ""
+
+
+ERROR_STORE_BUSY = "recovery_store_busy"
 
 
 def allocated_size(path: str, st=None) -> int:
@@ -89,13 +95,30 @@ def _nearest_existing_parent(path: str) -> str:
     return os.path.realpath(parent)
 
 
-def _plain_failure(path: str, detail: str) -> PreimageResult:
+def _plain_failure(path: str, detail: str, error_code: str = "") -> PreimageResult:
     name = os.path.basename(path) or path or "the target"
     return PreimageResult(
         False,
         reason=(f"Guardrails blocked this change because it could not create and verify "
                 f"a recovery point for {name}. {detail} Nothing was changed by this operation."),
         failed_target=path,
+        error_code=error_code,
+    )
+
+
+def _busy_failure(path: str) -> PreimageResult:
+    """The store lock did not free up inside the hook budget.
+
+    Returning a legible refusal here is what keeps the host from killing the
+    hook at its own deadline and running the tool call with no pre-image.
+    """
+    budget = store.hook_lock_budget_s()
+    return _plain_failure(
+        path,
+        "The recovery store is busy with another Guardrails operation and did "
+        f"not become available within {budget:g} seconds. Retry this same "
+        "change in a moment; nothing needs to be changed first.",
+        error_code=ERROR_STORE_BUSY,
     )
 
 
@@ -169,10 +192,11 @@ def prepare(targets, label: str, max_file_bytes: int,
         except OSError as exc:
             return _plain_failure(path, f"The file could not be read safely ({exc}).")
 
+    first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
         store.maintain_retention(
             policy=retention_config, incoming_bytes=required_bytes,
-            lock_context=store.Lock("recovery-store", timeout=30.0),
+            lock_context=store.hook_lock(),
         )
         if required_bytes:
             capacity_root = _nearest_existing_parent(
@@ -183,15 +207,16 @@ def prepare(targets, label: str, max_file_bytes: int,
                     present[0][0], "The recovery store does not have enough free disk space."
                 )
     except store.ArchiveCapacityError:
-        target = present[0][0] if present else (targets[0] if targets else "")
         return _plain_failure(
-            target,
+            first_target,
             "The recovery store does not have enough configured capacity; "
             "its protected rollback points cannot be pruned safely.",
         )
+    except TimeoutError:
+        # Must precede OSError: TimeoutError is an OSError subclass.
+        return _busy_failure(first_target)
     except OSError as exc:
-        target = present[0][0] if present else (targets[0] if targets else "")
-        return _plain_failure(target, f"Recovery-store capacity could not be verified ({exc}).")
+        return _plain_failure(first_target, f"Recovery-store capacity could not be verified ({exc}).")
 
     for path, before_identity in present:
         try:
@@ -203,6 +228,7 @@ def prepare(targets, label: str, max_file_bytes: int,
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 retention_config=retention_config,
+                lock_context=store.hook_lock(),
             )
             artifact = str(entry.get("dest") or "")
             transaction_id = str(entry.get("transaction_id") or "")
@@ -228,6 +254,8 @@ def prepare(targets, label: str, max_file_bytes: int,
                 recovery_record_kind="archive",
                 recovery_record_state=str(record.get("state") or ""),
             ))
+        except TimeoutError:
+            return _busy_failure(path)
         except (OSError, ValueError, TypeError) as exc:
             return _plain_failure(path, f"The recovery copy could not be completed ({exc}).")
         except Exception:

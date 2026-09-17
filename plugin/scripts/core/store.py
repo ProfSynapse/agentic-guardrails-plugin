@@ -31,6 +31,14 @@ from . import retention
 from . import retention_policy
 
 SCHEMA_VERSION = 1
+# Hosts kill a PreToolUse hook at roughly 15 s and then run the tool call
+# unguarded. Every lock wait on the hook path must therefore give up well
+# inside that budget and turn into an explicit refusal, never a hang.
+HOOK_LOCK_BUDGET_S = 8.0
+# Interactive agw commands have no host deadline; they may wait for a busy
+# store instead of refusing.
+CLI_LOCK_TIMEOUT_S = 30.0
+_HOOK_LOCK_BUDGET_ENV = "AGW_HOOK_LOCK_BUDGET_S"
 _WINDOWS_SHARING_WINERRORS = {32, 33}
 _WINDOWS_MISSING_LOCK_RETRIES = 3
 _MALFORMED_LOCK_STALE_SECONDS = 60.0
@@ -172,6 +180,29 @@ def _stale_malformed_lock_identity(path: str):
     if _lock_identity(path) != first or _lock_owner(path) != owner:
         return None
     return first
+
+
+def hook_lock_budget_s() -> float:
+    """Return the lock wait allowed on the hook path.
+
+    ``AGW_HOOK_LOCK_BUDGET_S`` exists only so tests can shorten the wait; it
+    can never raise the budget above the compiled-in hook constant.
+    """
+    raw = os.environ.get(_HOOK_LOCK_BUDGET_ENV, "")
+    if not raw:
+        return HOOK_LOCK_BUDGET_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return HOOK_LOCK_BUDGET_S
+    if value <= 0:
+        return HOOK_LOCK_BUDGET_S
+    return min(value, HOOK_LOCK_BUDGET_S)
+
+
+def hook_lock(name: str = "recovery-store") -> "Lock":
+    """A store lock bounded by the hook budget."""
+    return Lock(name, timeout=hook_lock_budget_s())
 
 
 def agw_home_path() -> str:
@@ -546,7 +577,7 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     except OSError:
         incoming_bytes = 0
 
-    context = lock_context or Lock("recovery-store", timeout=30.0)
+    context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
         if not _admission_checked:
             maintain_retention(
@@ -1346,7 +1377,7 @@ def undo_transaction(
     """
     if not transaction_id:
         raise ValueError("transaction id is required")
-    with Lock("recovery-store", timeout=30.0):
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
         operation = _mutation_record(transaction_id)
         members = _undo_members(operation)
         prior_undos = {
@@ -1429,7 +1460,7 @@ def undo_transaction(
 def restore(src: str, version: int = 0, overwrite: bool = False,
             retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
     """Restore an archived version of `src` to its original location."""
-    with Lock("recovery-store", timeout=30.0):
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
         entries = list_versions(src)
         if not entries:
             raise FileNotFoundError(f"no archived versions of {src}")
@@ -1681,7 +1712,7 @@ def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None
     records are never candidates.  If those protections leave insufficient
     room, the new store-growing operation is refused before publication.
     """
-    context = lock_context or Lock("recovery-store", timeout=30.0)
+    context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
         return _maintain_retention_locked(
             policy=policy, incoming_bytes=incoming_bytes
