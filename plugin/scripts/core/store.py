@@ -1610,28 +1610,139 @@ def restore(src: str, version: int = 0, overwrite: bool = False,
         return op
 
 
-def undo_last() -> dict:
-    """Invert the most recent invertible operation in the oplog."""
-    ops = oplog_read()
-    for op in reversed(ops):
-        if op.get("undone"):
+def _undo_key(op: dict) -> tuple:
+    """Identity of an invertible oplog row for undo bookkeeping."""
+    return (
+        str(op.get("op") or ""), str(op.get("transaction_id") or ""),
+        str(op.get("src") or ""), str(op.get("dest") or ""),
+    )
+
+
+def _undone_keys(ops: list) -> set:
+    """Rows already inverted, derived from the oplog's own ``undo`` records.
+
+    The oplog is append-only, so the original row is never marked; the
+    ``undo`` row that names it is the durable marker.
+    """
+    keys = set()
+    for op in ops:
+        if op.get("op") != "undo":
             continue
-        kind = op.get("op")
-        if kind == "archive" and op.get("mode") == "move":
-            if op.get("artifact_kind") == "link-metadata" \
-                    and os.path.exists(op["dest"]) and not os.path.lexists(op["src"]):
-                archive_tx.publish_restore(agw_home(), op, op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "archive", "restored": op["src"]}
-            if os.path.exists(op["dest"]) and not os.path.exists(op["src"]):
-                shutil.move(op["dest"], op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "archive", "restored": op["src"]}
-        if kind == "move":
-            if os.path.exists(op["dest"]) and not os.path.exists(op["src"]):
-                shutil.move(op["dest"], op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "move", "restored": op["src"]}
+        if isinstance(op.get("undid"), dict):
+            keys.add(_undo_key(op["undid"]))
+        # An archive the undo itself created (a logged move's safety capture)
+        # is part of that undo, not a separate operation to invert later.
+        if isinstance(op.get("consumed"), dict):
+            keys.add(_undo_key(op["consumed"]))
+    return keys
+
+
+def _undo_archive_move(op: dict) -> dict:
+    """Put a move-archived path back from its verified artifact.
+
+    The artifact is copied, never moved: it stays in the store as evidence,
+    a tampered or corrupt artifact is refused by the fingerprint check, and
+    the target must be absent so nothing is displaced.
+    """
+    transaction_id = str(op.get("transaction_id") or "")
+    target = os.path.abspath(str(op.get("src") or ""))
+    if not transaction_id:
+        raise ValueError(
+            f"undo refused: the archive of {target} predates verified "
+            f"transactions. Use `agw restore {target}` to restore a verified "
+            "version instead."
+        )
+    record = archive_tx.load(agw_home(), transaction_id)
+    if record.get("kind") != "archive" or record.get("mode") != "move":
+        raise ValueError(f"undo refused: {transaction_id} is not a move archive")
+    entry = archive_tx.entry_from_record(record)
+    target = os.path.abspath(str(record.get("src") or target))
+    if not archive_tx.entry_is_verified(agw_home(), entry, target):
+        raise ValueError(
+            f"undo refused: the archived copy of {target} failed verification "
+            "and was left in the store untouched. Run `agw recover` and then "
+            f"`agw restore {target}`."
+        )
+    if os.path.lexists(target):
+        raise FileExistsError(
+            f"undo refused: {target} exists again, so the archived version "
+            "cannot be put back without displacing it. Use "
+            f"`agw restore {target}`, which archives the current file first."
+        )
+    archive_tx.publish_restore(agw_home(), entry, target)
+    return {"undone": "archive", "restored": target,
+            "transaction_id": transaction_id}
+
+
+def _undo_logged_move(op: dict,
+                      retention_config: retention_policy.RetentionPolicy | None
+                      ) -> dict:
+    """Reverse a logged move through a verified archive transaction.
+
+    A logged move carries no fingerprint, so the moved file is first
+    captured into the store (fingerprinted, committed, and never pruned as
+    a move archive) and then published back to its original path as a
+    verified copy. Its content is preserved in the store before the original
+    path is populated, so no step can lose it.
+    """
+    src = os.path.abspath(str(op.get("src") or ""))
+    dest = os.path.abspath(str(op.get("dest") or ""))
+    if not os.path.lexists(dest):
+        raise FileNotFoundError(
+            f"undo refused: {dest} no longer exists, so there is nothing to "
+            f"move back. Use `agw restore {dest}` if it was archived."
+        )
+    if os.path.lexists(src):
+        raise FileExistsError(
+            f"undo refused: {src} exists again, so the moved file cannot be "
+            f"put back without displacing it. Use `agw archive {src}` first."
+        )
+    entry = archive_file(
+        dest, mode="move", reason=f"undo of logged move from {src}",
+        actor="agw", retention_class="safety_archive",
+        retention_config=retention_config, lock_context=nullcontext(),
+    )
+    if not archive_tx.entry_is_verified(agw_home(), entry, dest):
+        raise ValueError(
+            f"undo refused: the moved file could not be verified after capture; "
+            f"it is preserved in the store. Use `agw restore {dest}`."
+        )
+    archive_tx.publish_restore(agw_home(), entry, src)
+    return {"undone": "move", "restored": src,
+            "transaction_id": entry["transaction_id"],
+            "consumed": {"op": "archive", "transaction_id": entry["transaction_id"],
+                         "src": entry["src"], "dest": entry["dest"]}}
+
+
+def undo_last(retention_config: retention_policy.RetentionPolicy | None = None
+              ) -> dict:
+    """Invert the most recent invertible operation in the oplog.
+
+    Runs under the recovery-store lock and restores only through verified
+    transactions. The newest row not already inverted is the one undone; if
+    its precondition fails (the target reappeared, the artifact is gone or
+    unverified) the undo refuses with the safe alternative rather than
+    silently inverting some older, unrelated operation.
+    """
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
+        ops = oplog_read()
+        undone = _undone_keys(ops)
+        for op in reversed(ops):
+            kind = op.get("op")
+            invertible = (kind == "archive" and op.get("mode") == "move") \
+                or kind == "move"
+            if not invertible or _undo_key(op) in undone:
+                continue
+            if kind == "archive":
+                result = _undo_archive_move(op)
+            else:
+                result = _undo_logged_move(op, retention_config)
+            undo_record = {"op": "undo", "undid": op}
+            consumed = result.pop("consumed", None)
+            if consumed:
+                undo_record["consumed"] = consumed
+            oplog_append(undo_record)
+            return result
     raise LookupError("nothing to undo")
 
 
