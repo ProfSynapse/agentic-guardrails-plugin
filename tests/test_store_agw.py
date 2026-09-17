@@ -893,9 +893,15 @@ def test_filename_search_never_opens_file_content(tmp_path, monkeypatch):
         "query": "needle", "filename_only": True, "kind": "file",
         "include_globs": [], "exclude_globs": [],
     })
-    monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("filename search opened file content")
-    ))
+    real_open = open
+
+    def _guarded_open(path, *a, **k):
+        # Folder-profile detection may read its own persisted verdicts under
+        # AGW_HOME; that is not the searched tree's content.
+        if os.path.basename(str(path)) == profiles._PROFILE_CACHE_NAME:
+            return real_open(path, *a, **k)
+        raise AssertionError("filename search opened file content")
+    monkeypatch.setattr("builtins.open", _guarded_open)
     data, fatal = scan_worker.search_in_process(request)
     assert fatal is None
     assert data["matches_found"] == 1
