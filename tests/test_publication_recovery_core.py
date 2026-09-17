@@ -280,8 +280,11 @@ def test_fixed_id_preparation_identity_substitution_is_preserved_and_blocks(
     archive_tx._allocate_fixed_preparation(agw_home, record)
     checkpointed = archive_tx.load(agw_home, record["transaction_id"])
     preparation = Path(record["temp"])
-    preparation.unlink()
-    preparation.write_bytes(b"foreign replacement")
+    # Allocate the foreign file while the checkpointed inode still exists so
+    # the filesystem cannot hand the replacement the same inode number.
+    foreign = preparation.with_name(preparation.name + ".foreign")
+    foreign.write_bytes(b"foreign replacement")
+    os.replace(foreign, preparation)
 
     with pytest.raises(ValueError, match="identity changed"):
         archive_tx._resume_preparing_archive(agw_home, checkpointed)

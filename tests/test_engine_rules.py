@@ -624,6 +624,199 @@ def test_mcp_read_defers(policy):
     assert d.action == DEFER
 
 
+def _regenerable_project(tmp_path):
+    for relative in ("node_modules/x/a.js", "build/o.js", "dist/bundle.js",
+                     "src/app.py"):
+        path = tmp_path.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n", encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_regenerable_delete_is_planned_as_skipped_not_as_a_target(tmp_path):
+    """F6: the allowance was useless because the directory stayed a target.
+
+    `preimages.prepare` rejects anything that is not a regular file, so a
+    listed directory turned `builtin:rm-regenerable` into a non-waivable
+    `invariant:prestate-unavailable` DENY whenever the tree actually existed.
+    """
+    from core import mutations
+
+    cwd = _regenerable_project(tmp_path)
+    for tool, command in (
+        ("PowerShell", "Remove-Item -Recurse -Force node_modules"),
+        ("PowerShell", "ri -Recurse -Force build"),
+        ("PowerShell", "rm -r -fo dist"),
+        ("Bash", "rm -rf node_modules"),
+    ):
+        event = _ev(EXEC, tool=tool, command=command, cwd=cwd)
+        plan = mutations.plan([event], engine.clobber_targets)
+        assert plan.complete, f"{command!r}: {plan.reason}"
+        assert plan.targets == [], command
+        assert plan.skipped, command
+        assert all(why == engine.SKIP_REGENERABLE for _target, why in plan.skipped)
+
+
+def test_a_mixed_delete_keeps_full_preimage_coverage(tmp_path):
+    """Only an all-regenerable delete is allowed, so only it may skip."""
+    from core import mutations
+
+    cwd = _regenerable_project(tmp_path)
+    for tool, command in (
+        ("Bash", "rm -rf node_modules src"),
+        ("PowerShell", "Remove-Item -Recurse -Force src"),
+    ):
+        event = _ev(EXEC, tool=tool, command=command, cwd=cwd)
+        plan = mutations.plan([event], engine.clobber_targets)
+        assert plan.skipped == [], command
+        assert engine.evaluate(event, engine.load_policy(REPO), REPO).action == DENY
+
+
+def test_every_project_marker_anchors_discovery_inside_a_synced_tree(tmp_path,
+                                                                     policy):
+    """G1: the project root walk knew only `.git`, so other stacks stayed blocked."""
+    for index, marker in enumerate(
+            (".git", "package.json", "pyproject.toml", "app.sln", ".agw")):
+        root = tmp_path / "OneDrive - Acme" / f"proj{index}"
+        (root / "src").mkdir(parents=True)
+        if marker in {".git", ".agw"}:
+            (root / marker).mkdir()
+        else:
+            (root / marker).write_text("{}\n", encoding="utf-8")
+        event = _ev(EXEC, tool="PowerShell", command="Get-ChildItem -Recurse",
+                    cwd=str(root))
+        decision = engine.evaluate(event, policy, REPO)
+        assert decision.action != DENY, marker
+        assert engine._active_project_root(event) == os.path.realpath(str(root))
+
+
+def test_discovery_below_a_marker_less_cwd_still_denies_a_synced_scope(tmp_path,
+                                                                      policy):
+    loose = tmp_path / "OneDrive - Acme" / "notes"
+    loose.mkdir(parents=True)
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="ls -R ..", cwd=str(loose)), policy, REPO)
+    assert decision.action == DENY
+    assert "cloud-synced tree" in decision.reason
+
+
+def test_force_is_a_risk_flag_only_on_the_finders(tmp_path, policy):
+    """G2: `-Force` on Get-ChildItem only reveals hidden entries."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "src").mkdir()
+
+    def _decide(tool, command):
+        return engine.evaluate(
+            _ev(EXEC, tool=tool, command=command, cwd=str(project)), policy, REPO)
+
+    for tool, command in (("PowerShell", "Get-ChildItem -Recurse -Force"),
+                          ("PowerShell", "gci -Force"),
+                          ("Bash", "ls -Ra"),
+                          ("Bash", "dir")):
+        assert _decide(tool, command).action != DENY, command
+    for command in ("fd -force . .", "find . -force -name '*.py'"):
+        decision = _decide("Bash", command)
+        assert decision.action == DENY, command
+        assert decision.rule_id == "builtin:unbounded-discovery"
+
+
+def test_whatif_is_allowed_and_schedules_no_preimage(tmp_path, policy):
+    """G3: -WhatIf was parsed and then ignored, so a dry run was denied."""
+    from core import mutations
+
+    (tmp_path / "temp").mkdir()
+    (tmp_path / "temp" / "note.txt").write_text("x\n", encoding="utf-8")
+    event = _ev(EXEC, tool="PowerShell",
+                command="Remove-Item .\\temp -Recurse -WhatIf", cwd=str(tmp_path))
+    decision = engine.evaluate(event, policy, REPO)
+    assert decision.action == ALLOW
+    assert decision.rule_id == "builtin:powershell-whatif"
+    assert "dry run (-WhatIf)" in decision.reason
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete and plan.targets == []
+    assert plan.skipped == [("remove-item", engine.SKIP_WHATIF)]
+
+
+def test_confirm_and_a_false_whatif_are_not_dry_runs(tmp_path, policy):
+    (tmp_path / "temp").mkdir()
+    for command in ("Remove-Item .\\temp -Recurse -Confirm",
+                    "Remove-Item .\\temp -Recurse -WhatIf:$false",
+                    "Remove-Item .\\temp -Recurse -WhatIf:$flag"):
+        decision = engine.evaluate(
+            _ev(EXEC, tool="PowerShell", command=command, cwd=str(tmp_path)),
+            policy, REPO)
+        assert decision.action == DENY, command
+        assert "agw archive" in decision.reason
+
+
+def test_a_posix_command_never_reads_whatif(tmp_path, policy):
+    """The allowance is PowerShell binding data, not a free-floating token."""
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="rm -rf temp -WhatIf", cwd=str(tmp_path)),
+        policy, REPO)
+    assert decision.action == DENY
+
+
+CLOBBER_CLOUD_COMMANDS = [
+    ("Bash", 'echo x > "{target}"'),
+    ("Bash", 'cp notes.txt "{target}"'),
+    ("Bash", 'mv notes.txt "{target}"'),
+    ("Bash", 'echo x | tee "{target}"'),
+    ("PowerShell", 'Set-Content -Path "{target}" -Value hi'),
+    ("PowerShell", 'Out-File -FilePath "{target}"'),
+]
+
+
+def test_a_clobbered_cloud_placeholder_is_denied_like_a_write(policy, tmp_path):
+    """G9: the guard only ever saw event.paths, never the clobber targets.
+
+    An unguarded redirect onto a placeholder forced a full cloud hydration
+    inside the hook's own budget before anything could stop it.
+    """
+    project = tmp_path / "OneDrive" / "proj"
+    placeholder = project / "big.xlsx"
+    _sparse(placeholder, 1024 * 1024)
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    write = engine.evaluate(
+        _ev(WRITE, paths=[str(placeholder)], content="x"), policy, REPO)
+    assert write.action == DENY
+    for tool, template in CLOBBER_CLOUD_COMMANDS:
+        decision = engine.evaluate(
+            _ev(EXEC, tool=tool, command=template.format(target=placeholder),
+                cwd=str(project)),
+            policy, REPO)
+        assert decision.action == DENY, template
+        assert decision.rule_id == write.rule_id == "builtin:placeholder"
+        assert decision.reason == write.reason
+
+
+def test_a_clobbered_gdoc_stub_is_denied_like_a_write(policy, tmp_path):
+    project = tmp_path / "OneDrive" / "proj"
+    project.mkdir(parents=True)
+    stub = project / "plan.gdoc"
+    stub.write_text('{"url": "https://docs.google.com/x"}\n', encoding="utf-8")
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    for tool, template in CLOBBER_CLOUD_COMMANDS:
+        decision = engine.evaluate(
+            _ev(EXEC, tool=tool, command=template.format(target=stub),
+                cwd=str(project)),
+            policy, REPO)
+        assert decision.action == DENY, template
+        assert decision.rule_id == "builtin:gdoc-stub"
+
+
+def test_an_ordinary_clobber_target_is_untouched_by_the_cloud_guard(policy,
+                                                                    tmp_path):
+    project = tmp_path / "OneDrive" / "proj"
+    project.mkdir(parents=True)
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="echo x > notes.txt", cwd=str(project)),
+        policy, REPO)
+    assert decision.action != DENY
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)

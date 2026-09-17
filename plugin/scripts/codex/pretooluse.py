@@ -37,7 +37,40 @@ FAIL_CLOSED = {
     }
 }
 
-from adapter_common import to_events  # noqa: E402
+from adapter_common import CODEX_ARGV_SHELL_TOOLS, exec_command_line, \
+    exec_workdir, to_events, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
+
+# Host surfaces whose command text carries the platform-neutral `agw` short
+# form, and so must be expanded to the active package before evaluation. The
+# Codex-native exec tools belong here as much as Bash does: leaving them out
+# made every denial on a native-tool build recommend `agw archive` while
+# `agw archive` itself denied as an unverified launcher - a wall with no door.
+# `write_stdin` is deliberately absent: its `chars` are keystrokes for a
+# process already running, not a command line this hook may rewrite.
+LAUNCHER_TOOLS = frozenset({"Bash", "PowerShell", "exec_command"}
+                           | set(CODEX_ARGV_SHELL_TOOLS))
+
+# Set once anything has reached stdout, so the fail-closed handler never
+# appends a second object to a stream that already carries a decision.
+_EMITTED = False
+
+
+def _emit(out):
+    """Write one decision object in a single, already-serialized write.
+
+    `json.dump` streams chunks straight at stdout: a failure partway through
+    leaves a truncated object, and the fail-closed handler then appends a whole
+    second one. The host can parse neither, and a decision it cannot parse is
+    no decision at all - which is an allow. Serializing first keeps stdout
+    untouched unless the whole object is ready.
+    """
+    global _EMITTED
+    text = json.dumps(out)
+    _EMITTED = True
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 # Codex has no hook-driven approval prompt (permissionDecision "ask" is parsed
@@ -47,38 +80,123 @@ PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 102
 ASK_MODAL_TIMEOUT = int(os.environ.get("AGW_ASK_MODAL_TIMEOUT", 100))
 
 
+# The host's registry of tools that neither run a command nor touch a file.
+# Bound at import time so the planner can be told which unmodeled tool names
+# are inert without the platform-neutral core learning any of them.
+from adapter_common import INERT_TOOLS  # noqa: E402
+
+
+class _InertPlan:
+    """The plan mutations.plan returns for an event that cannot mutate files."""
+    mutating = False
+    complete = True
+    review_required = False
+    reason = ""
+    evidence = {}
+    targets = []
+
+
+def _plan_mutations(evlist, engine, events, mutations, **options):
+    """Plan pre-images only for events that can mutate files.
+
+    mutations.plan leaves a READ or MCP event inert by construction (a Read
+    has no mutation primitive; a connected-service call has no local files to
+    snapshot). Every other kind, including an unmodeled OTHER tool, goes to
+    the planner. Skipping the call for the two inert kinds keeps the
+    mutations/workflows/store import chain off the routine path entirely.
+    """
+    if all(ev.kind in (events.READ, events.MCP) for ev in evlist):
+        return _InertPlan()
+    return mutations.plan(evlist, engine.clobber_targets, plugin_root=PLUGIN_ROOT,
+                          **options)
+
+
+def _launcher_command(tool_name, tool_input, payload):
+    """(command line, rewrite dialect, cwd) for a launcher-bearing call.
+
+    Each host surface spells its command differently - a string under
+    `command`, an argv list under `command`, a line under `cmd` - and the
+    rewriter reads one command line, so the shape is resolved here through the
+    same accessors `to_events` uses. Reading them apart is what made the gate
+    miss the native tools: `tool_input["command"]` on a `shell` call is a list,
+    and on an `exec_command` call it is not there at all.
+    """
+    if tool_name in CODEX_ARGV_SHELL_TOOLS or tool_name == "exec_command":
+        from core import mcpshell
+        command = (exec_command_line(tool_input) if tool_name == "exec_command"
+                   else mcpshell.argv_command(tool_input.get("command")))
+        # Never the PowerShell call-operator spelling: an argv list is exec'd
+        # directly (and a `-lc` body is a POSIX script), and `exec_command`
+        # names any PowerShell or cmd interpreter in `shell`, which puts a
+        # wrapper in front that no leading-token shortcut matches anyway.
+        return command or "", "posix", exec_workdir(tool_input,
+                                                    payload.get("cwd", ""))
+    command = tool_input.get("command", "")
+    return (command if isinstance(command, str) else ""), \
+        ("powershell" if os.name == "nt" else "posix"), payload.get("cwd", "")
+
+
+def _routine_read(payload):
+    """The Read fast path: True means the engine would say nothing, so we say
+    nothing without loading it. Anything else takes the full path below."""
+    from core import readfast
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    path = tool_input.get("file_path") or tool_input.get("path") or ""
+    return readfast.routine_read(path, PLUGIN_ROOT)
+
+
 def main(approval_provider=None):
     payload = json.load(sys.stdin)
-    from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, remediation, retention_policy, store
-    from core.decisions import GuardrailDecision
+    if payload.get("tool_name") == "Read" and _routine_read(payload):
+        return
+    from core import auditlog, enforcement, engine, events, launcher, remediation
+    from core.lazyimport import LazyModule
+    # Deferred until a call site needs them: the store, workflows and the
+    # prompt/approval machinery cost more to import than the whole routine
+    # Read or MCP path. Each proxy imports inside this function, so a
+    # broken module still lands in the fail-closed handler below.
+    approvals = LazyModule("core.approvals")
+    mutations = LazyModule("core.mutations")
+    preimages = LazyModule("core.preimages")
+    presentation = LazyModule("core.presentation")
+    retention_policy = LazyModule("core.retention_policy")
+    store = LazyModule("core.store")
 
     evaluation_payload = payload
     rewritten_command = None
     routed_workflow = ""
-    if payload.get("tool_name") in {"Bash", "PowerShell"}:
+    tool_name = payload.get("tool_name")
+    if tool_name in LAUNCHER_TOOLS:
         tool_input = payload.get("tool_input") or {}
-        command = tool_input.get("command", "")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        command, shell, cwd = _launcher_command(tool_name, tool_input, payload)
         rewritten_command = launcher.rewrite_shortcut(
-            command, PLUGIN_ROOT,
-            shell="powershell" if os.name == "nt" else "posix",
-        )
-        if not rewritten_command:
-            dialect = "powershell" if payload.get("tool_name") == "PowerShell" else None
+            command, PLUGIN_ROOT, shell=shell,
+        ) if command else None
+        if not rewritten_command and command:
+            dialect = "powershell" if tool_name == "PowerShell" else None
             matches = mutations.routable_trusted_workflows(
-                command, payload.get("cwd", ""), dialect=dialect,
+                command, cwd, dialect=dialect,
             )
             if len(matches) == 1:
                 rewritten_command = launcher.rewrite_trusted_workflow(
-                    command, matches[0], PLUGIN_ROOT,
-                    shell="powershell" if os.name == "nt" else "posix",
+                    command, matches[0], PLUGIN_ROOT, shell=shell,
                 )
                 routed_workflow = matches[0] if rewritten_command else ""
         if rewritten_command:
-            evaluation_payload = dict(payload)
-            evaluation_payload["tool_input"] = launcher.updated_tool_input(
-                payload, rewritten_command
-            )
+            updated = launcher.updated_tool_input(payload, rewritten_command)
+            if updated is None:
+                # The rewrite has no spelling in this payload's own shape.
+                # Evaluate what was actually asked for instead of allowing on
+                # the strength of a rewrite the host would never receive.
+                rewritten_command = None
+                routed_workflow = ""
+            else:
+                evaluation_payload = dict(payload)
+                evaluation_payload["tool_input"] = updated
 
     evlist = to_events(evaluation_payload)
     policy = engine.load_policy(PLUGIN_ROOT)
@@ -101,6 +219,21 @@ def main(approval_provider=None):
                 f"instead of removing it.",
                 "builtin:patch-delete",
                 enforcement_class=events.NON_WAIVABLE_INVARIANT))
+        if ev.extra.get("unrecognized_tool"):
+            # A tool identity this adapter cannot map to any guarded event.
+            # events.OTHER alone DEFERs and emits nothing, which Codex reads as
+            # allow. Ask instead — on Codex that routes through the approval
+            # provider, whose absence or timeout denies — and log one stderr
+            # line so the fall-through is diagnosable from the hook log.
+            reason = unrecognized_tool_reason(
+                unrecognized_tool(evaluation_payload)
+            )
+            sys.stderr.write("agentic-guardrails: %s\n" % reason)
+            d = d.merge(engine.Decision(
+                events.ASK, reason + ".", "builtin:unrecognized-tool",
+                policy_revision=policy.revision, policy_health=policy.health,
+                enforcement_class=events.NON_WAIVABLE_INVARIANT,
+                presentation_context=events.DecisionContext.UNKNOWN))
         if ev.extra.get("opaque"):
             d = d.merge(engine.Decision(
                 events.ASK,
@@ -121,35 +254,64 @@ def main(approval_provider=None):
     label = payload.get("tool_name", "") or "modification"
     # Prestate failures are safety invariants. Unlike advisory policy choices,
     # they cannot be approved away or suppressed by observe mode.
-    mutation_plan = mutations.plan(
-        evlist, engine.clobber_targets, plugin_root=PLUGIN_ROOT
+    mutation_plan = _plan_mutations(
+        evlist, engine, events, mutations,
+        regenerable=cfg.get("regenerable"), inert_tools=INERT_TOOLS,
     )
     invariant_failure = ""
+    # Structured detail behind the refusal. Only the capacity failure has any,
+    # and `render_safe_next` needs it to print the cap and the shortfall rather
+    # than a sizeless "the cache is full".
+    invariant_details = {}
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
             if mutation_plan.review_required:
                 ambiguous_action = (
                     events.DENY if cfg.get("level") == "strict" else events.ASK
                 )
-                decision = decision.merge(engine.Decision(
-                    ambiguous_action,
-                    "Guardrails found ambiguous write-like source evidence but could "
-                    "not confirm that this invocation writes files. Review this exact, "
-                    f"hash-bound run before continuing: {mutation_plan.reason}",
-                    "builtin:script-write-ambiguous",
-                    policy_revision=policy.revision, policy_health=policy.health,
-                    enforcement_class=events.POLICY_ENFORCEMENT,
-                    presentation_context=events.DecisionContext.FILE_CHANGE,
-                    presentation_details={
+                if mutation_plan.reason == mutations.UNRESOLVED_PATH_ASK:
+                    # A recognized PowerShell write whose path only exists at
+                    # run time (splatting, a variable, a here-string). Nothing
+                    # about it says the operation is dangerous, only that the
+                    # file cannot be named here, so it is a question for the
+                    # user. The target is described by category so the prompt
+                    # still carries enough for informed consent.
+                    review_rule = "builtin:powershell-path-unresolved"
+                    review_reason = (
+                        "Guardrails recognized this as a file-writing PowerShell "
+                        f"command, but its {mutations.UNRESOLVED_PATH_ASK}."
+                    )
+                    review_details = {
+                        "operation": "write a file named at run time",
+                        "targets": ["A file the command names at run time"],
+                        "target_kind": "category",
+                        "signal": "a file path supplied at run time",
+                        "trigger": ("The command supplies its target path at run "
+                                    "time, so Guardrails cannot read it statically."),
+                    }
+                else:
+                    review_rule = "builtin:script-write-ambiguous"
+                    review_reason = (
+                        "Guardrails found ambiguous write-like source evidence but could "
+                        "not confirm that this invocation writes files. Review this exact, "
+                        f"hash-bound run before continuing: {mutation_plan.reason}"
+                    )
+                    review_details = {
                         "operation": "run script with ambiguous write evidence",
                         "targets": [mutation_plan.evidence.get("path", "")],
                         "target_kind": "file",
                         "signal": mutation_plan.evidence.get("primitive", "write-like source"),
                         "trigger": "Static source analysis found ambiguous write evidence.",
-                    },
+                    }
+                decision = decision.merge(engine.Decision(
+                    ambiguous_action, review_reason, review_rule,
+                    policy_revision=policy.revision, policy_health=policy.health,
+                    enforcement_class=events.POLICY_ENFORCEMENT,
+                    presentation_context=events.DecisionContext.FILE_CHANGE,
+                    presentation_details=review_details,
                 ))
                 if decision.action == events.DENY \
-                        and decision.rule_id == "builtin:script-write-ambiguous":
+                        and decision.rule_id == review_rule:
                     decision.safe_next = None
                     decision.safe_next = remediation.for_events(decision, evlist)
                 effective = enforcement.resolve(decision, observe)
@@ -177,11 +339,13 @@ def main(approval_provider=None):
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason
+                    invariant_details = dict(receipt.details)
     if invariant_failure:
         decision = engine.Decision(
             events.DENY, invariant_failure, "invariant:prestate-unavailable",
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
+            presentation_details=invariant_details,
         )
         decision.safe_next = None
         decision.safe_next = remediation.for_events(decision, evlist)
@@ -230,17 +394,17 @@ def main(approval_provider=None):
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
         out = {"systemMessage": f"agentic-guardrails ({label}): would have "
                                 f"{decision.action.upper()} - {decision.reason}"}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
 
     # Codex can't render a hook 'ask' prompt, so an emitted ASK would silently
@@ -250,6 +414,7 @@ def main(approval_provider=None):
     approval_outcome = ""
     if action == events.ASK:
         sid = payload.get("session_id", "")
+        from core.decisions import GuardrailDecision
         prompt_decision = GuardrailDecision.from_legacy(decision)
         request = presentation.build_prompt(prompt_decision, evaluation_payload, evlist)
         try:
@@ -292,6 +457,7 @@ def main(approval_provider=None):
     refusal_metadata = None
     if action in (events.ALLOW, events.ASK, events.DENY):
         if action == events.DENY:
+            from core.decisions import GuardrailDecision
             denial_decision = GuardrailDecision.from_legacy(decision)
             denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
@@ -323,15 +489,27 @@ def main(approval_provider=None):
         )
 
     if out:
-        json.dump(out, sys.stdout)
+        _emit(out)
+
+
+def _fail_closed():
+    """Last-resort decision for a failure the evaluation path did not catch.
+
+    Only speaks if nothing already did. Appending a second object to a stream
+    that already carries a decision makes both unparseable, and a decision the
+    host cannot parse is no decision at all - which is an allow.
+    """
+    if _EMITTED:
+        return
+    try:
+        _emit(FAIL_CLOSED)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        try:
-            json.dump(FAIL_CLOSED, sys.stdout)
-        except Exception:
-            print(json.dumps(FAIL_CLOSED))
+        _fail_closed()
         sys.exit(0)

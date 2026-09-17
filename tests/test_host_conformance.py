@@ -2,7 +2,9 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,50 @@ def test_maintained_hooks_register_every_shell_surface(manifest, lifecycle):
     assert {"Bash", "PowerShell", "Monitor"} <= set(matcher)
 
 
+# Codex builds differ in which tool names they emit: some send the Claude-style
+# names above, others send Codex's own exec surfaces. A matcher that lists only
+# the first set leaves every call in the second set unguarded - the hook never
+# fires, so there is no decision, no audit record, and no denial.
+CODEX_NATIVE_EXEC_TOOLS = {"shell", "local_shell", "exec_command", "write_stdin"}
+
+
+@pytest.mark.parametrize("lifecycle", ["PreToolUse", "PostToolUse"])
+def test_codex_hooks_register_every_native_exec_surface(lifecycle):
+    matcher = set(_hooks("hooks-codex.json")[lifecycle][0]["matcher"].split("|"))
+    assert CODEX_NATIVE_EXEC_TOOLS <= matcher
+    # The Claude-style names stay: a build may still send either spelling.
+    assert {"Bash", "PowerShell", "Monitor", "apply_patch"} <= matcher
+
+
+def test_codex_matcher_and_adapter_registry_agree_on_native_tools():
+    """Each native name the matcher delivers must be one the adapter models.
+
+    The matcher also carries Claude-style names Codex does not model
+    (`Write`/`Edit`/`NotebookEdit`): Codex routes mutation through
+    `apply_patch`, and if a build ever sent one of those, asking beats passing
+    it. That is deliberate and unchanged here. The native exec surfaces must
+    not join them - a tool that runs commands and only ever prompts is a tool
+    agents route around.
+    """
+    matcher = set(
+        _hooks("hooks-codex.json")["PreToolUse"][0]["matcher"].split("|")
+    )
+    assert CODEX_NATIVE_EXEC_TOOLS <= matcher
+    assert CODEX_NATIVE_EXEC_TOOLS <= set(codex_adapter.MODELED_TOOLS)
+    for name in CODEX_NATIVE_EXEC_TOOLS - {"write_stdin"}:
+        payload = {"tool_name": name,
+                   "tool_input": {"command": ["git", "status"],
+                                  "cmd": "git status"}}
+        assert codex_adapter.unrecognized_tool(payload) is None, name
+        evlist = to_events(dict(payload, cwd="/repo", session_id="c"))
+        assert [ev.kind for ev in evlist] == [events.EXEC], name
+        assert evlist[0].command == "git status", name
+    # write_stdin is always uninspectable by design: it asks on every call.
+    assert codex_adapter.unrecognized_tool(
+        {"tool_name": "write_stdin", "tool_input": {"chars": "y\n"}}
+    ) is not None
+
+
 @pytest.mark.parametrize("manifest,root_name", [
     ("hooks.json", "CLAUDE_PLUGIN_ROOT"),
     ("hooks-codex.json", "PLUGIN_ROOT"),
@@ -60,7 +106,97 @@ def test_windows_hooks_use_python3_launcher_and_plugin_root(manifest, root_name)
         # stable and put runtime/encoding changes in the dispatcher instead.
         assert command.startswith("py.exe -3 ")
         assert "-X utf8" not in command
-        assert "${" + root_name + "}" in command
+        # Microsoft Store Python and conda installs have no py.exe. A hook that
+        # cannot spawn is a host hook error, and the tool call then proceeds
+        # unguarded, so the launcher must fall back to a bare `python`.
+        primary, _, fallback = command.partition(" || ")
+        assert fallback.startswith("python "), command
+        # Both legs address the same dispatcher, with the plugin root still
+        # quoted so an install path containing spaces survives cmd.exe.
+        target = '"${%s}\\scripts\\' % root_name
+        assert primary.count(target) == 1 and fallback.count(target) == 1
+        assert primary.endswith(lifecycle.lower()) and \
+            fallback.endswith(lifecycle.lower())
+
+
+@pytest.mark.parametrize("manifest,root_name", [
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT"),
+    ("hooks-codex.json", "PLUGIN_ROOT"),
+])
+def test_posix_hook_fallback_only_fires_when_python3_is_absent(manifest, root_name):
+    """A plain `||` reruns the adapter on *any* non-zero exit.
+
+    Both legs read the same stdin, so the second one gets a drained pipe and
+    appends a second JSON object to a stream that already holds a decision -
+    which the host cannot parse, and an unparseable decision is an allow.
+    Restrict the fallback to exit 127, the shell's "no such interpreter".
+    """
+    for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
+        command = _hooks(manifest)[lifecycle][0]["hooks"][0]["command"]
+        assert command.startswith("python3 ")
+        assert "[ $? -eq 127 ]" in command
+        assert '"${%s}/scripts/' % root_name in command
+        # No bare `|| python`: that is the fail-open spelling this guards.
+        assert "|| python " not in command
+
+
+def _json_objects(text):
+    """Split a stdout blob into the top-level JSON objects it actually holds."""
+    decoder = json.JSONDecoder()
+    objects, index = [], 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        value, index = decoder.raw_decode(text, index)
+        objects.append(value)
+    return objects
+
+
+def _shim_path_without_python3(tmp_path):
+    """A PATH directory that offers `python` but no `python3` at all."""
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "python"
+    shim.write_text('#!/bin/sh\nexec "%s" "$@"\n' % sys.executable, encoding="utf-8")
+    shim.chmod(0o755)
+    return shim_dir
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hook command string")
+@pytest.mark.parametrize("manifest,root_name,shadow", [
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT", False),
+    ("hooks.json", "CLAUDE_PLUGIN_ROOT", True),
+    ("hooks-codex.json", "PLUGIN_ROOT", False),
+    ("hooks-codex.json", "PLUGIN_ROOT", True),
+])
+def test_posix_hook_command_emits_exactly_one_decision(
+        manifest, root_name, shadow, tmp_path):
+    """Spawn the literal manifest command the way the host does.
+
+    With `python3` present the first leg answers. With `python3` absent the
+    shell reports 127 and the fallback answers. Either way the host must find
+    exactly one JSON object on stdout - two would be unparseable, and an
+    unparseable decision is an allow.
+    """
+    command = _hooks(manifest)["PreToolUse"][0]["hooks"][0]["command"]
+    shell = shutil.which("sh")
+    assert shell, "no POSIX shell to run the hook command with"
+    env = dict(os.environ, AGW_HOME=str(tmp_path / "agw-home"),
+               AGW_APPROVAL_PROVIDER="headless", AGW_TEST_MODE="1")
+    env[root_name] = str(PLUGIN)
+    if shadow:
+        env["PATH"] = str(_shim_path_without_python3(tmp_path))
+    payload = {"tool_name": "Shell", "cwd": str(tmp_path),
+               "tool_input": {"command": "rm -rf ~/Documents"},
+               "session_id": "one-object", "hook_event_name": "PreToolUse"}
+    result = subprocess.run([shell, "-c", command], input=json.dumps(payload),
+                            capture_output=True, text=True, env=env, timeout=60)
+    objects = _json_objects(result.stdout)
+    assert len(objects) == 1, (result.stdout, result.stderr)
+    decision = objects[0]["hookSpecificOutput"]["permissionDecision"]
+    # Claude asks; Codex has no hook-level ask and denies through the provider.
+    assert decision in ("ask", "deny")
 
 
 @pytest.mark.parametrize("tool,command", [
@@ -457,6 +593,70 @@ def test_sessionstart_uses_host_approval_without_security_workarounds():
         assert "never change acls" in context
         assert "filesystem permissions" in context
         assert "path" in context
+
+
+def _gitattributes_lines():
+    text = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def test_batch_launchers_are_checked_out_with_crlf():
+    """cmd.exe seeks through a batch file by byte offset and re-reads after
+    every command, so `goto :label` and parenthesised blocks resolve against
+    file positions. agw.cmd uses both, and an LF-only checkout shifts them."""
+    lines = _gitattributes_lines()
+    for pattern in ("*.cmd", "*.bat"):
+        matches = [line for line in lines if line.split()[0] == pattern]
+        assert matches, f"{pattern} has no .gitattributes rule"
+        assert "eol=crlf" in matches[-1], matches
+    # A broad `plugin/bin/* text eol=lf` sits above these, and the last matching
+    # rule wins, so the batch rules have to come after it.
+    assert lines.index([l for l in lines if l.split()[0] == "*.cmd"][-1]) > \
+        lines.index([l for l in lines if l.split()[0] == "plugin/bin/*"][-1])
+
+
+def test_gitattributes_only_protects_paths_that_exist():
+    """A rule naming a path that does not exist protects nothing, silently.
+
+    `synthetic/cowork-safety-lab/workspace/**` was such a rule: the real tree is
+    `synthetic/safety-lab/`, so the byte-exact fixtures it claimed to protect
+    were normalized like any other text on a Windows checkout.
+    """
+    for line in _gitattributes_lines():
+        pattern = line.split()[0]
+        if "/" not in pattern or pattern.startswith("*"):
+            continue
+        base = pattern.split("*", 1)[0].rstrip("/")
+        assert (ROOT / base).exists(), f"{pattern} names a path that does not exist"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_git_resolves_the_batch_launcher_to_crlf():
+    resolved = subprocess.run(
+        ["git", "check-attr", "text", "eol", "--", "plugin/bin/agw.cmd"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=30,
+    )
+    if resolved.returncode != 0:  # not a work tree (packed artifact run)
+        pytest.skip(resolved.stderr.strip() or "git check-attr unavailable")
+    assert "eol: crlf" in resolved.stdout, resolved.stdout
+
+
+def test_readme_release_banner_names_the_shipped_version():
+    """The banner is the first version a human reads, and it drifted.
+
+    It advertised `0.3.23` as the Windows-first stable release; no v0.3.23 tag
+    ever existed (tags jump v0.3.6 -> v0.3.26) while every manifest said 0.4.4.
+    """
+    version = json.loads(
+        (PLUGIN / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )["version"]
+    banner = next(line for line in (ROOT / "README.md").read_text(
+        encoding="utf-8").splitlines() if "**Release status:**" in line)
+    assert f"`{version}`" in banner, banner
+    # RELEASING.md must list the banner, or nothing makes the next bump happen.
+    releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    assert "Release status" in releasing and "README.md" in releasing
 
 
 def test_host_registry_marks_only_maintained_hosts_release_blocking():

@@ -17,7 +17,15 @@ import re
 import shlex
 from typing import Optional
 
-from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
+from .mcpshell import inline_posix_script_index
+from .shellparse import (DIALECT_POWERSHELL, ParseUncertain,
+                         collapse_powershell_line_continuations,
+                         extract_commands)
+
+# The canonical collapser now lives in the parser, which has to apply it
+# before it can tokenize a multi-line PowerShell command at all. Kept under
+# the old private name so the launcher's call sites read unchanged.
+_collapse_powershell_line_continuations = collapse_powershell_line_continuations
 
 
 _SHORTCUT = re.compile(r"^(?P<indent>\s*)(?P<name>agw(?:\.cmd)?)(?=$|\s)", re.IGNORECASE)
@@ -79,47 +87,6 @@ def _has_powershell_control_syntax(command: str) -> bool:
             return True
         index += 1
     return bool(quote)
-
-
-def _collapse_powershell_line_continuations(command: str) -> str:
-    """Remove only PowerShell's exact backtick-newline continuation.
-
-    A backtick must be the final character on the physical line. Backticks in
-    single-quoted strings are literal, and any whitespace between a backtick
-    and newline intentionally leaves the newline for fail-closed handling.
-    """
-    out = []
-    in_single = False
-    in_double = False
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "'" and not in_double:
-            if in_single and index + 1 < len(command) and command[index + 1] == "'":
-                out.extend((char, char))
-                index += 2
-                continue
-            in_single = not in_single
-            out.append(char)
-            index += 1
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            out.append(char)
-            index += 1
-            continue
-        if char == "`" and not in_single and index + 1 < len(command):
-            following = command[index + 1]
-            if following == "\n":
-                index += 2
-                continue
-            if following == "\r" and index + 2 < len(command) \
-                    and command[index + 2] == "\n":
-                index += 3
-                continue
-        out.append(char)
-        index += 1
-    return "".join(out)
 
 
 def _powershell_segment_end(command: str, start: int) -> tuple[int, bool]:
@@ -415,9 +382,52 @@ def rewrite_trusted_workflow(command: str, workflow_id: str, plugin_root: str, *
             + shlex.quote(payload))
 
 
-def updated_tool_input(payload: dict, rewritten_command: str) -> dict:
-    """Copy the complete tool input while replacing only its command."""
+def _spliced_argv(argv: list, rewritten_command: str) -> Optional[list]:
+    """Put a rewritten command line back into the argv list it came from.
+
+    The command the engine evaluated came out of `argv_command`, so the way
+    back in is that normalization run backwards: an inline `-lc` body is
+    replaced in the argv slot it was lifted from, keeping the interpreter
+    wrapper the host execs, and anything else is re-split out of the
+    shell-quoted join it was built from. `shlex.split` inverts `shlex.join`
+    exactly, and the only unquoted text a rewrite adds is a `shlex.quote`d
+    launcher path, so the original argument boundaries survive the round trip.
+    """
+    index = inline_posix_script_index(argv)
+    if index is not None:
+        return argv[:index] + [rewritten_command] + argv[index + 1:]
+    try:
+        spliced = shlex.split(rewritten_command)
+    except ValueError:
+        return None
+    return spliced or None
+
+
+def updated_tool_input(payload: dict, rewritten_command: str) -> Optional[dict]:
+    """Copy the complete tool input while replacing only its command.
+
+    The replacement keeps the payload's own shape. A host that hands over an
+    argv list gets an argv list back: handing it a string would make it exec a
+    single file with that name, or - worse - a different command than the one
+    the decision was made about. A host that carries its command under `cmd`
+    gets `cmd` rewritten, because writing `command` beside it would leave the
+    rewrite a silent no-op while the decision still said allow.
+
+    Returns ``None`` when the rewrite cannot be expressed in the original
+    shape. The caller must then drop the rewrite entirely rather than emit an
+    ``updatedInput`` the host cannot run.
+    """
     tool_input = dict(payload.get("tool_input") or {})
+    command = tool_input.get("command")
+    if isinstance(command, (list, tuple)):
+        spliced = _spliced_argv(list(command), rewritten_command)
+        if spliced is None:
+            return None
+        tool_input["command"] = spliced
+        return tool_input
+    if "command" not in tool_input and "cmd" in tool_input:
+        tool_input["cmd"] = rewritten_command
+        return tool_input
     tool_input["command"] = rewritten_command
     return tool_input
 
@@ -426,6 +436,11 @@ def attach_rewrite(out: dict, payload: dict, rewritten_command: Optional[str],
                    *, may_run: bool) -> dict:
     """Attach a host-supported PreToolUse rewrite to an existing decision."""
     if not rewritten_command or not may_run:
+        return out
+    updated = updated_tool_input(payload, rewritten_command)
+    if updated is None:
+        # The rewrite cannot be spelled in the payload's own shape. Say nothing
+        # rather than hand the host an input it would exec as something else.
         return out
     result = dict(out)
     specific = dict(result.get("hookSpecificOutput") or {})
@@ -437,6 +452,6 @@ def attach_rewrite(out: dict, payload: dict, rewritten_command: Optional[str],
             "permissionDecisionReason",
             "Resolved the trusted Agentic Guardrails launcher.",
         )
-    specific["updatedInput"] = updated_tool_input(payload, rewritten_command)
+    specific["updatedInput"] = updated
     result["hookSpecificOutput"] = specific
     return result

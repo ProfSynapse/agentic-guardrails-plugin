@@ -7,9 +7,11 @@ built-ins (profiles/*.yaml in the plugin, ~/.agw/profiles.d for local).
 """
 from __future__ import annotations
 
+import json
 import os
 import stat as stat_mod
 import sys
+import time
 from dataclasses import dataclass, field
 
 GDOC_STUB_EXTS = {".gdoc", ".gsheet", ".gslides", ".gdraw", ".gform", ".gtable", ".gjam"}
@@ -47,6 +49,21 @@ BUILTIN = {
 }
 
 _cache: dict = {}
+
+# The marker walk (up to twelve ancestors, five existence probes each) is the
+# only part of detection that touches the disk, and a hook process never gets
+# to reuse its answer: `_cache` above dies with the process. The walk's result
+# for a directory is therefore also kept under $AGW_HOME/profile-cache.json,
+# keyed on the st_mtime_ns of the directory and each ancestor probed (a marker
+# created or removed inside a directory changes that directory's mtime), with a
+# short TTL as a safety net. Only folder-profile verdicts are stored here;
+# placeholder detection for a file is never cached.
+_PROFILE_CACHE_SCHEMA = "agw.profile-cache/1"
+_PROFILE_CACHE_NAME = "profile-cache.json"
+_PROFILE_CACHE_TTL = 600
+_PROFILE_CACHE_MAX = 256
+_MARKER_DEPTH = 12
+_persisted = None  # (agw_home, entries) loaded once per process
 
 
 def detect(path: str, *, assume_directory: bool = False, override: str = "") -> Profile:
@@ -118,26 +135,109 @@ def _detect_uncached(directory: str) -> Profile:
     if "dropbox" in label:
         return BUILTIN["dropbox"]
 
-    # Marker paths walking up. Direct existence probes avoid enumerating every
-    # entry in every ancestor directory.
+    return BUILTIN[_marker_profile(directory)]
+
+
+def _ancestors(directory: str) -> list:
+    """The directory and its parents, innermost first, as the walk probes them."""
+    chain = []
     cur = directory
-    git_found = False
-    for _ in range(12):
-        if any(os.path.exists(os.path.join(cur, marker))
-               for marker in (".tmp.drivedownload", ".tmp.driveupload")):
-            return BUILTIN["gdrive-sync"]
-        if any(os.path.exists(os.path.join(cur, marker))
-               for marker in (".dropbox.cache", ".dropbox")):
-            return BUILTIN["dropbox"]
-        if os.path.exists(os.path.join(cur, ".git")):
-            git_found = True
+    for _ in range(_MARKER_DEPTH):
+        chain.append(cur)
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
-    if git_found:
-        return BUILTIN["git"]
-    return BUILTIN["local"]
+    return chain
+
+
+def _walk_markers(ancestors: list) -> str:
+    """Marker paths walking up. Direct existence probes avoid enumerating every
+    entry in every ancestor directory."""
+    git_found = False
+    for cur in ancestors:
+        if any(os.path.exists(os.path.join(cur, marker))
+               for marker in (".tmp.drivedownload", ".tmp.driveupload")):
+            return "gdrive-sync"
+        if any(os.path.exists(os.path.join(cur, marker))
+               for marker in (".dropbox.cache", ".dropbox")):
+            return "dropbox"
+        if os.path.exists(os.path.join(cur, ".git")):
+            git_found = True
+    return "git" if git_found else "local"
+
+
+def _marker_key(ancestors: list) -> list:
+    key = []
+    for cur in ancestors:
+        try:
+            key.append([cur, os.stat(cur).st_mtime_ns])
+        except OSError:
+            key.append([cur, None])
+    return key
+
+
+def _agw_home() -> str:
+    return os.environ.get("AGW_HOME") or os.path.join(os.path.expanduser("~"), ".agw")
+
+
+def _persisted_entries(home: str) -> dict:
+    """The on-disk entries, read once per process (per AGW_HOME)."""
+    global _persisted
+    if _persisted is not None and _persisted[0] == home:
+        return _persisted[1]
+    entries = {}
+    try:
+        with open(os.path.join(home, _PROFILE_CACHE_NAME), "rb") as handle:
+            data = json.loads(handle.read().decode("utf-8"))
+        if isinstance(data, dict) and data.get("schema") == _PROFILE_CACHE_SCHEMA \
+                and isinstance(data.get("entries"), dict):
+            entries = data["entries"]
+    except (OSError, ValueError, UnicodeDecodeError):
+        entries = {}
+    _persisted = (home, entries)
+    return entries
+
+
+def _remember(home: str, entries: dict, directory: str, key: list, name: str) -> None:
+    """Add one verdict and rewrite the file atomically. Best effort only."""
+    entries[directory] = {"key": key, "profile": name, "at": time.time()}
+    if len(entries) > _PROFILE_CACHE_MAX:
+        oldest = sorted(entries, key=lambda item: entries[item].get("at", 0))
+        for item in oldest[:len(entries) - _PROFILE_CACHE_MAX]:
+            del entries[item]
+    if not os.path.isdir(home):
+        # Detection must not create the store root as a side effect: a scan
+        # of a tree that happens to contain AGW_HOME would then find it.
+        return
+    path = os.path.join(home, _PROFILE_CACHE_NAME)
+    temp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"schema": _PROFILE_CACHE_SCHEMA, "entries": entries}))
+        os.replace(temp, path)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
+def _marker_profile(directory: str) -> str:
+    """The marker-walk verdict for a directory, from the persisted cache when
+    the directory and its ancestors are unchanged and the entry is fresh."""
+    ancestors = _ancestors(directory)
+    key = _marker_key(ancestors)
+    home = _agw_home()
+    entries = _persisted_entries(home)
+    entry = entries.get(directory)
+    if isinstance(entry, dict) and entry.get("key") == key \
+            and entry.get("profile") in BUILTIN and entry.get("profile") != "unknown" \
+            and 0 <= time.time() - float(entry.get("at", 0)) <= _PROFILE_CACHE_TTL:
+        return entry["profile"]
+    name = _walk_markers(ancestors)
+    _remember(home, entries, directory, key, name)
+    return name
 
 
 def _windows_volume_label(path: str) -> str:

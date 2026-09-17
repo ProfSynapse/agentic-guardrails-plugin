@@ -153,6 +153,89 @@ def test_custom_failure_matrix_is_degraded_and_atomic(
     assert policy.settings.get("level") != "relaxed"
 
 
+@pytest.fixture()
+def without_pyyaml(monkeypatch):
+    """Force the stdlib-only reader, the plugin's documented primary mode."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "yaml", None)  # `import yaml` -> ImportError
+    return None
+
+
+# Everything PyYAML rejects among the constructs core.yaml actually uses.
+# miniyaml is the only policy reader when PyYAML is absent, so a shape it
+# accepts as a plain string is a corrupt pack that loads as HEALTHY.
+MINIYAML_REJECTS = [
+    "commands:\n  - pattern: [unclosed",
+    "k: [unclosed",
+    "k: [a, [b]",
+    "k: [a] [b]",
+    "k: {unclosed",
+    "k: {a: 1}",
+    "k: ]stray",
+    "k: }stray",
+    'k: "unterminated',
+    "k: 'unterminated",
+    "commands:\n\t- pattern: rm *\n",
+    "commands:\n  - pattern: rm *\n\taction: deny\n",
+]
+MINIYAML_ACCEPTS = [
+    ("k: [a, b]", {"k": ["a", "b"]}),
+    ("k: []", {"k": []}),
+    ('applies_to: ["*.py", "*.js"]', {"applies_to": ["*.py", "*.js"]}),
+    ('k: "AKIA[0-9A-Z]{16}"', {"k": "AKIA[0-9A-Z]{16}"}),
+    ("k: a]b", {"k": "a]b"}),
+    ("k: a[b", {"k": "a[b"}),
+    ("k: don't stop", {"k": "don't stop"}),
+    ("snippets:\n  - pattern: '[unterminated'\n    action: deny\n",
+     {"snippets": [{"pattern": "[unterminated", "action": "deny"}]}),
+]
+
+
+@pytest.mark.parametrize("document", MINIYAML_REJECTS)
+def test_miniyaml_rejects_the_documents_pyyaml_rejects(document):
+    from core import miniyaml
+
+    with pytest.raises(miniyaml.MiniYamlError):
+        miniyaml.loads(document)
+
+
+@pytest.mark.parametrize("document,expected", MINIYAML_ACCEPTS)
+def test_miniyaml_still_reads_the_shapes_core_yaml_uses(document, expected):
+    from core import miniyaml
+
+    assert miniyaml.loads(document) == expected
+
+
+def test_shipped_core_policy_parses_under_the_stdlib_reader():
+    from core import miniyaml
+
+    with open(os.path.join(REPO, "policies", "core.yaml"), encoding="utf-8") as fh:
+        data = miniyaml.loads(fh.read())
+    assert isinstance(data, dict) and data.get("commands")
+
+
+@pytest.mark.parametrize("document", MINIYAML_REJECTS)
+def test_corrupt_custom_pack_is_degraded_without_pyyaml(
+        tmp_path, agw_home, without_pyyaml, document):
+    directory = tmp_path / "agw-home" / "policies.d"
+    directory.mkdir(parents=True)
+    (directory / "broken.yaml").write_text(document)
+    policy = engine.load_policy(REPO)
+    assert policy.health == policy_health.DEGRADED
+
+
+@pytest.mark.parametrize("document", MINIYAML_REJECTS)
+def test_corrupt_baseline_is_unavailable_without_pyyaml(
+        tmp_path, without_pyyaml, document):
+    plugin = tmp_path / "plugin"
+    policies = plugin / "policies"
+    policies.mkdir(parents=True)
+    (policies / "core.yaml").write_text(document)
+    policy = engine.load_policy(str(plugin))
+    assert policy.health == policy_health.UNAVAILABLE
+
+
 def test_custom_policy_discovery_failure_is_degraded(monkeypatch, agw_home):
     original = engine._policy_files
     local = os.path.normcase(os.path.abspath(os.path.join(agw_home, "policies.d")))

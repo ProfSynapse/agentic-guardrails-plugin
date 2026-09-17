@@ -1,6 +1,8 @@
 """Prompt-noise regressions for contextual and target-aware classification."""
 import os
 
+import pytest
+
 from core import engine
 from core.events import ALLOW, ASK, DENY, DEFER, OTHER, READ, ToolEvent
 
@@ -77,3 +79,15 @@ def test_apply_patch_unknown_targets_denies_without_prompt(policy):
     decision = engine.evaluate(event, policy, PLUGIN_ROOT)
     assert decision.action == DENY
     assert "explicit file paths" in decision.reason.lower()
+
+
+# ---- F7: a hyphenated word must not move a Bash line into PowerShell -----
+
+@pytest.mark.parametrize("command", [
+    'curl -H "Content-Type: application/json" https://x.test',
+    'curl -H "X-Request-Id: abc" -H "Accept-Encoding: gzip" https://x.test',
+    "echo Foo-Bar > /dev/null",
+    "grep My-App src/",
+])
+def test_hyphenated_words_stay_posix_and_benign(evaluate, command):
+    assert evaluate(command).action != DENY, command

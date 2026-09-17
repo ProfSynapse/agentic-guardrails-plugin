@@ -1029,3 +1029,425 @@ def test_codex_powershell_ambiguous_backtick_is_nonwaivable_deny(
                    env_extra={"AGW_HOME": str(tmp_path / "home"),
                               "AGW_LEVEL": "observe"})
     assert _decision(out) == "deny"
+
+
+class _RecordingStdout:
+    """A stdout that remembers how many separate writes reached it."""
+
+    def __init__(self):
+        self.writes = []
+        self.flushes = 0
+
+    def write(self, text):
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self):
+        self.flushes += 1
+
+    def isatty(self):
+        return False
+
+
+@pytest.mark.parametrize("case", ["deny", "defer"])
+def test_codex_decision_reaches_stdout_in_exactly_one_write(
+        case, tmp_path, monkeypatch):
+    """P3 in the 2026-09-17 audit: `json.dump` streamed chunks at stdout, so a
+    failure partway through left a truncated object and the fail-closed handler
+    appended a second one. The host can parse neither, and an unparseable
+    decision is an allow."""
+    import io
+
+    cptu = _load_codex_pretooluse_isolated()
+
+    payloads = {
+        "deny": {"tool_name": "Bash", "tool_input": {"command": "rm important.txt"}},
+        "defer": {"tool_name": "Bash", "tool_input": {"command": "git status"}},
+    }
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGW_APPROVAL_PROVIDER", "headless")
+    monkeypatch.setenv("AGW_TEST_MODE", "1")
+    payload = {**payloads[case], "cwd": str(tmp_path),
+               "session_id": f"codex-one-write-{case}", "event_id": f"ev-{case}",
+               "hook_event_name": "PreToolUse"}
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(cptu, "_EMITTED", False, raising=False)
+    cptu.main()
+    if case == "defer":
+        assert recorder.writes == []
+        return
+    assert len(recorder.writes) == 1, recorder.writes
+    assert recorder.flushes >= 1
+    json.loads(recorder.writes[0])
+
+
+def test_codex_fail_closed_handler_never_appends_a_second_object(monkeypatch):
+    cptu = _load_codex_pretooluse_isolated()
+
+    recorder = _RecordingStdout()
+    monkeypatch.setattr("sys.stdout", recorder)
+    monkeypatch.setattr(cptu, "_EMITTED", False, raising=False)
+
+    cptu._fail_closed()
+    assert len(recorder.writes) == 1
+    assert json.loads(recorder.writes[0])["hookSpecificOutput"][
+        "permissionDecision"] == "deny"
+
+    recorder.writes.clear()
+    cptu._emit({"systemMessage": "already decided"})
+    cptu._fail_closed()
+    assert len(recorder.writes) == 1, recorder.writes
+    json.loads(recorder.writes[0])
+
+
+def run_codex_dispatch_raw(payload, tmp_path, event="pretooluse"):
+    """Drive the real hooks-codex.json entry point, keeping the streams apart."""
+    dispatch = os.path.join(REPO, "scripts", "codex", "_dispatch.py")
+    env = dict(os.environ, PLUGIN_ROOT=REPO, AGW_HOME=str(tmp_path / "home"),
+               AGW_APPROVAL_PROVIDER="headless", AGW_TEST_MODE="1")
+    payload.setdefault("hook_event_name", "PreToolUse")
+    return subprocess.run([sys.executable, dispatch, event],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=30)
+
+
+@pytest.mark.parametrize("payload,label", [
+    ({"tool_name": "Shell", "tool_input": {"command": "rm -rf ~/Documents"}},
+     "'Shell'"),
+    ({"tool_name": "sh_exec", "tool_input": {"command": "rm -rf ~/Documents"}},
+     "'sh_exec'"),
+    ({"tool_input": {"command": "rm -rf ~/Documents"}}, "no tool name"),
+])
+def test_codex_unrecognized_tool_never_silently_allows(payload, label, tmp_path):
+    # Audit F2: an unmodeled tool name reached events.OTHER, the engine
+    # DEFERred, and an empty stdout is a silent allow. Codex cannot render a
+    # hook-level ASK, so the ASK is resolved through the approval provider;
+    # headless (and provider-absent) always denies, which is the fail-closed
+    # answer the Codex crash policy already uses.
+    result = run_codex_dispatch_raw(
+        dict(payload, cwd=str(tmp_path), session_id="unknown-tool"), tmp_path
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip(), "unrecognized tool produced no decision"
+    out = json.loads(result.stdout)
+    assert _decision(out) == "deny"
+    assert out["hookSpecificOutput"]["agwRefusal"]["rule_id"] == \
+        "builtin:unrecognized-tool"
+    assert "agentic-guardrails:" in result.stderr
+    assert label in result.stderr
+    assert "update the plugin" in result.stderr
+
+
+def test_codex_unrecognized_tool_is_not_waivable_by_observe_mode(tmp_path):
+    result = run_codex_dispatch_raw(
+        {"tool_name": "Shell", "tool_input": {"command": "rm -rf /"},
+         "cwd": str(tmp_path), "session_id": "observe-unknown"}, tmp_path
+    )
+    assert result.returncode == 0
+    observed = subprocess.run(
+        [sys.executable, os.path.join(REPO, "scripts", "codex", "_dispatch.py"),
+         "pretooluse"],
+        input=json.dumps({"tool_name": "Shell",
+                          "tool_input": {"command": "rm -rf /"},
+                          "cwd": str(tmp_path), "session_id": "observe-unknown",
+                          "hook_event_name": "PreToolUse"}),
+        capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, PLUGIN_ROOT=REPO, AGW_HOME=str(tmp_path / "home2"),
+                 AGW_APPROVAL_PROVIDER="headless", AGW_TEST_MODE="1",
+                 AGW_ENFORCEMENT="observe"),
+    )
+    assert observed.stdout.strip()
+    assert _decision(json.loads(observed.stdout)) == "deny"
+
+
+# `update_plan` is recognized here but still denied further down by
+# mutations.plan's name-based net for events.OTHER (_MUTATION_WORDS matches
+# "update"). That is pre-existing behavior in core/mutations.py, and no tool in
+# this list is in the hooks-codex.json matcher, so the hook never sees them.
+@pytest.mark.parametrize("tool", [
+    "view_image", "web_search", "Task", "Agent",
+    "AskUserQuestion", "ExitPlanMode", "Skill", "SlashCommand", "ToolSearch",
+    "BashOutput", "KillShell", "LS", "WebFetch", "WebSearch",
+])
+def test_codex_known_harmless_tools_still_pass_without_prompting(tool, tmp_path):
+    out = run_hook({"tool_name": tool, "tool_input": {},
+                    "cwd": str(tmp_path), "session_id": "inert"},
+                   env_extra={"AGW_HOME": str(tmp_path / "home")})
+    assert _decision(out) == "defer"
+
+
+def test_codex_registry_recognizes_modeled_and_mcp_tools():
+    from codex.adapter_common import unrecognized_tool
+
+    for name in ("Bash", "PowerShell", "Monitor", "apply_patch", "Read",
+                 "Glob", "Grep", "mcp__anything__at_all"):
+        assert unrecognized_tool({"tool_name": name}) is None, name
+    # Codex's own exec surfaces are modeled, so a readable payload evaluates
+    # normally instead of prompting on every call.
+    for name in ("shell", "local_shell"):
+        assert unrecognized_tool(
+            {"tool_name": name, "tool_input": {"command": ["git", "status"]}}
+        ) is None, name
+    assert unrecognized_tool(
+        {"tool_name": "exec_command", "tool_input": {"cmd": "git status"}}
+    ) is None
+    # A recognized tool carrying nothing readable still fails closed, with its
+    # own label rather than the "unknown tool" one.
+    from codex.adapter_common import UNINSPECTABLE_STDIN, UNREADABLE_SHELL
+
+    assert unrecognized_tool({"tool_name": "shell"}) == UNREADABLE_SHELL
+    assert unrecognized_tool(
+        {"tool_name": "local_shell", "tool_input": {"command": ["rm", 7]}}
+    ) == UNREADABLE_SHELL
+    assert unrecognized_tool(
+        {"tool_name": "exec_command", "tool_input": {"cmd": ["ls"]}}
+    ) is None
+    assert unrecognized_tool(
+        {"tool_name": "exec_command", "tool_input": {"cmd": 17}}
+    ) == UNREADABLE_SHELL
+    # write_stdin is recognized and never inspectable: it always asks.
+    assert unrecognized_tool(
+        {"tool_name": "write_stdin",
+         "tool_input": {"session_id": "s", "chars": "y\n"}}
+    ) == UNINSPECTABLE_STDIN
+
+
+# --- Codex-native exec surfaces ----------------------------------------------
+# `shell`/`local_shell`/`exec_command`/`write_stdin` are the tool names Codex
+# builds emit natively. Until they were added to the matcher and to to_events,
+# a build using them ran every command completely unguarded: the manifest's
+# matcher listed only Claude's tool names, so the hook never fired at all.
+
+NATIVE_ARGV_SHELLS = ("shell", "local_shell")
+
+
+def _native_cwd(tmp_path):
+    (tmp_path / "node_modules").mkdir(exist_ok=True)
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize("tool", NATIVE_ARGV_SHELLS)
+def test_native_shell_argv_wrapper_is_unwrapped_and_denied(tool, tmp_path):
+    # `bash -lc` is the shape Codex actually sends. shellparse only recurses a
+    # literal `-c`, so without the adapter lifting the script out, the whole
+    # deletion hides behind an unrecognized wrapper flag.
+    result = run_codex_dispatch_raw(
+        {"tool_name": tool,
+         "tool_input": {"command": ["bash", "-lc", "rm -rf ~/Documents"]},
+         "cwd": _native_cwd(tmp_path), "session_id": "native-rm"}, tmp_path
+    )
+    assert result.returncode == 0
+    out = json.loads(result.stdout)
+    assert _decision(out) == "deny"
+    assert "agw archive" in _reason(out)
+
+
+@pytest.mark.parametrize("tool", NATIVE_ARGV_SHELLS)
+def test_native_shell_bare_argv_is_joined_with_shell_quoting(tool, tmp_path):
+    # A bare argv list carries no interpreter; it still has to evaluate as the
+    # command line it is, so the regenerable-tree allowance can recognize it.
+    result = run_codex_dispatch_raw(
+        {"tool_name": tool,
+         "tool_input": {"command": ["rm", "-rf", "node_modules"]},
+         "cwd": _native_cwd(tmp_path), "session_id": "native-regenerable"},
+        tmp_path
+    )
+    assert result.returncode == 0
+    out = json.loads(result.stdout)
+    assert _decision(out) != "deny"
+
+
+@pytest.mark.parametrize("tool", NATIVE_ARGV_SHELLS)
+def test_native_shell_benign_argv_is_not_blocked(tool, tmp_path):
+    result = run_codex_dispatch_raw(
+        {"tool_name": tool, "tool_input": {"command": ["git", "status"]},
+         "cwd": _native_cwd(tmp_path), "session_id": "native-benign"}, tmp_path
+    )
+    assert result.returncode == 0
+    out = json.loads(result.stdout) if result.stdout.strip() else {}
+    assert _decision(out) not in ("deny", "ask")
+
+
+def test_native_exec_command_is_denied(tmp_path):
+    result = run_codex_dispatch_raw(
+        {"tool_name": "exec_command",
+         "tool_input": {"cmd": "rm -rf ~/Documents"},
+         "cwd": _native_cwd(tmp_path), "session_id": "unified-exec"}, tmp_path
+    )
+    assert result.returncode == 0
+    out = json.loads(result.stdout)
+    assert _decision(out) == "deny"
+    assert "agw archive" in _reason(out)
+
+
+def test_native_exec_command_honours_the_named_interpreter(tmp_path):
+    # `shell: pwsh` makes the same text a PowerShell script. The wrapper is put
+    # back so shellparse reads it in the PowerShell dialect.
+    result = run_codex_dispatch_raw(
+        {"tool_name": "exec_command",
+         "tool_input": {"cmd": "Remove-Item -Recurse -Force .codex",
+                        "shell": "pwsh"},
+         "cwd": _native_cwd(tmp_path), "session_id": "unified-pwsh"}, tmp_path
+    )
+    assert result.returncode == 0
+    assert _decision(json.loads(result.stdout)) == "deny"
+
+
+@pytest.mark.parametrize("payload,fragment", [
+    ({"tool_name": "write_stdin",
+      "tool_input": {"session_id": "running", "chars": "rm -rf ~/Documents\n"}},
+     "stdin to a running process cannot be inspected"),
+    ({"tool_name": "shell", "tool_input": {"command": ["rm", 7]}},
+     "could not read a command"),
+    ({"tool_name": "shell", "tool_input": {"command": {"argv": ["rm"]}}},
+     "could not read a command"),
+    ({"tool_name": "local_shell", "tool_input": {}},
+     "could not read a command"),
+    ({"tool_name": "exec_command", "tool_input": {"cmd": 17}},
+     "could not read a command"),
+])
+def test_native_uninspectable_call_fails_closed(payload, fragment, tmp_path):
+    # Codex cannot render a hook-level ASK, so it resolves through the approval
+    # provider; headless denies, which is the fail-closed answer. The reason is
+    # written to stderr so a host-side fall-through stays diagnosable.
+    result = run_codex_dispatch_raw(
+        dict(payload, cwd=str(tmp_path), session_id="uninspectable"), tmp_path
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip(), "uninspectable call produced no decision"
+    out = json.loads(result.stdout)
+    assert _decision(out) == "deny"
+    assert out["hookSpecificOutput"]["agwRefusal"]["rule_id"] == \
+        "builtin:unrecognized-tool"
+    assert "agentic-guardrails:" in result.stderr
+    assert fragment in result.stderr
+
+
+@pytest.mark.parametrize("payload", [
+    {"tool_name": "write_stdin",
+     "tool_input": {"session_id": "running", "chars": "y\n"}},
+    {"tool_name": "shell", "tool_input": {"command": ["rm", 7]}},
+])
+def test_native_uninspectable_call_is_an_ask_not_a_hard_deny(
+        payload, monkeypatch, capsys, tmp_path):
+    # The fail-closed path is an ASK the user can answer, not an unconditional
+    # block: an approving provider lets the call through.
+    import io as _io
+    from core.approvals import ApprovalProvider, ApprovalResponse
+
+    ptu = _load_codex_pretooluse_isolated()
+
+    class Approve(ApprovalProvider):
+        def request(self, request):
+            return ApprovalResponse(True, "approved")
+
+    monkeypatch.setenv("AGW_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("sys.stdin", _io.StringIO(json.dumps(
+        dict(payload, cwd=str(tmp_path), session_id="approved-uninspectable",
+             hook_event_name="PreToolUse"))))
+    ptu.main(Approve())
+    out = capsys.readouterr().out
+    data = json.loads(out) if out.strip() else {}
+    assert data.get("hookSpecificOutput", {}).get(
+        "permissionDecision") != "deny"
+
+
+def test_native_shell_honours_workdir_over_the_payload_cwd(tmp_path):
+    from codex.adapter_common import to_events
+
+    workdir = tmp_path / "sub"
+    workdir.mkdir()
+    events = to_events({"tool_name": "shell",
+                        "tool_input": {"command": ["git", "status"],
+                                       "workdir": str(workdir)},
+                        "cwd": str(tmp_path), "session_id": "wd"})
+    assert [ev.cwd for ev in events] == [str(workdir)]
+    # No workdir: the session cwd still applies.
+    events = to_events({"tool_name": "shell",
+                        "tool_input": {"command": ["git", "status"]},
+                        "cwd": str(tmp_path), "session_id": "wd"})
+    assert [ev.cwd for ev in events] == [str(tmp_path)]
+
+
+def test_native_shell_argv_normalization():
+    from core import events as core_events
+    from codex.adapter_common import to_events
+
+    def command_of(tool_input):
+        evlist = to_events({"tool_name": "shell", "tool_input": tool_input,
+                            "cwd": "/repo", "session_id": "n"})
+        assert len(evlist) == 1 and evlist[0].kind == core_events.EXEC
+        return evlist[0].command
+
+    # A plain string is taken as written.
+    assert command_of({"command": "rm -rf x"}) == "rm -rf x"
+    # `-lc`/`-c` bodies are lifted out of the interpreter wrapper.
+    assert command_of({"command": ["bash", "-lc", "rm -rf x"]}) == "rm -rf x"
+    assert command_of({"command": ["/bin/sh", "-c", "rm -rf x"]}) == "rm -rf x"
+    assert command_of({"command": ["zsh", "-lic", "rm -rf x"]}) == "rm -rf x"
+    # A bare argv keeps every word as one argument, quoting as needed.
+    assert command_of({"command": ["rm", "-rf", "node_modules"]}) == \
+        "rm -rf node_modules"
+    assert command_of({"command": ["rm", "-rf", "my documents"]}) == \
+        "rm -rf 'my documents'"
+    # Windows interpreters keep their wrapper so shellparse picks the dialect.
+    assert command_of({"command": ["pwsh", "-Command", "Remove-Item x"]}) == \
+        "pwsh -Command 'Remove-Item x'"
+    assert command_of({"command": ["cmd.exe", "/c", "del x"]}) == \
+        "cmd.exe /c 'del x'"
+
+
+def test_native_update_plan_is_inert_and_outside_the_matcher():
+    """`update_plan` and `view_image` change nothing and are not intercepted.
+
+    They are in the adapter's inert registry, so if a payload ever reaches the
+    hook it is recognized rather than prompted for. They are deliberately NOT
+    in the hooks-codex.json matcher: the hook is only worth spawning for tools
+    that read, write, or run something.
+
+    A direct `update_plan` dispatch is still denied further down the pipeline by
+    mutations.plan's name-based net for events.OTHER (_MUTATION_WORDS matches
+    "update" in the tool name) - pre-existing behavior in core/mutations.py that
+    the matcher keeps out of reach.
+    """
+    from codex.adapter_common import INERT_TOOLS, unrecognized_tool
+
+    manifest = json.loads(
+        open(os.path.join(REPO, "hooks", "hooks-codex.json"),
+             encoding="utf-8").read()
+    )
+    for lifecycle in ("PreToolUse", "PostToolUse"):
+        matcher = set(
+            manifest["hooks"][lifecycle][0]["matcher"].split("|")
+        )
+        assert not ({"update_plan", "view_image"} & matcher), lifecycle
+    for name in ("update_plan", "view_image"):
+        assert name in INERT_TOOLS
+        assert unrecognized_tool({"tool_name": name, "tool_input": {}}) is None
+
+
+def test_native_exec_tools_are_all_in_the_codex_matcher():
+    """A modeled tool missing from the matcher is a dead guard.
+
+    This is the regression the whole native-tool change exists for: the matcher
+    listed only Claude's tool names, so a Codex build emitting `shell` never
+    reached the hook at all.
+    """
+    from codex.adapter_common import MODELED_TOOLS
+
+    manifest = json.loads(
+        open(os.path.join(REPO, "hooks", "hooks-codex.json"),
+             encoding="utf-8").read()
+    )
+    native = {"shell", "local_shell", "exec_command", "write_stdin"}
+    assert native <= MODELED_TOOLS
+    for lifecycle in ("PreToolUse", "PostToolUse"):
+        matcher = set(manifest["hooks"][lifecycle][0]["matcher"].split("|"))
+        assert native <= matcher, lifecycle
+        # Every command-running surface the adapter models must be delivered.
+        # (`Glob`/`Grep` are modeled as READ but sit outside both hosts'
+        # matchers; that gap predates this change and is not widened here.)
+        assert {"Bash", "PowerShell", "Monitor", "apply_patch", "Read"} <= \
+            matcher, lifecycle

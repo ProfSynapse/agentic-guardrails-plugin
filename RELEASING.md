@@ -13,6 +13,9 @@ The following distributable release surfaces must remain aligned:
 2. `plugin/.codex-plugin/plugin.json`
 3. the plugin entry in `.claude-plugin/marketplace.json`
 4. the corresponding release ref in `.agents/plugins/marketplace.json`
+5. the **Release status** banner near the top of `README.md` — it is the first
+   version a human reads, and it drifted to a `0.3.23` that never had a tag
+   while every manifest said `0.4.4`
 
 The two manifests and Claude catalog carry the plain version. During candidate
 validation both catalogs use `main`; after the tag-exists gate both use the same
@@ -22,12 +25,13 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.4.4`
+## Release gate for `0.5.0`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.4.4` before that tag exists.
+   `v0.5.0` before that tag exists.
 
-2. Confirm all three version fields are `0.4.4` and both refs are `main`, then run:
+2. Confirm all three version fields and the README banner read `0.5.0` and both
+   refs are `main`, then run:
 
    ```bash
    python -m pytest -q
@@ -63,12 +67,27 @@ release must bump the version.
    SessionStart adapter, installer, or launcher may persistently modify user or
    machine PATH.
 
-   Windows hook commands must use `py.exe -3` with the host-provided plugin
-   root. A bare `agw.cmd` is never trusted by basename: tests must prove its
+   Windows hook commands must probe `py.exe -3` and then `python`, both with the
+   host-provided plugin root; the POSIX legs probe `python3` and fall back to
+   `python` only on exit 127. Changing a hook command changes the hook
+   definition Codex pins, so call it out prominently in the release notes.
+   A bare `agw.cmd` is never trusted by basename: tests must prove its
    resolved origin is exactly the packaged launcher and that a workspace or
    PATH shim receives no Guardrails privileges. Monitor coverage validates only
    the documented literal `tool_input.command` normalization contract; do not
    describe it as a live-host probe.
+
+   **Hook definition changed in this release.** `plugin/hooks/hooks-codex.json`
+   gained `shell`, `local_shell`, `exec_command`, and `write_stdin` in the
+   PreToolUse and PostToolUse matchers, so builds that emit Codex's native tool
+   names are guarded instead of running unmatched. Codex pins the exact hook
+   definition hash, and a *matcher* change moves that hash just as a command
+   change does: **every existing install must re-trust the hooks** (`/hooks` in
+   Codex CLI, or the desktop trust dialog) or Codex silently skips them and the
+   session runs unguarded. Say so at the top of the release notes, not in a
+   changelog tail - an install that quietly stops enforcing looks identical to
+   one that has nothing to enforce. Enterprise fleets shipping managed hooks via
+   `requirements.toml` must roll the updated definition out at the same time.
 
    Approval-copy tests must cover the maintained prompt families using only
    closed rule/context mappings and safe category/count labels. Raw commands,
@@ -107,19 +126,19 @@ release must bump the version.
    git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json \
      .claude-plugin/marketplace.json .agents/plugins/marketplace.json \
      tests/test_packaging.py RELEASING.md
-   git commit -m "Release Agentic Guardrails 0.4.4"
+   git commit -m "Release Agentic Guardrails 0.5.0"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.4.4 --target <verified-main-commit-sha> \
-     --title "v0.4.4" --notes "..."
+   gh release create v0.5.0 --target <verified-main-commit-sha> \
+     --title "v0.5.0" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.4.4` in both marketplace catalogs, rerun JSON and artifact
+   `main` to `v0.5.0` in both marketplace catalogs, rerun JSON and artifact
    conformance, and merge the catalog pointer update through a follow-up pull
    request. This tag-exists gate is mandatory.
 

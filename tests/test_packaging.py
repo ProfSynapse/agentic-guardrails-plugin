@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.4.4"
+VERSION = "0.5.0"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -547,7 +547,10 @@ def test_packed_host_history_boundary_never_touches_legacy_audit(
     out = _run_dispatch(packed_plugin, host, payload, tmp_path)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert legacy.read_bytes() == original
-    assert sorted(path.relative_to(home) for path in home.rglob("*")) == [
+    # The hook may leave its policy and profile caches behind (policy-cache.json,
+    # profile-cache.json); those are accelerators, not history. Nothing else.
+    assert sorted(path.relative_to(home) for path in home.rglob("*")
+                  if not path.name.endswith("-cache.json")) == [
         Path("audit.jsonl")
     ]
     imported = _packed_core(

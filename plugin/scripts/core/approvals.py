@@ -2,14 +2,25 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import ctypes
-from ctypes import wintypes
 from dataclasses import dataclass
 import hashlib
-import json
 import os
+import sys
 import threading
 import time
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+else:
+    # Off Windows nothing here can open a dialog, and `ctypes` plus
+    # `ctypes.wintypes` cost ~2 ms of the per-call hook budget on every
+    # platform. The Win32 ABI below is therefore built on first touch - by
+    # `_ensure_win32_abi()` inside the functions that need it, or by the module
+    # `__getattr__` at the bottom, which is how the Linux CI tests that assert
+    # the exact struct layout still reach `approvals.TASKDIALOGCONFIG`.
+    ctypes = None
+    wintypes = None
 
 from .decisions import GuardrailDecision, LOW, PromptRequest
 
@@ -45,75 +56,113 @@ def _validated(response) -> ApprovalResponse:
     return ApprovalResponse(False, "invalid-response", "validation:invalid-response")
 
 
-class ACTCTXW(ctypes.Structure):
-    _fields_ = [
-        # Windows ULONG/DWORD are fixed 32-bit values. ctypes.wintypes maps
-        # them through host c_ulong, which is 64-bit on many Unix runners.
-        ("cbSize", ctypes.c_uint32),
-        ("dwFlags", ctypes.c_uint32),
-        ("lpSource", wintypes.LPCWSTR),
-        ("wProcessorArchitecture", wintypes.USHORT),
-        ("wLangId", wintypes.WORD),
-        ("lpAssemblyDirectory", wintypes.LPCWSTR),
-        ("lpResourceName", wintypes.LPCWSTR),
-        ("lpApplicationName", wintypes.LPCWSTR),
-        ("hModule", wintypes.HMODULE),
-    ]
+_WIN32_ABI_NAMES = frozenset({
+    "ACTCTXW", "TASKDIALOG_BUTTON", "_TASKDIALOG_MAIN_ICON",
+    "_TASKDIALOG_FOOTER_ICON", "_CALLBACK_FACTORY", "PFTASKDIALOGCALLBACK",
+    "TASKDIALOGCONFIG", "ULONG_PTR", "INVALID_HANDLE_VALUE",
+})
 
 
-class TASKDIALOG_BUTTON(ctypes.Structure):
-    # CommCtrl.h wraps the task-dialog declarations in pshpack1.h.
-    _pack_ = 1
-    _fields_ = [("nButtonID", ctypes.c_int),
-                ("pszButtonText", wintypes.LPCWSTR)]
+def _ensure_win32_abi():
+    """Define the Win32 TaskDialog ABI, importing ctypes on the first ask.
+
+    Idempotent. Windows runs it at import; everywhere else it runs only when a
+    caller (or a test) actually reaches for one of these names, so the ordinary
+    hook path never pays for ctypes on a platform that cannot show a dialog.
+    """
+    global ctypes, wintypes
+    global ACTCTXW, TASKDIALOG_BUTTON, _TASKDIALOG_MAIN_ICON
+    global _TASKDIALOG_FOOTER_ICON, _CALLBACK_FACTORY, PFTASKDIALOGCALLBACK
+    global TASKDIALOGCONFIG, ULONG_PTR, INVALID_HANDLE_VALUE
+    if "TASKDIALOGCONFIG" in globals():
+        return
+    if ctypes is None:
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
+        ctypes, wintypes = _ctypes, _wintypes
+
+    class ACTCTXW(ctypes.Structure):
+        _fields_ = [
+            # Windows ULONG/DWORD are fixed 32-bit values. ctypes.wintypes maps
+            # them through host c_ulong, which is 64-bit on many Unix runners.
+            ("cbSize", ctypes.c_uint32),
+            ("dwFlags", ctypes.c_uint32),
+            ("lpSource", wintypes.LPCWSTR),
+            ("wProcessorArchitecture", wintypes.USHORT),
+            ("wLangId", wintypes.WORD),
+            ("lpAssemblyDirectory", wintypes.LPCWSTR),
+            ("lpResourceName", wintypes.LPCWSTR),
+            ("lpApplicationName", wintypes.LPCWSTR),
+            ("hModule", wintypes.HMODULE),
+        ]
 
 
-class _TASKDIALOG_MAIN_ICON(ctypes.Union):
-    _fields_ = [("hMainIcon", wintypes.HICON),
-                ("pszMainIcon", wintypes.LPCWSTR)]
+    class TASKDIALOG_BUTTON(ctypes.Structure):
+        # CommCtrl.h wraps the task-dialog declarations in pshpack1.h.
+        _pack_ = 1
+        _fields_ = [("nButtonID", ctypes.c_int),
+                    ("pszButtonText", wintypes.LPCWSTR)]
 
 
-class _TASKDIALOG_FOOTER_ICON(ctypes.Union):
-    _fields_ = [("hFooterIcon", wintypes.HICON),
-                ("pszFooterIcon", wintypes.LPCWSTR)]
+    class _TASKDIALOG_MAIN_ICON(ctypes.Union):
+        _fields_ = [("hMainIcon", wintypes.HICON),
+                    ("pszMainIcon", wintypes.LPCWSTR)]
 
 
-_CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-PFTASKDIALOGCALLBACK = _CALLBACK_FACTORY(
-    ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
-    wintypes.LPARAM, ctypes.c_ssize_t,
-)
+    class _TASKDIALOG_FOOTER_ICON(ctypes.Union):
+        _fields_ = [("hFooterIcon", wintypes.HICON),
+                    ("pszFooterIcon", wintypes.LPCWSTR)]
 
 
-class TASKDIALOGCONFIG(ctypes.Structure):
-    # CommCtrl.h uses anonymous unions and one-byte packing for this ABI.
-    _pack_ = 1
-    _anonymous_ = ("main_icon", "footer_icon")
-    _fields_ = [
-        ("cbSize", wintypes.UINT), ("hwndParent", wintypes.HWND),
-        ("hInstance", wintypes.HINSTANCE), ("dwFlags", wintypes.UINT),
-        ("dwCommonButtons", wintypes.UINT),
-        ("pszWindowTitle", wintypes.LPCWSTR),
-        ("main_icon", _TASKDIALOG_MAIN_ICON),
-        ("pszMainInstruction", wintypes.LPCWSTR),
-        ("pszContent", wintypes.LPCWSTR), ("cButtons", wintypes.UINT),
-        ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
-        ("nDefaultButton", ctypes.c_int), ("cRadioButtons", wintypes.UINT),
-        ("pRadioButtons", ctypes.c_void_p), ("nDefaultRadioButton", ctypes.c_int),
-        ("pszVerificationText", wintypes.LPCWSTR),
-        ("pszExpandedInformation", wintypes.LPCWSTR),
-        ("pszExpandedControlText", wintypes.LPCWSTR),
-        ("pszCollapsedControlText", wintypes.LPCWSTR),
-        ("footer_icon", _TASKDIALOG_FOOTER_ICON),
-        ("pszFooter", wintypes.LPCWSTR),
-        ("pfCallback", PFTASKDIALOGCALLBACK),
-        ("lpCallbackData", ctypes.c_ssize_t),
-        ("cxWidth", wintypes.UINT),
-    ]
+    _CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+    PFTASKDIALOGCALLBACK = _CALLBACK_FACTORY(
+        ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+        wintypes.LPARAM, ctypes.c_ssize_t,
+    )
 
 
-ULONG_PTR = ctypes.c_size_t
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    class TASKDIALOGCONFIG(ctypes.Structure):
+        # CommCtrl.h uses anonymous unions and one-byte packing for this ABI.
+        _pack_ = 1
+        _anonymous_ = ("main_icon", "footer_icon")
+        _fields_ = [
+            ("cbSize", wintypes.UINT), ("hwndParent", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE), ("dwFlags", wintypes.UINT),
+            ("dwCommonButtons", wintypes.UINT),
+            ("pszWindowTitle", wintypes.LPCWSTR),
+            ("main_icon", _TASKDIALOG_MAIN_ICON),
+            ("pszMainInstruction", wintypes.LPCWSTR),
+            ("pszContent", wintypes.LPCWSTR), ("cButtons", wintypes.UINT),
+            ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
+            ("nDefaultButton", ctypes.c_int), ("cRadioButtons", wintypes.UINT),
+            ("pRadioButtons", ctypes.c_void_p), ("nDefaultRadioButton", ctypes.c_int),
+            ("pszVerificationText", wintypes.LPCWSTR),
+            ("pszExpandedInformation", wintypes.LPCWSTR),
+            ("pszExpandedControlText", wintypes.LPCWSTR),
+            ("pszCollapsedControlText", wintypes.LPCWSTR),
+            ("footer_icon", _TASKDIALOG_FOOTER_ICON),
+            ("pszFooter", wintypes.LPCWSTR),
+            ("pfCallback", PFTASKDIALOGCALLBACK),
+            ("lpCallbackData", ctypes.c_ssize_t),
+            ("cxWidth", wintypes.UINT),
+        ]
+
+
+    ULONG_PTR = ctypes.c_size_t
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def __getattr__(name):
+    # Only reached for names not already in the module dict, so this fires once
+    # per Win32 ABI name and never for anything defined eagerly.
+    if name in _WIN32_ABI_NAMES:
+        _ensure_win32_abi()
+        return globals()[name]
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
+
+if sys.platform == "win32":
+    _ensure_win32_abi()
 TDF_ALLOW_DIALOG_CANCELLATION = 0x0008
 _COMMON_CONTROLS_MANIFEST = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "common-controls-v6.manifest"
@@ -127,6 +176,7 @@ class _NativeUIFailure(RuntimeError):
 
 
 def _last_error() -> int:
+    _ensure_win32_abi()
     getter = getattr(ctypes, "get_last_error", None)
     return int(getter() if getter else 0)
 
@@ -136,6 +186,7 @@ def _exception_diagnostic(stage: str, exc: BaseException) -> str:
 
 
 def _configure_activation_apis(kernel32):
+    _ensure_win32_abi()
     kernel32.CreateActCtxW.argtypes = [ctypes.POINTER(ACTCTXW)]
     kernel32.CreateActCtxW.restype = wintypes.HANDLE
     kernel32.ActivateActCtx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ULONG_PTR)]
@@ -148,6 +199,7 @@ def _configure_activation_apis(kernel32):
 
 
 def _configure_task_dialog_api(comctl32):
+    _ensure_win32_abi()
     comctl32.TaskDialogIndirect.argtypes = [
         ctypes.POINTER(TASKDIALOGCONFIG), ctypes.POINTER(ctypes.c_int),
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(wintypes.BOOL),
@@ -157,12 +209,14 @@ def _configure_task_dialog_api(comctl32):
 
 
 def _load_kernel32():
+    _ensure_win32_abi()
     return _configure_activation_apis(
         ctypes.WinDLL("kernel32", use_last_error=True)
     )
 
 
 def _load_task_dialog():
+    _ensure_win32_abi()
     # Load comctl32 only after the v6 activation context is active.
     return _configure_task_dialog_api(
         ctypes.WinDLL("comctl32", use_last_error=True)
@@ -175,6 +229,7 @@ def _handle_value(handle):
 
 def _config_problem(config, buttons) -> str:
     """Return a machine-readable local config defect without invoking UI."""
+    _ensure_win32_abi()
     if config.cbSize != ctypes.sizeof(TASKDIALOGCONFIG):
         return "cbsize"
     if config.cButtons != len(buttons):
@@ -202,6 +257,7 @@ def _default_button_id(request: PromptRequest, allow_id: int, cancel_id: int) ->
 
 @contextmanager
 def _common_controls_v6(kernel32):
+    _ensure_win32_abi()
     if not os.path.isfile(_COMMON_CONTROLS_MANIFEST):
         raise _NativeUIFailure("native-ui:manifest:missing")
     actctx = ACTCTXW()
@@ -276,6 +332,7 @@ class NativeApprovalProvider(ApprovalProvider):
             )
 
     def _task_dialog(self, request: PromptRequest) -> ApprovalResponse:
+        _ensure_win32_abi()
         prompt_problem = request.validation_problem()
         if prompt_problem:
             return ApprovalResponse(
@@ -361,87 +418,13 @@ def request_approval(decision: GuardrailDecision, request: PromptRequest,
     return response
 
 
-PENDING_SECONDS = 120
-
-
-def _host_event_id(payload: dict) -> str:
-    return str(payload.get("event_id") or payload.get("invocation_id") or
-               payload.get("tool_use_id") or "")
-
-
-def _identity_hash(value: str) -> str:
-    return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()
-
-
-def approval_identity(memo_key: str, policy_revision: str) -> str:
-    """One-way, revision-bound identity for a resource approval."""
-    material = f"agw-pending-approval-v1\0{policy_revision}\0{memo_key}"
-    return _identity_hash(material)
-
-
-def _pending_path(payload: dict, session_id: str) -> str:
-    event_id = _host_event_id(payload)
-    if not event_id or not session_id:
-        return ""
-    home = os.environ.get("AGW_HOME") or os.path.join(os.path.expanduser("~"), ".agw")
-    directory = os.path.join(home, "pending-approvals")
-    os.makedirs(directory, exist_ok=True)
-    key = _identity_hash(f"{session_id}\0{event_id}")
-    return os.path.join(directory, key + ".json")
-
-
-def record_pending_approval(payload: dict, session_id: str, memo_key: str,
-                            policy_revision: str, operation_fingerprint: str) -> bool:
-    """Persist a privacy-minimal pre-hook candidate for one post-hook consume."""
-    path = _pending_path(payload, session_id)
-    if not path or not memo_key or not policy_revision or not operation_fingerprint:
-        return False
-    record = {
-        "session_hash": _identity_hash(session_id),
-        "event_hash": _identity_hash(_host_event_id(payload)),
-        "approval_identity": approval_identity(memo_key, policy_revision),
-        "policy_revision": policy_revision,
-        "operation_fingerprint": operation_fingerprint,
-        "created_at": time.time(),
-    }
-    temp = path + f".{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
-    return True
-
-
-def consume_pending_approval(payload: dict, session_id: str):
-    """Atomically consume one matching, unexpired pending approval record."""
-    path = _pending_path(payload, session_id)
-    if not path or not os.path.exists(path):
-        return None
-    consuming = path + f".{os.getpid()}.{threading.get_ident()}.consuming"
-    try:
-        os.replace(path, consuming)
-    except OSError:
-        return None
-    try:
-        with open(consuming, encoding="utf-8") as handle:
-            record = json.load(handle)
-        if time.time() - float(record.get("created_at", 0)) > PENDING_SECONDS:
-            return None
-        if record.get("session_hash") != _identity_hash(session_id):
-            return None
-        if record.get("event_hash") != _identity_hash(_host_event_id(payload)):
-            return None
-        if not record.get("policy_revision") or not record.get("approval_identity"):
-            return None
-        return record
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    finally:
-        try:
-            os.unlink(consuming)
-        except OSError:
-            pass
+# The pending-approval handshake lives in core.pending_approvals so the
+# PostToolUse adapters can check it before loading anything heavier than
+# os/json/hashlib. Re-exported here for every existing caller.
+from .pending_approvals import (  # noqa: E402,F401
+    PENDING_SECONDS, _host_event_id, _identity_hash, _pending_path,
+    approval_identity, consume_pending_approval, record_pending_approval,
+)
 
 
 def default_provider(timeout_s: int = 100) -> ApprovalProvider:

@@ -25,17 +25,112 @@ FAIL_CLOSED = {
 }
 
 
-from adapter_common import to_event  # noqa: E402
+from adapter_common import to_event, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
 
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 
 
+# Set once anything has reached stdout, so the fail-closed handler never
+# appends a second object to a stream that already carries a decision.
+_EMITTED = False
+
+
+def _emit(out):
+    """Write one decision object in a single, already-serialized write.
+
+    `json.dump` streams chunks straight at stdout: a failure partway through
+    leaves a truncated object, and the fail-closed handler then appends a whole
+    second one. The host can parse neither, and a decision it cannot parse is
+    no decision at all - which is an allow. Serializing first keeps stdout
+    untouched unless the whole object is ready.
+    """
+    global _EMITTED
+    text = json.dumps(out)
+    _EMITTED = True
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _unrecognized_tool_decision(label):
+    """Fail closed on a tool identity we cannot map to any guarded event.
+
+    An unmodeled tool name reaches the engine as events.OTHER, which DEFERs;
+    an empty stdout is a silent allow. The day the host renames Write or ships
+    a new file-mutating tool, that is exactly the wrong answer, so ask instead
+    and say why on stderr, where the host's hook log makes it diagnosable.
+    """
+    reason = unrecognized_tool_reason(label)
+    sys.stderr.write("agentic-guardrails: %s\n" % reason)
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason + ".",
+    }}
+
+
+# The host's registry of tools that neither run a command nor touch a file.
+# Bound at import time so the planner can be told which unmodeled tool names
+# are inert without the platform-neutral core learning any of them.
+from adapter_common import INERT_TOOLS  # noqa: E402
+
+
+class _InertPlan:
+    """The plan mutations.plan returns for an event that cannot mutate files."""
+    mutating = False
+    complete = True
+    review_required = False
+    reason = ""
+    evidence = {}
+    targets = []
+
+
+def _plan_mutations(evlist, engine, events, mutations, **options):
+    """Plan pre-images only for events that can mutate files.
+
+    mutations.plan leaves a READ or MCP event inert by construction (a Read
+    has no mutation primitive; a connected-service call has no local files to
+    snapshot). Every other kind, including an unmodeled OTHER tool, goes to
+    the planner. Skipping the call for the two inert kinds keeps the
+    mutations/workflows/store import chain off the routine path entirely.
+    """
+    if all(ev.kind in (events.READ, events.MCP) for ev in evlist):
+        return _InertPlan()
+    return mutations.plan(evlist, engine.clobber_targets, plugin_root=PLUGIN_ROOT,
+                          **options)
+
+
+def _routine_read(payload):
+    """The Read fast path: True means the engine would say nothing, so we say
+    nothing without loading it. Anything else takes the full path below."""
+    from core import readfast
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    return readfast.routine_read(tool_input.get("file_path", ""), PLUGIN_ROOT)
+
+
 def main():
     payload = json.load(sys.stdin)
-    from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
-        preimages, presentation, remediation, retention_policy, store
-    from core.decisions import GuardrailDecision
+    unknown = unrecognized_tool(payload)
+    if unknown is not None:
+        _emit(_unrecognized_tool_decision(unknown))
+        return
+    if payload.get("tool_name") == "Read" and _routine_read(payload):
+        return
+    from core import auditlog, enforcement, engine, events, launcher, remediation
+    from core.lazyimport import LazyModule
+    # Deferred until a call site needs them: the store, workflows and the
+    # prompt/approval machinery cost more to import than the whole routine
+    # Read or MCP path. Each proxy imports inside this function, so a
+    # broken module still lands in the fail-closed handler below.
+    approvals = LazyModule("core.approvals")
+    mutations = LazyModule("core.mutations")
+    preimages = LazyModule("core.preimages")
+    presentation = LazyModule("core.presentation")
+    retention_policy = LazyModule("core.retention_policy")
+    store = LazyModule("core.store")
 
     evaluation_payload = payload
     rewritten_command = None
@@ -73,35 +168,64 @@ def main():
     will_run = effective.action != events.DENY
     # Prestate failures are safety invariants. Unlike advisory policy choices,
     # they cannot be approved away or suppressed by observe mode.
-    mutation_plan = mutations.plan(
-        [event], engine.clobber_targets, plugin_root=PLUGIN_ROOT
+    mutation_plan = _plan_mutations(
+        [event], engine, events, mutations,
+        regenerable=cfg.get("regenerable"), inert_tools=INERT_TOOLS,
     )
     invariant_failure = ""
+    # Structured detail behind the refusal. Only the capacity failure has any,
+    # and `render_safe_next` needs it to print the cap and the shortfall rather
+    # than a sizeless "the cache is full".
+    invariant_details = {}
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
             if mutation_plan.review_required:
                 ambiguous_action = (
                     events.DENY if cfg.get("level") == "strict" else events.ASK
                 )
-                decision = decision.merge(engine.Decision(
-                    ambiguous_action,
-                    "Guardrails found ambiguous write-like source evidence but could "
-                    "not confirm that this invocation writes files. Review this exact, "
-                    f"hash-bound run before continuing: {mutation_plan.reason}",
-                    "builtin:script-write-ambiguous",
-                    policy_revision=policy.revision, policy_health=policy.health,
-                    enforcement_class=events.POLICY_ENFORCEMENT,
-                    presentation_context=events.DecisionContext.FILE_CHANGE,
-                    presentation_details={
+                if mutation_plan.reason == mutations.UNRESOLVED_PATH_ASK:
+                    # A recognized PowerShell write whose path only exists at
+                    # run time (splatting, a variable, a here-string). Nothing
+                    # about it says the operation is dangerous, only that the
+                    # file cannot be named here, so it is a question for the
+                    # user. The target is described by category so the prompt
+                    # still carries enough for informed consent.
+                    review_rule = "builtin:powershell-path-unresolved"
+                    review_reason = (
+                        "Guardrails recognized this as a file-writing PowerShell "
+                        f"command, but its {mutations.UNRESOLVED_PATH_ASK}."
+                    )
+                    review_details = {
+                        "operation": "write a file named at run time",
+                        "targets": ["A file the command names at run time"],
+                        "target_kind": "category",
+                        "signal": "a file path supplied at run time",
+                        "trigger": ("The command supplies its target path at run "
+                                    "time, so Guardrails cannot read it statically."),
+                    }
+                else:
+                    review_rule = "builtin:script-write-ambiguous"
+                    review_reason = (
+                        "Guardrails found ambiguous write-like source evidence but could "
+                        "not confirm that this invocation writes files. Review this exact, "
+                        f"hash-bound run before continuing: {mutation_plan.reason}"
+                    )
+                    review_details = {
                         "operation": "run script with ambiguous write evidence",
                         "targets": [mutation_plan.evidence.get("path", "")],
                         "target_kind": "file",
                         "signal": mutation_plan.evidence.get("primitive", "write-like source"),
                         "trigger": "Static source analysis found ambiguous write evidence.",
-                    },
+                    }
+                decision = decision.merge(engine.Decision(
+                    ambiguous_action, review_reason, review_rule,
+                    policy_revision=policy.revision, policy_health=policy.health,
+                    enforcement_class=events.POLICY_ENFORCEMENT,
+                    presentation_context=events.DecisionContext.FILE_CHANGE,
+                    presentation_details=review_details,
                 ))
                 if decision.action == events.DENY \
-                        and decision.rule_id == "builtin:script-write-ambiguous":
+                        and decision.rule_id == review_rule:
                     decision.safe_next = None
                     decision.safe_next = remediation.for_events(decision, [event])
                 effective = enforcement.resolve(decision, observe)
@@ -129,11 +253,13 @@ def main():
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason
+                    invariant_details = dict(receipt.details)
     if invariant_failure:
         decision = engine.Decision(
             events.DENY, invariant_failure, "invariant:prestate-unavailable",
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
+            presentation_details=invariant_details,
         )
         decision.safe_next = None
         decision.safe_next = remediation.for_events(decision, [event])
@@ -179,28 +305,36 @@ def main():
     if memoed:
         out = {"systemMessage": f"agentic-guardrails: already approved this session "
                                 f"({decision.rule_id}); not re-asking."}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
     if effective.shadowed:
         label = "observe mode" if effective.suppression == "observe" else "advisory"
         out = {"systemMessage": f"agentic-guardrails ({label}): would have "
                                 f"{decision.action.upper()} — {decision.reason}"}
-        json.dump(launcher.attach_rewrite(
+        _emit(launcher.attach_rewrite(
             out, payload, rewritten_command, may_run=True
-        ), sys.stdout)
+        ))
         return
 
     action = effective.action
     prompt_request = None
     approval_outcome = ""
     if action == events.ASK:
+        from core.decisions import GuardrailDecision
         prompt_decision = GuardrailDecision.from_legacy(decision)
         prompt_request = presentation.build_prompt(
             prompt_decision, evaluation_payload, [event]
         )
         if prompt_request.validation_problem():
+            # Only prompts the engine cannot make informed reach here: the
+            # `*_UNKNOWN` contexts, where Guardrails knows files change and
+            # cannot say which. An ASK that is simply about an operation
+            # rather than a file set (pip install, npm publish, builtin:eval,
+            # builtin:chmod-r) is rendered at operation scope by
+            # presentation.build_prompt and still asks — upgrading those would
+            # turn every shipped `action: ask` rule into a wall with no door.
             action = events.DENY
             approval_outcome = "prompt-incomplete"
 
@@ -219,6 +353,7 @@ def main():
         if action == events.ASK:
             reason = prompt_request.action + "\n\n" + prompt_request.primary_text()
         elif action == events.DENY:
+            from core.decisions import GuardrailDecision
             denial_decision = GuardrailDecision.from_legacy(decision)
             denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
@@ -250,15 +385,27 @@ def main():
         )
 
     if out:
-        json.dump(out, sys.stdout)
+        _emit(out)
+
+
+def _fail_closed():
+    """Last-resort decision for a failure the evaluation path did not catch.
+
+    Only speaks if nothing already did. Appending a second object to a stream
+    that already carries a decision makes both unparseable, and a decision the
+    host cannot parse is no decision at all - which is an allow.
+    """
+    if _EMITTED:
+        return
+    try:
+        _emit(FAIL_CLOSED)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        try:
-            json.dump(FAIL_CLOSED, sys.stdout)
-        except Exception:
-            print(json.dumps(FAIL_CLOSED))
+        _fail_closed()
         sys.exit(0)

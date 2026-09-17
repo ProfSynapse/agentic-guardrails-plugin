@@ -31,6 +31,14 @@ from . import retention
 from . import retention_policy
 
 SCHEMA_VERSION = 1
+# Hosts kill a PreToolUse hook at roughly 15 s and then run the tool call
+# unguarded. Every lock wait on the hook path must therefore give up well
+# inside that budget and turn into an explicit refusal, never a hang.
+HOOK_LOCK_BUDGET_S = 8.0
+# Interactive agw commands have no host deadline; they may wait for a busy
+# store instead of refusing.
+CLI_LOCK_TIMEOUT_S = 30.0
+_HOOK_LOCK_BUDGET_ENV = "AGW_HOOK_LOCK_BUDGET_S"
 _WINDOWS_SHARING_WINERRORS = {32, 33}
 _WINDOWS_MISSING_LOCK_RETRIES = 3
 _MALFORMED_LOCK_STALE_SECONDS = 60.0
@@ -172,6 +180,29 @@ def _stale_malformed_lock_identity(path: str):
     if _lock_identity(path) != first or _lock_owner(path) != owner:
         return None
     return first
+
+
+def hook_lock_budget_s() -> float:
+    """Return the lock wait allowed on the hook path.
+
+    ``AGW_HOOK_LOCK_BUDGET_S`` exists only so tests can shorten the wait; it
+    can never raise the budget above the compiled-in hook constant.
+    """
+    raw = os.environ.get(_HOOK_LOCK_BUDGET_ENV, "")
+    if not raw:
+        return HOOK_LOCK_BUDGET_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return HOOK_LOCK_BUDGET_S
+    if value <= 0:
+        return HOOK_LOCK_BUDGET_S
+    return min(value, HOOK_LOCK_BUDGET_S)
+
+
+def hook_lock(name: str = "recovery-store") -> "Lock":
+    """A store lock bounded by the hook budget."""
+    return Lock(name, timeout=hook_lock_budget_s())
 
 
 def agw_home_path() -> str:
@@ -398,7 +429,7 @@ class Lock:
             self._close_gate()
 
 
-def _append_jsonl(path: str, record: dict):
+def _append_jsonl(path: str, record: dict, durable: bool = True):
     record.setdefault("schema_version", SCHEMA_VERSION)
     record.setdefault("ts", _ts())
     # Archive projections already carry the authoritative transaction creation
@@ -418,7 +449,8 @@ def _append_jsonl(path: str, record: dict):
             f.write("\n")
         f.write(line + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        if durable:
+            os.fsync(f.fileno())
 
 
 def _preserve_malformed_jsonl(path: str, line_number: int, raw: str,
@@ -469,21 +501,28 @@ def _read_jsonl_resilient(path: str) -> tuple[list, list]:
     return records, malformed
 
 
-def _append_jsonl_unique(path: str, record: dict) -> tuple[bool, list]:
+def _append_jsonl_unique(path: str, record: dict,
+                         durable: bool = True) -> tuple[bool, list]:
     records, malformed = _read_jsonl_resilient(path)
     transaction_id = record.get("transaction_id")
     if transaction_id and any(
             item.get("transaction_id") == transaction_id for item in records):
         return False, malformed
-    _append_jsonl(path, record)
+    _append_jsonl(path, record, durable=durable)
     return True, malformed
 
 
-def oplog_append(op: dict):
+def _oplog_append(op: dict, durable: bool) -> tuple[bool, list]:
     with Lock("oplog"):
         return _append_jsonl_unique(
-            os.path.join(agw_home(), "oplog.jsonl"), outcomes.project_record(op)
+            os.path.join(agw_home(), "oplog.jsonl"), outcomes.project_record(op),
+            durable=durable,
         )
+
+
+def oplog_append(op: dict):
+    """Durably append one operation record (restore, undo, mutation ...)."""
+    return _oplog_append(op, True)
 
 
 def oplog_read() -> list:
@@ -523,30 +562,125 @@ def _next_version(file_dir: str) -> int:
     return max(nums, default=0) + 1
 
 
+def _size_or_zero(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
+
+
+def _newest_index_row(file_dir: str):
+    """The per-file index row with the highest version, or ``None``.
+
+    ``None`` also when the index lags the directory (a crash between
+    COMMITTED and the derived append): the newest version is then unknown.
+    """
+    manifest = os.path.join(file_dir, "manifest.jsonl")
+    if not os.path.exists(manifest):
+        return None
+    rows = [row for row in _read_jsonl_resilient(manifest)[0]
+            if row.get("transaction_id")]
+    if not rows:
+        return None
+    newest = max(rows, key=lambda row: int(row.get("version") or 0))
+    if int(newest.get("version") or 0) < _next_version(file_dir) - 1:
+        return None
+    return newest
+
+
+def _latest_indexed_version(src: str, file_dir: str, digest: str = "",
+                            newest=None):
+    """Return the verified newest version of ``src`` using only its own index.
+
+    ``list_versions`` scans every transaction manifest in the store; this
+    reads the per-file ``manifest.jsonl``, loads the one authoritative record
+    it names, and verifies it. With ``digest`` a content mismatch returns
+    early before the artifact is read.
+    """
+    newest = newest or _newest_index_row(file_dir)
+    if newest is None:
+        return None
+    if digest and newest.get("sha256") != digest:
+        return None
+    try:
+        record = archive_tx.load(agw_home(), str(newest["transaction_id"]))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if record.get("kind") != "archive" \
+            or record.get("state") != archive_tx.COMMITTED \
+            or str(record.get("artifact_state") or "PRESENT") != "PRESENT" \
+            or (digest and record.get("sha256") != digest):
+        return None
+    entry = archive_tx.entry_from_record(record)
+    if not archive_tx.entry_is_verified(agw_home(), entry, src):
+        return None
+    return entry
+
+
+def _dedupe_digest(src: str, newest) -> str:
+    """Hash the source for dedupe only when the newest version could match.
+
+    A size difference is a certain miss, so the common edit (content grew or
+    shrank) costs no extra read of the source.
+    """
+    if newest is None:
+        return ""
+    try:
+        if int(newest.get("size") or 0) != int(os.path.getsize(src)):
+            return ""
+        return file_sha256(src)
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _dedupe_candidate(src: str, file_dir: str, digest: str,
+                      retention_class: str, policy_revision: str, newest=None):
+    last = _latest_indexed_version(src, file_dir, digest, newest)
+    if not last or last.get("sha256") != digest:
+        return None
+    if retention_class and last.get("retention_class") != retention_class:
+        return None
+    bound = str(last.get("policy_revision") or "")
+    # A copy bound to another policy revision cannot stand in for this one:
+    # the receipt must bind to the active policy.
+    if policy_revision and bound and bound != policy_revision:
+        return None
+    return last
+
+
 def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "agent",
                  dedupe: bool = False, _crash_after: str = None,
                  retention_class: str = "", protected_until_ns: int = 0,
                  capture_group_id: str = "",
                  retention_config: retention_policy.RetentionPolicy | None = None,
                  lock_context=None,
+                 policy_revision: str = "",
                  _transaction_id: str = "",
                  _admission_checked: bool = False,
                  _recovery_source_identity=None,
                  ) -> dict:
     """Archive one file or directory. mode='move' (delete-replacement) or
-    'copy' (pre-image snapshot, leaves the original)."""
+    'copy' (pre-image snapshot, leaves the original).
+
+    With ``dedupe`` a copy whose content hash equals the verified newest
+    version of the same source refreshes that version instead of storing a
+    second full copy. Only the newest version is a dedupe target, so the
+    entry that stands in for the new capture is always the one retention
+    protects as the newest, and its hold is extended to the new deadline.
+    """
     src = os.path.abspath(src)
     if not os.path.lexists(src):
         raise FileNotFoundError(src)
     link = archive_tx.link_metadata(src)
-    digest = file_sha256(src) if link is None and os.path.isfile(src) else ""
+    ordinary_file = link is None and os.path.isfile(src)
+    digest = ""
     try:
         incoming_bytes = int(os.path.getsize(src)) if os.path.isfile(src) \
             else int(archive_tx.artifact_fingerprint(src)[2])
     except OSError:
         incoming_bytes = 0
 
-    context = lock_context or Lock("recovery-store", timeout=30.0)
+    context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
         if not _admission_checked:
             maintain_retention(
@@ -557,12 +691,15 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
             # Directory publication shares parents with every archive from this
             # source folder, so it belongs inside the same lock as versioning.
             file_dir = _file_dir(src)
+            if dedupe and ordinary_file:
+                newest = _newest_index_row(file_dir)
+                digest = _dedupe_digest(src, newest)
             if dedupe and digest:
-                last = latest_version(src)
-                if last and last.get("sha256") == digest \
-                        and archive_tx.entry_is_verified(agw_home(), last, src) \
-                        and (not retention_class
-                             or last.get("retention_class") == retention_class):
+                last = _dedupe_candidate(
+                    src, file_dir, digest, retention_class, policy_revision,
+                    newest,
+                )
+                if last is not None:
                     if retention_class == "mutation_preimage":
                         refreshed = archive_tx.update(
                             agw_home(), last["transaction_id"],
@@ -575,19 +712,28 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                         return {**archive_tx.entry_from_record(refreshed),
                                 "deduped": True}
                     return {**last, "deduped": True}
+            size_base = _archive_size_bytes_locked()
+            index_path = os.path.join(file_dir, "manifest.jsonl")
+            index_before = _size_or_zero(index_path)
             version = _next_version(file_dir)
             name = os.path.basename(src)
             dest = os.path.join(file_dir, f"v{version:03d}_{_ts()}_{name}")
             entry = archive_tx.create_archive(
                 agw_home(), src, dest, mode, version, reason, actor,
                 crash_after=_crash_after,
+                policy_revision=policy_revision,
                 retention_class=retention_class,
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 transaction_id=_transaction_id,
                 recovery_source_identity=_recovery_source_identity,
+                source_sha256=digest,
             )
         _materialize_committed_transaction(entry["transaction_id"], _crash_after)
+        _account_archive_growth_locked(
+            size_base,
+            int(entry.get("size") or 0) + _size_or_zero(index_path) - index_before,
+        )
         return entry
 
 
@@ -655,18 +801,20 @@ def _materialize_committed_transaction(transaction_id: str,
     file_dir = _file_dir(record["src"])
     manifest = os.path.join(file_dir, "manifest.jsonl")
     malformed = []
+    # Both indexes are projections of the durable COMMITTED manifest and are
+    # re-derived idempotently by recovery, so none of these writes is fsynced.
     with Lock(_folder_key(os.path.dirname(record["src"]))):
-        _appended, issues = _append_jsonl_unique(manifest, entry)
+        _appended, issues = _append_jsonl_unique(manifest, entry, durable=False)
         malformed.extend(issues)
     if crash_after == "DERIVED_INDEX_APPENDED":
         raise archive_tx.SimulatedCrash("simulated crash after DERIVED_INDEX_APPENDED")
-    archive_tx.update(agw_home(), transaction_id, derived_index=True)
+    archive_tx.note_derived(agw_home(), transaction_id, derived_index=True)
 
-    _appended, issues = oplog_append(entry)
+    _appended, issues = _oplog_append(entry, False)
     malformed.extend(issues)
     if crash_after == "DERIVED_OPLOG_APPENDED":
         raise archive_tx.SimulatedCrash("simulated crash after DERIVED_OPLOG_APPENDED")
-    archive_tx.update(agw_home(), transaction_id, derived_oplog=True)
+    archive_tx.note_derived(agw_home(), transaction_id, derived_oplog=True)
     return malformed
 
 
@@ -1346,7 +1494,7 @@ def undo_transaction(
     """
     if not transaction_id:
         raise ValueError("transaction id is required")
-    with Lock("recovery-store", timeout=30.0):
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
         operation = _mutation_record(transaction_id)
         members = _undo_members(operation)
         prior_undos = {
@@ -1429,7 +1577,7 @@ def undo_transaction(
 def restore(src: str, version: int = 0, overwrite: bool = False,
             retention_config: retention_policy.RetentionPolicy | None = None) -> dict:
     """Restore an archived version of `src` to its original location."""
-    with Lock("recovery-store", timeout=30.0):
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
         entries = list_versions(src)
         if not entries:
             raise FileNotFoundError(f"no archived versions of {src}")
@@ -1462,28 +1610,139 @@ def restore(src: str, version: int = 0, overwrite: bool = False,
         return op
 
 
-def undo_last() -> dict:
-    """Invert the most recent invertible operation in the oplog."""
-    ops = oplog_read()
-    for op in reversed(ops):
-        if op.get("undone"):
+def _undo_key(op: dict) -> tuple:
+    """Identity of an invertible oplog row for undo bookkeeping."""
+    return (
+        str(op.get("op") or ""), str(op.get("transaction_id") or ""),
+        str(op.get("src") or ""), str(op.get("dest") or ""),
+    )
+
+
+def _undone_keys(ops: list) -> set:
+    """Rows already inverted, derived from the oplog's own ``undo`` records.
+
+    The oplog is append-only, so the original row is never marked; the
+    ``undo`` row that names it is the durable marker.
+    """
+    keys = set()
+    for op in ops:
+        if op.get("op") != "undo":
             continue
-        kind = op.get("op")
-        if kind == "archive" and op.get("mode") == "move":
-            if op.get("artifact_kind") == "link-metadata" \
-                    and os.path.exists(op["dest"]) and not os.path.lexists(op["src"]):
-                archive_tx.publish_restore(agw_home(), op, op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "archive", "restored": op["src"]}
-            if os.path.exists(op["dest"]) and not os.path.exists(op["src"]):
-                shutil.move(op["dest"], op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "archive", "restored": op["src"]}
-        if kind == "move":
-            if os.path.exists(op["dest"]) and not os.path.exists(op["src"]):
-                shutil.move(op["dest"], op["src"])
-                oplog_append({"op": "undo", "undid": op})
-                return {"undone": "move", "restored": op["src"]}
+        if isinstance(op.get("undid"), dict):
+            keys.add(_undo_key(op["undid"]))
+        # An archive the undo itself created (a logged move's safety capture)
+        # is part of that undo, not a separate operation to invert later.
+        if isinstance(op.get("consumed"), dict):
+            keys.add(_undo_key(op["consumed"]))
+    return keys
+
+
+def _undo_archive_move(op: dict) -> dict:
+    """Put a move-archived path back from its verified artifact.
+
+    The artifact is copied, never moved: it stays in the store as evidence,
+    a tampered or corrupt artifact is refused by the fingerprint check, and
+    the target must be absent so nothing is displaced.
+    """
+    transaction_id = str(op.get("transaction_id") or "")
+    target = os.path.abspath(str(op.get("src") or ""))
+    if not transaction_id:
+        raise ValueError(
+            f"undo refused: the archive of {target} predates verified "
+            f"transactions. Use `agw restore {target}` to restore a verified "
+            "version instead."
+        )
+    record = archive_tx.load(agw_home(), transaction_id)
+    if record.get("kind") != "archive" or record.get("mode") != "move":
+        raise ValueError(f"undo refused: {transaction_id} is not a move archive")
+    entry = archive_tx.entry_from_record(record)
+    target = os.path.abspath(str(record.get("src") or target))
+    if not archive_tx.entry_is_verified(agw_home(), entry, target):
+        raise ValueError(
+            f"undo refused: the archived copy of {target} failed verification "
+            "and was left in the store untouched. Run `agw recover` and then "
+            f"`agw restore {target}`."
+        )
+    if os.path.lexists(target):
+        raise FileExistsError(
+            f"undo refused: {target} exists again, so the archived version "
+            "cannot be put back without displacing it. Use "
+            f"`agw restore {target}`, which archives the current file first."
+        )
+    archive_tx.publish_restore(agw_home(), entry, target)
+    return {"undone": "archive", "restored": target,
+            "transaction_id": transaction_id}
+
+
+def _undo_logged_move(op: dict,
+                      retention_config: retention_policy.RetentionPolicy | None
+                      ) -> dict:
+    """Reverse a logged move through a verified archive transaction.
+
+    A logged move carries no fingerprint, so the moved file is first
+    captured into the store (fingerprinted, committed, and never pruned as
+    a move archive) and then published back to its original path as a
+    verified copy. Its content is preserved in the store before the original
+    path is populated, so no step can lose it.
+    """
+    src = os.path.abspath(str(op.get("src") or ""))
+    dest = os.path.abspath(str(op.get("dest") or ""))
+    if not os.path.lexists(dest):
+        raise FileNotFoundError(
+            f"undo refused: {dest} no longer exists, so there is nothing to "
+            f"move back. Use `agw restore {dest}` if it was archived."
+        )
+    if os.path.lexists(src):
+        raise FileExistsError(
+            f"undo refused: {src} exists again, so the moved file cannot be "
+            f"put back without displacing it. Use `agw archive {src}` first."
+        )
+    entry = archive_file(
+        dest, mode="move", reason=f"undo of logged move from {src}",
+        actor="agw", retention_class="safety_archive",
+        retention_config=retention_config, lock_context=nullcontext(),
+    )
+    if not archive_tx.entry_is_verified(agw_home(), entry, dest):
+        raise ValueError(
+            f"undo refused: the moved file could not be verified after capture; "
+            f"it is preserved in the store. Use `agw restore {dest}`."
+        )
+    archive_tx.publish_restore(agw_home(), entry, src)
+    return {"undone": "move", "restored": src,
+            "transaction_id": entry["transaction_id"],
+            "consumed": {"op": "archive", "transaction_id": entry["transaction_id"],
+                         "src": entry["src"], "dest": entry["dest"]}}
+
+
+def undo_last(retention_config: retention_policy.RetentionPolicy | None = None
+              ) -> dict:
+    """Invert the most recent invertible operation in the oplog.
+
+    Runs under the recovery-store lock and restores only through verified
+    transactions. The newest row not already inverted is the one undone; if
+    its precondition fails (the target reappeared, the artifact is gone or
+    unverified) the undo refuses with the safe alternative rather than
+    silently inverting some older, unrelated operation.
+    """
+    with Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S):
+        ops = oplog_read()
+        undone = _undone_keys(ops)
+        for op in reversed(ops):
+            kind = op.get("op")
+            invertible = (kind == "archive" and op.get("mode") == "move") \
+                or kind == "move"
+            if not invertible or _undo_key(op) in undone:
+                continue
+            if kind == "archive":
+                result = _undo_archive_move(op)
+            else:
+                result = _undo_logged_move(op, retention_config)
+            undo_record = {"op": "undo", "undid": op}
+            consumed = result.pop("consumed", None)
+            if consumed:
+                undo_record["consumed"] = consumed
+            oplog_append(undo_record)
+            return result
     raise LookupError("nothing to undo")
 
 
@@ -1520,7 +1779,32 @@ def state_save(state: dict):
         os.replace(tmp, path)
 
 
-def archive_size_bytes() -> int:
+# --- archive size accounting ---------------------------------------------------
+# A full walk of the archive costs O(store) per hook call. The store keeps an
+# advisory running counter instead, stamped with the number of transaction
+# manifests it was computed against. Every write path that grows or shrinks
+# the archive rewrites it under the global lock; a reader whose manifest count
+# no longer matches (crash mid-write, an older process, hand edits) falls back
+# to one walk and rewrites it. A wrong counter can only mis-time a prune or a
+# capacity refusal, never delete anything: prune selection re-inventories.
+
+_ARCHIVE_SIZE_STATE = "archive-size.json"
+
+
+def _archive_size_state_path() -> str:
+    return os.path.join(agw_home(), _ARCHIVE_SIZE_STATE)
+
+
+def _transaction_manifest_count() -> int:
+    root = os.path.join(agw_home(), "transactions")
+    try:
+        with os.scandir(root) as entries:
+            return sum(1 for entry in entries if entry.name.endswith(".json"))
+    except OSError:
+        return 0
+
+
+def _archive_size_walk() -> int:
     root = os.path.join(agw_home(), "archive")
     total = 0
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -1530,6 +1814,86 @@ def archive_size_bytes() -> int:
             except OSError:
                 pass
     return total
+
+
+def _load_archive_size_state():
+    try:
+        with open(_archive_size_state_path(), encoding="utf-8") as handle:
+            state = json.load(handle)
+        total = state["bytes"]
+        count = state["manifest_count"]
+        if isinstance(total, bool) or isinstance(count, bool) \
+                or not isinstance(total, int) or not isinstance(count, int) \
+                or total < 0 or count < 0:
+            return None
+        return {"bytes": total, "manifest_count": count}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _write_archive_size_state(total: int, manifest_count: int):
+    # Advisory state: no fsync. A torn write reads as invalid and triggers a
+    # walk, which is the same fallback as a missing file.
+    path = _archive_size_state_path()
+    temp = path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump({"schema_version": SCHEMA_VERSION, "bytes": max(0, int(total)),
+                       "manifest_count": max(0, int(manifest_count)),
+                       "updated_at_ns": time.time_ns()}, handle)
+        os.replace(temp, path)
+    except OSError:
+        try:
+            if os.path.lexists(temp):
+                os.unlink(temp)
+        except OSError:
+            pass
+
+
+def _cached_archive_size():
+    state = _load_archive_size_state()
+    if state is None or state["manifest_count"] != _transaction_manifest_count():
+        return None
+    return state["bytes"]
+
+
+def _refresh_archive_size_locked() -> int:
+    """Walk once and rewrite the counter. The caller holds the store lock."""
+    count = _transaction_manifest_count()
+    total = _archive_size_walk()
+    _write_archive_size_state(total, count)
+    return total
+
+
+def _archive_size_bytes_locked() -> int:
+    cached = _cached_archive_size()
+    return cached if cached is not None else _refresh_archive_size_locked()
+
+
+def _account_archive_growth_locked(base_bytes: int, delta_bytes: int):
+    """Advance the counter after one archive write under the store lock."""
+    _write_archive_size_state(
+        max(0, int(base_bytes) + int(delta_bytes)), _transaction_manifest_count()
+    )
+
+
+def archive_size_bytes() -> int:
+    """Return the archive's logical size without taking the store lock.
+
+    Serves the running counter when it is current. Otherwise it walks once
+    and, if the store lock is free right now, rewrites the counter so the
+    next reader does not walk again.
+    """
+    cached = _cached_archive_size()
+    if cached is not None:
+        return cached
+    try:
+        with Lock("recovery-store", timeout=0.0):
+            return _refresh_archive_size_locked()
+    except TimeoutError:
+        return _archive_size_walk()
+    except OSError:
+        return _archive_size_walk()
 
 
 def resolved_retention_policy(settings=None) -> retention_policy.RetentionPolicy:
@@ -1672,19 +2036,100 @@ def _recover_retention_journals_locked() -> dict:
     return result
 
 
+def _retention_journals_pending() -> bool:
+    """Cheap lock-free probe: does an interrupted prune need recovery?
+
+    Any journal or staging entry, readable or not, routes the caller to the
+    strict recovery that runs under the lock; that path decides whether the
+    state is recoverable or must fail closed.
+    """
+    home = agw_home()
+    for name in ("transactions", "staging"):
+        root = os.path.join(home, "retention", name)
+        try:
+            with os.scandir(root) as entries:
+                if next(entries, None) is not None:
+                    return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def _capacity_result(policy: retention_policy.RetentionPolicy, before: int,
+                     incoming: int, state, **extra) -> dict:
+    result = {
+        "automatic": True,
+        "before_bytes": before,
+        "incoming_bytes": incoming,
+        "projected_bytes": before + incoming,
+        "policy": policy.as_dict(),
+        "state": state.as_dict(),
+        "journal_recovery": {"discovered": 0, "recovered": 0,
+                             "already_complete": 0, "plan_ids": []},
+        "legacy_migration": {"migrated": 0, "transaction_ids": [],
+                             "protected_days": policy.min_protected_age_days},
+        "applied": False,
+        "reclaimed_bytes": 0,
+        "after_bytes": before,
+        "final_projected_bytes": before + incoming,
+    }
+    result.update(extra)
+    return result
+
+
+def _raise_if_over_capacity(policy: retention_policy.RetentionPolicy,
+                            result: dict):
+    final_projected = int(result["final_projected_bytes"])
+    if not policy.unlimited and final_projected > policy.max_bytes:
+        # Imported here: remediation reaches store through workflows, so a
+        # module-level import would be circular.
+        from . import remediation
+        details = {
+            **result,
+            "error_code": ArchiveCapacityError.error_code,
+            "maximum_bytes": policy.max_bytes,
+            "required_free_bytes": final_projected - policy.max_bytes,
+            "protected_or_unavailable_bytes": max(
+                0, final_projected - policy.low_water_bytes
+                - int(result.get("reclaimed_bytes") or 0),
+            ),
+        }
+        details["remediation"] = remediation.capacity_instruction(details)
+        raise ArchiveCapacityError(
+            "The recovery cache cannot safely make room for this operation. "
+            + details["remediation"],
+            details,
+        )
+
+
 def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None,
                        incoming_bytes: int = 0, lock_context=None) -> dict:
     """Automatically reclaim only expired, classified cache preimages.
 
-    The caller may provide an already-held global-store lock via
-    ``lock_context``.  Unknown, manual, move, evidence, corrupt, and recent
-    records are never candidates.  If those protections leave insufficient
-    room, the new store-growing operation is refused before publication.
+    The size check runs without the global lock. The lock (``lock_context``
+    when given, otherwise the CLI default; a caller that already holds it
+    passes ``nullcontext()``) is taken only when a prune may be applied or an
+    interrupted prune must be recovered. Unknown, manual, move, evidence,
+    corrupt, and recent records are never candidates. If those protections
+    leave insufficient room, the new store-growing operation is refused
+    before publication.
     """
-    context = lock_context or Lock("recovery-store", timeout=30.0)
+    policy = policy or resolved_retention_policy()
+    incoming = max(0, int(incoming_bytes or 0))
+    if not _retention_journals_pending():
+        before = archive_size_bytes()
+        state = retention_policy.classify_retention_state(policy, before + incoming)
+        if not state.prune_recommended:
+            result = _capacity_result(policy, before, incoming, state,
+                                      lock_taken=False)
+            _raise_if_over_capacity(policy, result)
+            return result
+    context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
         return _maintain_retention_locked(
-            policy=policy, incoming_bytes=incoming_bytes
+            policy=policy, incoming_bytes=incoming
         )
 
 
@@ -1695,7 +2140,9 @@ def _maintain_retention_locked(*,
     policy = policy or resolved_retention_policy()
     incoming = max(0, int(incoming_bytes or 0))
     journal_recovery = _recover_retention_journals_locked()
-    before = archive_size_bytes()
+    if journal_recovery["recovered"]:
+        _refresh_archive_size_locked()
+    before = _archive_size_bytes_locked()
     projected = before + incoming
     state = retention_policy.classify_retention_state(policy, projected)
     migration = {"migrated": 0, "transaction_ids": [],
@@ -1704,18 +2151,11 @@ def _maintain_retention_locked(*,
         migration = retention.migrate_legacy_cache_records(
             agw_home(), protected_days=policy.min_protected_age_days
         )
-    result = {
-        "automatic": True,
-        "before_bytes": before,
-        "incoming_bytes": incoming,
-        "projected_bytes": projected,
-        "policy": policy.as_dict(),
-        "state": state.as_dict(),
-        "journal_recovery": journal_recovery,
-        "legacy_migration": migration,
-        "applied": False,
-        "reclaimed_bytes": 0,
-    }
+    result = _capacity_result(
+        policy, before, incoming, state, lock_taken=True,
+        journal_recovery=journal_recovery, legacy_migration=migration,
+    )
+    after = before
     if state.prune_recommended and before:
         plan = retention.build_plan(
             agw_home(), policy=policy, current_bytes=projected,
@@ -1729,24 +2169,35 @@ def _maintain_retention_locked(*,
             result["applied"] = True
             result["apply"] = applied
             result["reclaimed_bytes"] = int(applied.get("reclaimed_bytes") or 0)
+            # A prune is the one path that shrinks the archive; recount once
+            # rather than trusting allocated-vs-logical arithmetic.
+            after = _refresh_archive_size_locked()
 
-    after = archive_size_bytes()
-    final_projected = after + incoming
-    result["after_bytes"] = after
-    result["final_projected_bytes"] = final_projected
-    if not policy.unlimited and final_projected > policy.max_bytes:
-        raise ArchiveCapacityError(
-            "The recovery cache cannot safely make room for this operation.",
-            {
-                **result,
-                "maximum_bytes": policy.max_bytes,
-                "required_free_bytes": final_projected - policy.max_bytes,
-                "protected_or_unavailable_bytes": max(
-                    0, final_projected - policy.low_water_bytes
-                    - int(result.get("reclaimed_bytes") or 0),
-                ),
-            },
+    if not policy.unlimited and after + incoming > policy.max_bytes and after:
+        # Capacity wall: normal reclamation left the store over its hard cap.
+        # Let older same-source pre-images yield behind a newer verified copy
+        # before refusing; the newest copy of every file is still never
+        # touched, and `agw prune` remains the only human-gated path beyond.
+        pressure_plan = retention.build_plan(
+            agw_home(), policy=policy, current_bytes=after + incoming,
+            capacity_pressure=True,
         )
+        result["capacity_pressure_plan"] = pressure_plan
+        if pressure_plan.get("applicable") and pressure_plan.get("candidates"):
+            applied = retention.apply_plan(
+                agw_home(), pressure_plan,
+                expected_plan_hash=pressure_plan["plan_sha256"],
+                policy=policy, lock_context=nullcontext(),
+            )
+            result["applied"] = True
+            result["capacity_pressure_apply"] = applied
+            result["reclaimed_bytes"] = int(result.get("reclaimed_bytes") or 0) \
+                + int(applied.get("reclaimed_bytes") or 0)
+            after = _refresh_archive_size_locked()
+
+    result["after_bytes"] = after
+    result["final_projected_bytes"] = after + incoming
+    _raise_if_over_capacity(policy, result)
     return result
 
 

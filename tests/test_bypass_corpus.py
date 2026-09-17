@@ -37,6 +37,22 @@ CORPUS = [
     "bash -c 'rm -rf /tmp/y'",
     "sh -c \"rm file\"",
     "bash -c \"bash -c 'rm x'\"",
+    # F3: the Windows spellings of the same interpreters
+    'bash.exe -c "rm -rf X"',
+    'sh.exe -c "rm file"',
+    r"C:\Windows\System32\cmd.exe /c del X",
+    r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -Command "Remove-Item -Recurse -Force C:\work\notes"',
+    '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c "Remove-Item -Recurse -Force C:\\work\\notes"',
+    # F4: Windows destroyers that were modelled nowhere
+    "wsl rm -rf /mnt/c/Users/jo/Documents",
+    "wsl -d Ubuntu -u root rm -rf /mnt/c/x",
+    r"Start-Process powershell -ArgumentList '-Command','Remove-Item -Recurse C:\x'",
+    'Start-Process -FilePath cmd.exe -ArgumentList "/c del X"',
+    "Start-Process powershell -ArgumentList $cmd",
+    r"robocopy C:\src C:\dst /MIR",
+    r"robocopy C:\src C:\dst /MOVE",
+    r"fsutil file setzerodata offset=0 length=4096 C:\work\notes.txt",
+    r"powershell -File .\wipe.ps1",
     # substitution
     "echo $(rm -rf /tmp/z)",
     "`rm file`",
@@ -125,6 +141,11 @@ BENIGN = [
     "ssh -i ~/.ssh/id_rsa deploy@prod.example",
     "cat .env.example",
     "grep password src/auth.py",
+    # F4: the non-destructive spellings of the newly modelled commands
+    "wsl --list --verbose",
+    "robocopy src dst /E",
+    "xcopy src dst /E /Y",
+    "Start-Process notepad.exe README.md",
     "curl https://api.example.com/v1/data.key",
     # searching for destructive text is not executing it (span-aware content scan)
     "grep \"DROP TABLE users\" schema.sql",

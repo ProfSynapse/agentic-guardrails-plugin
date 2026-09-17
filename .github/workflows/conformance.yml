@@ -63,3 +63,29 @@ jobs:
       - name: Run source and packed-artifact conformance on Unix
         if: runner.os != 'Windows'
         run: python -m pytest -q
+
+  stdlib-only:
+    # PyYAML is optional (contract 5), and running without it is the documented
+    # primary mode - but every matrix leg above installs it, so `miniyaml` was
+    # the one policy reader CI never exercised. A corrupt pack that miniyaml
+    # accepts loads as HEALTHY, which is a fail-open on contract 1.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Create a virtualenv with pytest and nothing else
+        run: |
+          python -m venv .venv-stdlib
+          .venv-stdlib/bin/python -m pip install --upgrade pip
+          .venv-stdlib/bin/python -m pip install pytest
+      - name: Assert PyYAML really is absent
+        run: |
+          if .venv-stdlib/bin/python -c "import yaml" 2>/dev/null; then
+            echo "PyYAML is installed; this leg proves nothing" >&2
+            exit 1
+          fi
+      - name: Run policy and engine suites on the stdlib reader
+        timeout-minutes: 5
+        run: .venv-stdlib/bin/python -m pytest -q tests/test_policy_health.py tests/test_engine_rules.py

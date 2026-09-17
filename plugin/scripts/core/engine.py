@@ -19,12 +19,14 @@ import re
 import shutil
 from typing import Optional
 
-from . import agw_contract, launcher, policy_health, powershell_bind, profiles as prof, remediation
+from . import agw_contract, launcher, policy_health, policycache, powershell_bind, \
+    profiles as prof, remediation
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
-    ToolEvent, worst
+    EnforcementClass, ToolEvent, worst
 from .shellparse import DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, \
-    FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, ParseUncertain, SimpleCommand, \
+    FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT, \
+    ParseUncertain, SimpleCommand, \
     _HEREDOC_RE, extract_commands, extract_payloads, redirect_targets
 
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
@@ -34,16 +36,13 @@ ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archiv
 # --- secret/confidential detection: ask, don't block --------------------------
 # Reading a credential-type file is often legitimate (dev setup), so it asks.
 # The only hard deny is the exfiltration shape: credential file + network tool
-# in the same command.
-
-_SECRET_BASENAME_RE = re.compile(
-    r"^(?:\.env(?:\..+)?|\.netrc|\.pgpass|\.git-credentials"
-    r"|id_(?:rsa|dsa|ecdsa|ed25519)|.*\.(?:pem|key|p12|pfx|jks|keystore|ppk))$",
-    re.IGNORECASE)
-_SECRET_NAMES = {"credentials", "credentials.json", "service_account.json",
-                 "service-account.json", "secrets.json", "secrets.yaml", "secrets.yml"}
-_SECRET_DIRS = {".ssh", ".aws", ".azure", ".kube", "gcloud"}
-_NOT_SECRET_SUFFIX = re.compile(r"\.(?:example|sample|template|dist|pub)$", re.IGNORECASE)
+# in the same command. The filename and content checks live in core.readscan so
+# the routine-Read fast path can run them without loading this module; they
+# are re-exported here because the exec rules use them and tests reach them
+# through the engine.
+from .readscan import _DEV_DOC_BASENAMES, _DEV_SOURCE_SUFFIXES, _NOT_SECRET_SUFFIX, \
+    _PRESCAN_BYTES, _PRESCAN_MARKERS, _SECRET_BASENAME_RE, _SECRET_DIRS, _SECRET_NAMES, \
+    _is_low_confidence_context, _is_secret_path, _prescan_file  # noqa: E402,F401
 
 # These commands may mention a credential-named path while creating or updating
 # it, but do not read that file into the agent conversation. Nested reads are
@@ -74,79 +73,6 @@ _READER_CMDS = {"cat", "head", "tail", "less", "more", "bat", "strings",
 
 _HUNT_RE = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token|credential)")
 
-_PRESCAN_BYTES = 64 * 1024
-_PRESCAN_MARKERS = (
-    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), True),
-    ("an AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), True),
-    ("an API token", re.compile(
-        r"\bgh[pos]_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{20,}"
-        r"|\bxox[bpoars]-[A-Za-z0-9-]{10,}"), True),
-    ("a hardcoded password", re.compile(
-        r"(?i)\b(?:password|passwd|pwd)\s*[=:]\s*[\"'][^\"']{6,}[\"']"), True),
-    ("a credential assignment", re.compile(
-        r"(?mi)^[A-Za-z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_?KEY)[A-Za-z0-9_]*"
-        r"\s*=\s*(?:[\"'][^\"']{6,}[\"']|[A-Za-z0-9_./+=:-]{6,})\s*$"), True),
-    ("a confidentiality marking", re.compile(
-        r"(?i)\b(?:confidential|do not distribute|internal use only|trade secret)\b"), False),
-    ("embedded prompt-injection instructions", re.compile(
-        r"\b(?:ignore|disregard|forget)\b[^.\n]{0,40}"
-        r"\b(?:instructions|prompt|rules|guidance|directives)\b"
-        r"|\b(?:say|claim|pretend|tell them)\b[^.\n]{0,30}"
-        r"\b(?:already\s+)?approved\b", re.IGNORECASE), False),
-)
-
-_DEV_SOURCE_SUFFIXES = {
-    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".sh", ".ps1", ".psm1",
-    ".rb", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
-}
-_DEV_DOC_BASENAMES = {
-    "readme.md", "research.md", "plan.md", "testing.md", "releasing.md",
-    "contributing.md", "codex.md", "deployment.md", "agents.md",
-}
-
-
-def _is_low_confidence_context(path: str) -> bool:
-    normalized = os.path.abspath(path).replace("\\", "/").lower()
-    parts = [part for part in normalized.split("/") if part]
-    base = parts[-1] if parts else ""
-    suffix = os.path.splitext(base)[1]
-    return (suffix in _DEV_SOURCE_SUFFIXES or suffix in {".log", ".jsonl"}
-            or base in _DEV_DOC_BASENAMES
-            or any(part in {"test", "tests", "docs", "plans"} for part in parts))
-
-
-def _is_secret_path(path: str) -> bool:
-    if "://" in path:
-        return False  # URL, not a filesystem path
-    p = os.path.expanduser(path).replace("\\", "/")
-    base = os.path.basename(p)
-    if _NOT_SECRET_SUFFIX.search(base):
-        return False
-    if _SECRET_BASENAME_RE.match(base) or base.lower() in _SECRET_NAMES:
-        return True
-    return any(d in p.split("/")[:-1] for d in _SECRET_DIRS)
-
-
-def _prescan_file(path: str):
-    """Return a human label for the first secret/confidential marker found in
-    the file head, or None. Cheap (one bounded read), binary-safe."""
-    if _NOT_SECRET_SUFFIX.search(os.path.basename(path)):
-        return None  # .example/.sample/.template files hold placeholders
-    try:
-        if not os.path.isfile(path) or os.path.getsize(path) == 0:
-            return None
-        with open(path, "rb") as f:
-            head = f.read(_PRESCAN_BYTES)
-    except OSError:
-        return None
-    if b"\0" in head:
-        return None  # binary container; plaintext markers won't be meaningful
-    text = head.decode("utf-8", "replace")
-    for label, rx, high_confidence in _PRESCAN_MARKERS:
-        if rx.search(text):
-            contextual_low = not high_confidence and _is_low_confidence_context(path)
-            return label, contextual_low
-    return None
 
 _INTERPRETER_DESTRUCTIVE = re.compile(
     r"os\.(remove|unlink|rmdir|removedirs)|shutil\.rmtree|\.unlink\(|send2trash"
@@ -229,7 +155,16 @@ def _code_view(command: str, parsed) -> str:
                 view = view.replace(tok, " " * len(tok), 1)  # blank first occurrence
     return "\n".join([view] + parsed.payloads)
 
-_MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate"}
+_MUTATOR_CMDS = {"mv", "cp", "tee", "sed", "touch", "ln", "install", "rsync", "truncate",
+                 # Windows bulk copiers. Both overwrite their destination, and
+                 # robocopy's mirroring switches below also delete from it.
+                 "xcopy", "robocopy"}
+
+# robocopy switches that destroy files rather than copy them: /MIR and /PURGE
+# delete everything in the destination that is not in the source, and
+# /MOV|/MOVE deletes the source once it has been copied.
+_ROBOCOPY_PURGE_SWITCHES = {"/mir", "/purge"}
+_ROBOCOPY_MOVE_SWITCHES = {"/mov", "/move"}
 
 # File/dir deletion verbs across shells. `name` is the lowered argv0 basename,
 # so PowerShell `Remove-Item` arrives as "remove-item" and its aliases/cmd
@@ -375,7 +310,7 @@ def load_policy(plugin_root: str = "") -> Policy:
     policy = Policy()
     home = os.path.expanduser("~")
     agw_home = os.environ.get("AGW_HOME") or os.path.join(home, ".agw")
-    policy.protected_globs = [
+    protected_globs = policy.protected_globs = [
         os.path.join(agw_home, "**"), agw_home,
         os.path.join(home, ".ssh", "**"), os.path.join(home, ".aws", "**"),
         os.path.join(home, ".gnupg", "**"),
@@ -383,6 +318,20 @@ def load_policy(plugin_root: str = "") -> Policy:
     ]
     if plugin_root:
         policy.protected_globs += [os.path.join(plugin_root, "**"), plugin_root]
+
+    # The key is taken before any pack is read: a pack edited while we parse
+    # must miss on the next call, not be served under its old key.
+    cache_key = policycache.key(plugin_root, agw_home)
+    cached = policycache.load(plugin_root, agw_home, cache_key)
+    if cached is not None:
+        try:
+            _policy_from_document(policy, cached)
+            return policy
+        except (KeyError, TypeError, ValueError, re.error):
+            policy = Policy()
+            policy.protected_globs = protected_globs
+            # A document this loader cannot rebuild is a malformed cache:
+            # parse the real files and overwrite it.
 
     baseline_path = os.path.join(plugin_root, "policies", "core.yaml") if plugin_root else ""
     source_tokens = []
@@ -446,7 +395,58 @@ def load_policy(plugin_root: str = "") -> Policy:
     policy.health_record = policy_health.Health(
         policy.health, policy.baseline_revision, policy.revision, issues
     )
+    if policy.health == policy_health.HEALTHY:
+        # Only a clean result is worth remembering. A degraded or unavailable
+        # policy is re-derived from the real files on every call, so a stale
+        # cache can never hide a broken pack.
+        policycache.store(agw_home, cache_key, _policy_document(policy))
     return policy
+
+
+def _policy_document(policy: Policy) -> dict:
+    """The parsed, merged state of a HEALTHY policy as plain JSON data."""
+    snippets = [dict(rule, pattern=rule["pattern"].pattern)
+                for rule in policy.snippet_rules]
+    return {
+        "command_rules": policy.command_rules, "snippet_rules": snippets,
+        "path_rules": policy.path_rules, "mcp_rules": policy.mcp_rules,
+        "settings": policy.settings, "baseline_revision": policy.baseline_revision,
+        "revision": policy.revision,
+    }
+
+
+def _policy_from_document(policy: Policy, document: dict) -> None:
+    """Rebuild a HEALTHY policy from a cached document (raises on a bad one)."""
+    def _rules(section):
+        rules = document[section]
+        if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+            raise TypeError("cached policy section %s is not a rule list" % section)
+        return [dict(rule, enforcement_class=EnforcementClass(rule["enforcement_class"]))
+                for rule in rules]
+    command_rules = _rules("command_rules")
+    snippet_rules = [dict(rule, pattern=re.compile(rule["pattern"]))
+                     for rule in _rules("snippet_rules")]
+    path_rules = _rules("path_rules")
+    mcp_rules = _rules("mcp_rules")
+    settings = document["settings"]
+    if not isinstance(settings, dict):
+        raise TypeError("cached policy settings is not a mapping")
+    revision = document["revision"]
+    baseline_revision = document["baseline_revision"]
+    if not (isinstance(revision, str) and isinstance(baseline_revision, str)):
+        raise TypeError("cached policy revision is not a string")
+    policy.command_rules = command_rules
+    policy.snippet_rules = snippet_rules
+    policy.path_rules = path_rules
+    policy.mcp_rules = mcp_rules
+    policy.settings = settings
+    policy.degraded = []
+    policy.baseline_revision = baseline_revision
+    policy.revision = revision
+    policy.health = policy_health.HEALTHY
+    policy.health_record = policy_health.Health(
+        policy.health, baseline_revision, revision, ()
+    )
 
 
 def _read_policy_bytes(path: str) -> bytes:
@@ -459,12 +459,18 @@ def _load_policy_document(path: str, raw: bytes):
     if path.lower().endswith(".json"):
         import json
         return json.loads(text)
+    # miniyaml first: it is the reader every install has, CONTRIBUTING requires
+    # core.yaml to parse under it, and it costs a fraction of PyYAML's import.
+    # PyYAML is only consulted for a document miniyaml cannot read.
+    from . import miniyaml
     try:
-        import yaml  # type: ignore
-        return yaml.safe_load(text)
-    except ImportError:
-        from . import miniyaml
         return miniyaml.loads(text)
+    except Exception:
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            raise
+        return yaml.safe_load(text)
 
 
 def _load_yaml(path: str):
@@ -622,13 +628,22 @@ def _named_arg(argv: list, flags: tuple) -> str:
 class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
-    def __init__(self, values=(), complete=True, reason="", covered=False):
+    def __init__(self, values=(), complete=True, reason="", covered=False,
+                 skipped=(), incomplete_kind=""):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
+        # Why the analysis is incomplete, as one of the powershell_bind kind
+        # constants. A caller routes on it: an unresolved path is a question
+        # for the user, an unsupported shape stays a fail-closed invariant.
+        self.incomplete_kind = incomplete_kind
         # True when a recognized mutator was fully analyzed but legitimately
         # needs no pre-image (for example mkdir -p on an existing directory).
         self.covered = covered
+        # (target, why) pairs a recognized mutator deliberately left out of the
+        # target set. The planner records them so the receipt stays honest
+        # about what was analyzed and not snapshotted.
+        self.skipped = list(skipped)
 
 
 def _static_shell_path(token: str) -> bool:
@@ -644,6 +659,26 @@ def _absent_creation_root(path: str) -> str:
         root = parent
         parent = os.path.dirname(root)
     return root
+
+
+# A bulk directory copy names no files, so the set it would overwrite has to
+# be read off the source. Only immediate entries are listed, and only that many
+# of them: the point is to protect the files a routine `robocopy src dst` would
+# replace, not to model every recursive switch. A deeper collision still has no
+# pre-image, which is the same gap the copy had before it was analyzed at all.
+_TREE_COPY_SCAN_LIMIT = 512
+
+
+def _tree_copy_sources(source: str) -> list:
+    """Immediate entries of a copied directory, for destination planning."""
+    try:
+        entries = sorted(os.listdir(source))[:_TREE_COPY_SCAN_LIMIT]
+    except OSError:
+        return []
+    # Files only: a subdirectory has no pre-image of its own, and naming one
+    # as a target would fail the pre-image step instead of protecting anything.
+    return [os.path.join(source, entry) for entry in entries
+            if os.path.isfile(os.path.join(source, entry))]
 
 
 def _covered_by_absent_root(path: str, roots: set[str]) -> bool:
@@ -709,15 +744,84 @@ def _powershell_directory_creation(argv: list[str]) -> bool:
     return False
 
 
+SKIP_REGENERABLE = "regenerable, no pre-image required"
+SKIP_WHATIF = "dry run (-WhatIf), nothing is changed"
+
+# `-WhatIf` short-circuits ShouldProcess: the cmdlet reports what it would do
+# and changes nothing. PowerShell resolves any unambiguous prefix, and every
+# bound parameter starting with "wh" is WhatIf; it also documents `-wi`, which
+# is no prefix of the name at all. `-Confirm` is deliberately not here: it
+# still deletes once the prompt is answered, and the hook cannot see that
+# answer.
+_WHATIF_PREFIXES = frozenset(
+    "whatif"[:length] for length in range(2, len("whatif") + 1)
+) | powershell_bind.WHATIF_ALIASES
+_SWITCH_TRUE = {"true", "$true", "1"}
+
+
+def _powershell_whatif(cmd: SimpleCommand) -> bool:
+    if cmd.dialect != DIALECT_POWERSHELL:
+        return False
+    for token in cmd.argv[1:]:
+        if not token.startswith("-") or token == "-":
+            continue
+        raw = token[1:]
+        value = None
+        if ":" in raw:
+            raw, value = raw.split(":", 1)
+        if raw.lower() not in _WHATIF_PREFIXES:
+            continue
+        if value is None:
+            return True
+        # `-WhatIf:$flag` is a dry run only when the literal says so; an
+        # explicit false or a runtime value is not one.
+        return value.strip().lower() in _SWITCH_TRUE
+    return False
+
+
+def _regenerable_delete_operands(cmd: SimpleCommand, binding, regenerable: set):
+    """Operands of a delete whose every target is a regenerable tree.
+
+    Mirrors the `builtin:rm-regenerable` allowance exactly: only the general
+    removers, and only when *every* operand is regenerable. Returns an empty
+    list otherwise, so a mixed delete keeps full pre-image coverage.
+    """
+    name = cmd.name
+    if name not in _REGEN_OK_VERBS:
+        return []
+    if binding.recognized and binding.complete:
+        operands = list(binding.targets)
+    else:
+        # Same operand filter the allowance itself uses, so a shape the binder
+        # cannot model (`del /s /q build`) is planned the way it is decided.
+        operands = [value for value in cmd.argv[1:]
+                    if not value.startswith("-")
+                    and not (name in _CMD_SWITCH_VERBS
+                             and _CMD_SWITCH_RE.fullmatch(value))]
+    if not operands:
+        return []
+    return operands if all(_is_regenerable(value, regenerable)
+                           for value in operands) else []
+
+
 def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
-                    dialect: str = None) -> list:
+                    dialect: str = None, regenerable: set = None) -> list:
     """Existing files a shell command would overwrite/truncate: `>` redirects,
     POSIX mv/cp/tee/dd/truncate/install destinations, and the PowerShell/cmd
     write forms (Set-Content/Out-File, Copy-Item/copy /y, Move-Item/move,
     [IO.File]::WriteAllText) that carry no `>` token. Used by the adapter to
     pre-image-snapshot them before the command runs — the Bash equivalent of
     the Write/Edit pre-image. Best-effort: never raises. Over-inclusion is
-    cheap (a redundant snapshot is deduped); a miss is silent data loss."""
+    cheap (a redundant snapshot is deduped); a miss is silent data loss.
+
+    `regenerable` is the engine's regenerable-tree set (defaults to the
+    built-in one). Deletes the engine allows under `builtin:rm-regenerable`
+    report their operands as skipped instead of as targets: a directory has no
+    pre-image to take and archiving a build tree would copy gigabytes of
+    reproducible junk. When the level turns the allowance off the delete is a
+    DENY, so the command never reaches pre-image preparation anyway."""
+    regenerable = _REGENERABLE if regenerable is None else regenerable
+
     def _abs(tok):
         tok = tok.strip("'\"")
         p = os.path.expanduser(tok)
@@ -730,7 +834,9 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     absent_dir_roots = set()
     complete = True
     incomplete_reason = ""
+    incomplete_kind = ""
     covered = False
+    skipped = []
     try:
         for t in redirect_targets(command):
             targets.add(_abs(t))
@@ -753,8 +859,24 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             name = cmd.name
             argv_low = [a.lower() for a in cmd.argv]
             binding = powershell_bind.bind(cmd.argv, cmd.dialect)
+            if binding.recognized and _powershell_whatif(cmd):
+                # The engine allows this as a dry run; there is nothing to
+                # snapshot, and demanding a pre-image would deny it anyway.
+                covered = True
+                skipped.append((cmd.name, SKIP_WHATIF))
+                continue
+            regen_operands = _regenerable_delete_operands(
+                cmd, binding, regenerable
+            )
+            if regen_operands:
+                covered = True
+                skipped.extend((_abs(value), SKIP_REGENERABLE)
+                               for value in regen_operands)
+                continue
             if binding.recognized:
                 if not binding.complete:
+                    if complete:
+                        incomplete_kind = binding.kind
                     complete = False
                     incomplete_reason = incomplete_reason or binding.reason
                     continue
@@ -855,12 +977,52 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                        if not a.startswith("-") and not _CMD_SWITCH_RE.fullmatch(a)]
                 if len(pos) >= 2:
                     targets.add(_abs(pos[-1]))
+            elif name in ("xcopy", "robocopy"):
+                # Both overwrite their destination and neither is modeled by
+                # the PowerShell binder. Their switches are multi-letter and
+                # `/`-prefixed (`/Y`, `/MIR`, `/XF`), so `_CMD_SWITCH_RE` —
+                # which matches one letter — would read `/MIR` as a path.
+                pos = [a for a in cmd.argv[1:]
+                       if not a.startswith("/") and not a.startswith("-")]
+                if len(pos) < 2:
+                    continue
+                # xcopy: `<source> <destination>`, destination last.
+                # robocopy: `<source> <destination> [files...]`, so the
+                # destination is the second positional and the rest name
+                # individual files inside it.
+                dest = pos[-1] if name == "xcopy" else pos[1]
+                sources = ([pos[0]] if name == "xcopy"
+                           else [os.path.join(pos[0], value) for value in pos[2:]])
+                if not _static_shell_path(dest) or any(
+                        not _static_shell_path(source) for source in sources):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        f"{name} source or destination uses runtime expansion or a wildcard"
+                    continue
+                covered = True
+                dest_abs = _abs(dest)
+                if os.path.isdir(dest_abs) or dest_abs in planned_dirs \
+                        or dest.endswith(("/", "\\")):
+                    # A directory destination is not itself replaced and has no
+                    # pre-image; the files copied into it are what get
+                    # clobbered. Naming the directory as a target instead would
+                    # fail the pre-image step and deny every routine copy.
+                    for source in (sources or _tree_copy_sources(_abs(pos[0]))):
+                        destination = os.path.join(
+                            dest_abs, os.path.basename(source)
+                        )
+                        if not _covered_by_absent_root(
+                                destination, absent_dir_roots):
+                            targets.add(destination)
+                else:
+                    targets.add(dest_abs)
     # [IO.File]::WriteAllText("path", ...) in the raw line or a wrapper payload.
     for text in [command] + (parsed.payloads if parsed else []):
         for m in _WRITEALLTEXT_RE.finditer(text):
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
-    return TargetList(values, complete, incomplete_reason, covered=covered)
+    return TargetList(values, complete, incomplete_reason, covered=covered,
+                      skipped=skipped, incomplete_kind=incomplete_kind)
 
 
 def _zone_rule_for(path: str, policy: Policy):
@@ -916,6 +1078,27 @@ def _has_mutation_evidence(command: str) -> bool:
     return bool(_MUTATION_EVIDENCE_RE.search(command)
                 or _PWSH_DESTRUCTIVE.search(command)
                 or redirect_targets(command))
+
+
+# A short POSIX flag cluster carrying both recursion and force — `-rf`, `-fr`,
+# `-Rf`, `-rfv`. The letter bounds keep this to real clusters rather than any
+# long word after a dash.
+#
+# Only the indirect-command evidence test consults it. There, the command name
+# is exactly what we could not resolve (`$RM -rf ~/My-Documents`), so the flag
+# cluster is the whole signal. Everywhere else the head is known and read-only
+# heads spell the same letters for unrelated reasons: `grep -rf patterns.txt .`
+# reads patterns from a file, `tar -rf archive.tar` appends to an archive.
+# Widening the general evidence test would make clobber_targets snapshot both.
+_FORCED_RECURSIVE_FLAGS_RE = re.compile(
+    r"(?<![\w-])-[a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}\b"
+    r"|(?<![\w-])-[a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}\b")
+
+
+def _has_indirect_mutation_evidence(command: str) -> bool:
+    """Whether a command whose name we could not read still looks destructive."""
+    return bool(_has_mutation_evidence(command)
+                or _FORCED_RECURSIVE_FLAGS_RE.search(command))
 
 
 _SEARCH_VALUE_FLAGS = {
@@ -1071,8 +1254,36 @@ _DISCOVERY_HEAVY_PARTS = {value.casefold() for value in _REGENERABLE} | {
 }
 _DISCOVERY_RISK_FLAGS = {
     "--no-ignore", "--no-ignore-vcs", "--hidden", "--follow",
-    "--dereference-recursive", "-follow", "-followsymlink", "-force",
+    "--dereference-recursive", "-follow", "-followsymlink",
 }
+# `-force` means "ignore safety" only on the finders. On Get-ChildItem/gci and
+# on ls/dir it reveals hidden entries and nothing else — `gci -Recurse -Force`
+# is the standard PowerShell listing idiom, not a safeguard being disabled.
+_DISCOVERY_FORCE_TOOLS = {"fd", "fdfind", "find"}
+
+
+# Markers that identify a checkout the agent is actually working in. A folder
+# holding one of these is the unit of work, wherever it happens to live — a
+# repo under "OneDrive - Acme" is still a repo.
+_PROJECT_ROOT_MARKERS = (".git", "package.json", "pyproject.toml", ".agw")
+_PROJECT_ROOT_MARKER_GLOBS = ("*.sln",)
+
+
+def _is_project_root(path: str) -> bool:
+    if any(os.path.exists(os.path.join(path, marker))
+           for marker in _PROJECT_ROOT_MARKERS):
+        return True
+    try:
+        # Streamed and short-circuited: this runs once per ancestor on the
+        # discovery path, and a home directory can hold a lot of entries.
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if any(fnmatch.fnmatch(entry.name, pattern)
+                       for pattern in _PROJECT_ROOT_MARKER_GLOBS):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _active_project_root(event: ToolEvent) -> str:
@@ -1081,7 +1292,7 @@ def _active_project_root(event: ToolEvent) -> str:
         cwd = os.path.dirname(cwd)
     current = cwd
     for _ in range(32):
-        if os.path.exists(os.path.join(current, ".git")):
+        if _is_project_root(current):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -1133,7 +1344,22 @@ def _discovery_scope_assessment(scopes: list[str], event: ToolEvent,
         parts = {value.casefold() for value in resolved.replace("\\", "/").split("/")}
         if _is_root_or_home(resolved):
             return False, "the scope is a filesystem or home-directory root", labels
-        if any(marker in part for part in parts for marker in _DISCOVERY_CLOUD_PARTS):
+        # A project that happens to live under OneDrive/Dropbox is still the
+        # unit of work: listing it is not an unbounded sweep of the user's
+        # cloud storage. So the cloud-tree test ignores the components the
+        # project root itself contributes, and still fires on a scope that
+        # escapes the project (`gci ~/OneDrive -Recurse` from a project
+        # elsewhere) or on a synced folder nested inside it.
+        cloud_parts = parts
+        if _within(resolved, project_root):
+            cloud_parts = {
+                value.casefold()
+                for value in os.path.relpath(resolved, project_root)
+                .replace("\\", "/").split("/")
+                if value not in ("", ".")
+            }
+        if any(marker in part for part in cloud_parts
+               for marker in _DISCOVERY_CLOUD_PARTS):
             return False, "the scope is inside a cloud-synced tree", labels
         if parts & _DISCOVERY_HEAVY_PARTS:
             return False, "the scope is a dependency, build, or cache tree", labels
@@ -1218,6 +1444,9 @@ def _raw_discovery_shape(cmd: SimpleCommand, event: ToolEvent):
 def _raw_discovery_risk_flag(cmd: SimpleCommand) -> bool:
     lowered = [value.lower() for value in cmd.argv[1:]]
     if any(value in _DISCOVERY_RISK_FLAGS for value in lowered):
+        return True
+    if cmd.name in _DISCOVERY_FORCE_TOOLS and any(
+            value in {"-force", "--force"} for value in lowered):
         return True
     if cmd.name in {"rg", "ripgrep"} and any(
             re.fullmatch(r"-u{1,3}", value) for value in lowered):
@@ -1419,8 +1648,27 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
     if FLAG_EVAL in parsed.flags:
         decisions.append(Decision(ASK, "eval/source of dynamic content — review carefully.",
                                   "builtin:eval"))
+    if FLAG_UNINSPECTED_SCRIPT in parsed.flags:
+        scripts = [str(value) for value in parsed.uninspected if str(value).strip()]
+        decisions.append(Decision(
+            ASK,
+            "This hands a command body to a shell interpreter that guardrails never "
+            "sees — a `-File` script, or a launcher argument list that is not a "
+            "literal. Its contents are not inspected, so guardrails cannot tell which "
+            "files it changes. Confirm you know what it runs, or pass the commands "
+            "inline so they can be checked.",
+            "builtin:uninspected-script",
+            presentation_context=DecisionContext.FILE_CHANGE,
+            presentation_details={
+                "operation": "run an uninspected command body",
+                "targets": scripts,
+                "target_kind": "file",
+                "signal": "script contents not inspected",
+                "trigger": "A shell wrapper was handed a command body guardrails "
+                           "cannot read.",
+            }))
     if FLAG_INDIRECT in parsed.flags:
-        if _has_mutation_evidence(event.command):
+        if _has_indirect_mutation_evidence(event.command):
             decisions.append(Decision(
                 DENY, "Guardrails could not identify a potentially file-changing action. "
                       "Ask the agent to use the direct command name so it can be checked.",
@@ -1486,6 +1734,10 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
 
     for cmd in parsed.commands:
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
+
+    # The files this command would clobber get the Write path's cloud guard,
+    # before anything tries to take a pre-image of them.
+    decisions.append(_eval_clobber_cloud(event, parsed, dialect))
 
     # content rules also see payloads the command would write (heredocs, echo)
     # and the inner text of any wrapper we recursed (so secrets smuggled through
@@ -1694,6 +1946,14 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         return Decision(ALLOW, "", "builtin:agw")
 
     # ---- built-in semantic deny table ----
+    # A `-WhatIf` run of a supported cmdlet reports what it would do and
+    # changes nothing, so it is the safest way for an agent to show its work
+    # before asking for the real operation. Blocking it taught the agent that
+    # checking first is pointless. `-Confirm` gets no such allowance: it still
+    # deletes once the prompt is answered, and the hook never sees the answer.
+    if powershell_bind.bind(cmd.argv, cmd.dialect).recognized \
+            and _powershell_whatif(cmd):
+        return Decision(ALLOW, "dry run (-WhatIf)", "builtin:powershell-whatif")
     if name in _DELETE_VERBS or name in _SECURE_WIPE_VERBS:
         # Regenerable build/dependency dirs are routine to delete and pointless
         # (and huge) to archive — allow deletion when every path operand is
@@ -1711,6 +1971,20 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
             a.lower().strip("'\"") in _NULL_SINKS for a in cmd.argv[1:]):
         return Decision(DENY, "Moving or renaming a file into a null sink (NUL/$null) "
                               "destroys it. " + ARCHIVE_REDIRECT, "builtin:move-null")
+    if name == "robocopy":
+        switches = {a.lower() for a in cmd.argv[1:] if a.startswith("/")}
+        if switches & _ROBOCOPY_MOVE_SWITCHES:
+            return Decision(DENY, "`robocopy /MOV` (or `/MOVE`) deletes the source "
+                                  "files once they are copied. " + ARCHIVE_REDIRECT,
+                            "builtin:robocopy-move")
+        if switches & _ROBOCOPY_PURGE_SWITCHES:
+            return Decision(DENY, "`robocopy /MIR` (or `/PURGE`) deletes every file in "
+                                  "the destination that is not in the source tree. "
+                                  + ARCHIVE_REDIRECT, "builtin:robocopy-purge")
+    if name == "fsutil" and [a.lower() for a in cmd.argv[1:3]] == ["file", "setzerodata"]:
+        return Decision(DENY, "`fsutil file setzerodata` overwrites a file's contents "
+                              "with zeros in place. " + ARCHIVE_REDIRECT,
+                        "builtin:fsutil-zerodata")
     if name == "find" and ("-delete" in cmd.argv):
         return Decision(DENY, ARCHIVE_REDIRECT, "builtin:find-delete")
     if name == "dd" and any(a.startswith("of=/dev/") for a in cmd.argv):
@@ -1856,6 +2130,57 @@ SHRINK_GUARD_MIN = 64 * 1024     # only guard files larger than this
 SHRINK_GUARD_RATIO = 0.2         # new content < 20% of old size → ask
 
 
+def _cloud_write_decision(path: str):
+    """The Write-path verdict for a cloud stub or placeholder, or None.
+
+    Shared with the exec path: a `>` redirect, `mv`/`cp`/`tee` destination or
+    Set-Content target lands on exactly the same files a Write would, and an
+    unprotected one forces a full cloud hydration inside the hook's budget.
+    """
+    if prof.is_gdoc_stub(path):
+        return Decision(DENY, "This is a Google Docs pointer stub — it has no "
+                              "document content and editing it corrupts the "
+                              "link. Use the Drive connector to export the "
+                              "doc through a Google connector/export workflow.",
+                        "builtin:gdoc-stub")
+    if prof.is_placeholder(path):
+        return Decision(DENY, "This file is a cloud-only placeholder — its "
+                              "local content is not fully present, and "
+                              "editing it can corrupt the cloud copy. "
+                              "Hydrate it first (mark 'Always keep on this "
+                              "device' / 'Available offline').",
+                        "builtin:placeholder")
+    return None
+
+
+# Commands whose targets clobber_targets resolves. Only these justify the
+# second parse the cloud guard needs; a read-only command never reaches it.
+_CLOBBER_WRITE_NAMES = {
+    "mv", "cp", "tee", "dd", "install", "truncate", "touch", "mkdir", "md",
+    "move", "copy", "ren", "rename", "move-item", "mi", "copy-item", "cpi",
+    "set-content", "sc", "out-file", "new-item", "ni",
+}
+
+
+def _eval_clobber_cloud(event: ToolEvent, parsed, dialect) -> Decision:
+    """Run the Write-path cloud guard over the files a command would clobber.
+
+    Without this the guard only ever saw `event.paths`, so
+    `echo x > "...\\OneDrive\\big.xlsx"` was never denied and the pre-image
+    copy hydrated the whole file inside the hook.
+    """
+    if not (any(cmd.name in _CLOBBER_WRITE_NAMES for cmd in parsed.commands)
+            or _WRITEALLTEXT_RE.search(event.command)
+            or redirect_targets(event.command)):
+        return Decision()
+    try:
+        targets = clobber_targets(event.command, event.cwd, dialect=dialect)
+    except Exception:
+        return Decision()
+    verdicts = [_cloud_write_decision(target) for target in targets]
+    return worst([verdict for verdict in verdicts if verdict is not None])
+
+
 def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
     decisions = []
     for path in event.paths:
@@ -1878,20 +2203,9 @@ def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
                 enforcement_class=zone_rule["enforcement_class"]))
             continue
 
-        if prof.is_gdoc_stub(p):
-            decisions.append(Decision(DENY, "This is a Google Docs pointer stub — it has no "
-                                            "document content and editing it corrupts the "
-                                            "link. Use the Drive connector to export the "
-                                            "doc through a Google connector/export workflow.",
-                                      "builtin:gdoc-stub"))
-            continue
-        if prof.is_placeholder(p):
-            decisions.append(Decision(DENY, "This file is a cloud-only placeholder — its "
-                                            "local content is not fully present, and "
-                                            "editing it can corrupt the cloud copy. "
-                                            "Hydrate it first (mark 'Always keep on this "
-                                            "device' / 'Available offline').",
-                                      "builtin:placeholder"))
+        cloud = _cloud_write_decision(p)
+        if cloud is not None:
+            decisions.append(cloud)
             continue
         if prof.is_sync_artifact(p):
             decisions.append(Decision(ASK, "This looks like a sync conflict/lock artifact — "
