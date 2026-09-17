@@ -805,3 +805,19 @@ def test_audit_exception_leaves_claude_decisions_identical_and_never_prompts(
     failed = invoke(tmp_path / "failed", fail)
     assert failed == baseline
     assert _decision(failed) == expected
+
+
+def test_policy_ask_rule_is_not_upgraded_to_a_hard_deny(tmp_path):
+    """A shipped `action: ask` rule has no file targets; it must still ask.
+
+    Denying for want of a structured target named no safe alternative, which
+    contract 3 forbids, and converted the whole shipped ask set into a wall.
+    """
+    out = run_hook({"tool_name": "Bash",
+                    "tool_input": {"command": "pip install requests"},
+                    "cwd": str(tmp_path), "session_id": "ask-rule",
+                    "hook_event_name": "PreToolUse"})
+    assert _decision(out) == "ask"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Installing packages changes the environment." in reason
+    assert "could not identify enough structured information" not in reason

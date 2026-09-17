@@ -632,13 +632,18 @@ def _named_arg(argv: list, flags: tuple) -> str:
 class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
-    def __init__(self, values=(), complete=True, reason="", covered=False):
+    def __init__(self, values=(), complete=True, reason="", covered=False,
+                 skipped=()):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
         # True when a recognized mutator was fully analyzed but legitimately
         # needs no pre-image (for example mkdir -p on an existing directory).
         self.covered = covered
+        # (target, why) pairs a recognized mutator deliberately left out of the
+        # target set. The planner records them so the receipt stays honest
+        # about what was analyzed and not snapshotted.
+        self.skipped = list(skipped)
 
 
 def _static_shell_path(token: str) -> bool:
@@ -719,15 +724,83 @@ def _powershell_directory_creation(argv: list[str]) -> bool:
     return False
 
 
+SKIP_REGENERABLE = "regenerable, no pre-image required"
+SKIP_WHATIF = "dry run (-WhatIf), nothing is changed"
+
+# `-WhatIf` short-circuits ShouldProcess: the cmdlet reports what it would do
+# and changes nothing. PowerShell resolves any unambiguous prefix, and every
+# bound parameter starting with "wh" is WhatIf. `-Confirm` is deliberately not
+# here: it still deletes once the prompt is answered, and the hook cannot see
+# that answer.
+_WHATIF_PREFIXES = frozenset(
+    "whatif"[:length] for length in range(2, len("whatif") + 1)
+)
+_SWITCH_TRUE = {"true", "$true", "1"}
+
+
+def _powershell_whatif(cmd: SimpleCommand) -> bool:
+    if cmd.dialect != DIALECT_POWERSHELL:
+        return False
+    for token in cmd.argv[1:]:
+        if not token.startswith("-") or token == "-":
+            continue
+        raw = token[1:]
+        value = None
+        if ":" in raw:
+            raw, value = raw.split(":", 1)
+        if raw.lower() not in _WHATIF_PREFIXES:
+            continue
+        if value is None:
+            return True
+        # `-WhatIf:$flag` is a dry run only when the literal says so; an
+        # explicit false or a runtime value is not one.
+        return value.strip().lower() in _SWITCH_TRUE
+    return False
+
+
+def _regenerable_delete_operands(cmd: SimpleCommand, binding, regenerable: set):
+    """Operands of a delete whose every target is a regenerable tree.
+
+    Mirrors the `builtin:rm-regenerable` allowance exactly: only the general
+    removers, and only when *every* operand is regenerable. Returns an empty
+    list otherwise, so a mixed delete keeps full pre-image coverage.
+    """
+    name = cmd.name
+    if name not in _REGEN_OK_VERBS:
+        return []
+    if binding.recognized and binding.complete:
+        operands = list(binding.targets)
+    else:
+        # Same operand filter the allowance itself uses, so a shape the binder
+        # cannot model (`del /s /q build`) is planned the way it is decided.
+        operands = [value for value in cmd.argv[1:]
+                    if not value.startswith("-")
+                    and not (name in _CMD_SWITCH_VERBS
+                             and _CMD_SWITCH_RE.fullmatch(value))]
+    if not operands:
+        return []
+    return operands if all(_is_regenerable(value, regenerable)
+                           for value in operands) else []
+
+
 def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
-                    dialect: str = None) -> list:
+                    dialect: str = None, regenerable: set = None) -> list:
     """Existing files a shell command would overwrite/truncate: `>` redirects,
     POSIX mv/cp/tee/dd/truncate/install destinations, and the PowerShell/cmd
     write forms (Set-Content/Out-File, Copy-Item/copy /y, Move-Item/move,
     [IO.File]::WriteAllText) that carry no `>` token. Used by the adapter to
     pre-image-snapshot them before the command runs — the Bash equivalent of
     the Write/Edit pre-image. Best-effort: never raises. Over-inclusion is
-    cheap (a redundant snapshot is deduped); a miss is silent data loss."""
+    cheap (a redundant snapshot is deduped); a miss is silent data loss.
+
+    `regenerable` is the engine's regenerable-tree set (defaults to the
+    built-in one). Deletes the engine allows under `builtin:rm-regenerable`
+    report their operands as skipped instead of as targets: a directory has no
+    pre-image to take and archiving a build tree would copy gigabytes of
+    reproducible junk. When the level turns the allowance off the delete is a
+    DENY, so the command never reaches pre-image preparation anyway."""
+    regenerable = _REGENERABLE if regenerable is None else regenerable
+
     def _abs(tok):
         tok = tok.strip("'\"")
         p = os.path.expanduser(tok)
@@ -741,6 +814,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     complete = True
     incomplete_reason = ""
     covered = False
+    skipped = []
     try:
         for t in redirect_targets(command):
             targets.add(_abs(t))
@@ -763,6 +837,20 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             name = cmd.name
             argv_low = [a.lower() for a in cmd.argv]
             binding = powershell_bind.bind(cmd.argv, cmd.dialect)
+            if binding.recognized and _powershell_whatif(cmd):
+                # The engine allows this as a dry run; there is nothing to
+                # snapshot, and demanding a pre-image would deny it anyway.
+                covered = True
+                skipped.append((cmd.name, SKIP_WHATIF))
+                continue
+            regen_operands = _regenerable_delete_operands(
+                cmd, binding, regenerable
+            )
+            if regen_operands:
+                covered = True
+                skipped.extend((_abs(value), SKIP_REGENERABLE)
+                               for value in regen_operands)
+                continue
             if binding.recognized:
                 if not binding.complete:
                     complete = False
@@ -870,7 +958,8 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
         for m in _WRITEALLTEXT_RE.finditer(text):
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
-    return TargetList(values, complete, incomplete_reason, covered=covered)
+    return TargetList(values, complete, incomplete_reason, covered=covered,
+                      skipped=skipped)
 
 
 def _zone_rule_for(path: str, policy: Policy):
@@ -1081,8 +1170,36 @@ _DISCOVERY_HEAVY_PARTS = {value.casefold() for value in _REGENERABLE} | {
 }
 _DISCOVERY_RISK_FLAGS = {
     "--no-ignore", "--no-ignore-vcs", "--hidden", "--follow",
-    "--dereference-recursive", "-follow", "-followsymlink", "-force",
+    "--dereference-recursive", "-follow", "-followsymlink",
 }
+# `-force` means "ignore safety" only on the finders. On Get-ChildItem/gci and
+# on ls/dir it reveals hidden entries and nothing else — `gci -Recurse -Force`
+# is the standard PowerShell listing idiom, not a safeguard being disabled.
+_DISCOVERY_FORCE_TOOLS = {"fd", "fdfind", "find"}
+
+
+# Markers that identify a checkout the agent is actually working in. A folder
+# holding one of these is the unit of work, wherever it happens to live — a
+# repo under "OneDrive - Acme" is still a repo.
+_PROJECT_ROOT_MARKERS = (".git", "package.json", "pyproject.toml", ".agw")
+_PROJECT_ROOT_MARKER_GLOBS = ("*.sln",)
+
+
+def _is_project_root(path: str) -> bool:
+    if any(os.path.exists(os.path.join(path, marker))
+           for marker in _PROJECT_ROOT_MARKERS):
+        return True
+    try:
+        # Streamed and short-circuited: this runs once per ancestor on the
+        # discovery path, and a home directory can hold a lot of entries.
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if any(fnmatch.fnmatch(entry.name, pattern)
+                       for pattern in _PROJECT_ROOT_MARKER_GLOBS):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _active_project_root(event: ToolEvent) -> str:
@@ -1091,7 +1208,7 @@ def _active_project_root(event: ToolEvent) -> str:
         cwd = os.path.dirname(cwd)
     current = cwd
     for _ in range(32):
-        if os.path.exists(os.path.join(current, ".git")):
+        if _is_project_root(current):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -1143,7 +1260,22 @@ def _discovery_scope_assessment(scopes: list[str], event: ToolEvent,
         parts = {value.casefold() for value in resolved.replace("\\", "/").split("/")}
         if _is_root_or_home(resolved):
             return False, "the scope is a filesystem or home-directory root", labels
-        if any(marker in part for part in parts for marker in _DISCOVERY_CLOUD_PARTS):
+        # A project that happens to live under OneDrive/Dropbox is still the
+        # unit of work: listing it is not an unbounded sweep of the user's
+        # cloud storage. So the cloud-tree test ignores the components the
+        # project root itself contributes, and still fires on a scope that
+        # escapes the project (`gci ~/OneDrive -Recurse` from a project
+        # elsewhere) or on a synced folder nested inside it.
+        cloud_parts = parts
+        if _within(resolved, project_root):
+            cloud_parts = {
+                value.casefold()
+                for value in os.path.relpath(resolved, project_root)
+                .replace("\\", "/").split("/")
+                if value not in ("", ".")
+            }
+        if any(marker in part for part in cloud_parts
+               for marker in _DISCOVERY_CLOUD_PARTS):
             return False, "the scope is inside a cloud-synced tree", labels
         if parts & _DISCOVERY_HEAVY_PARTS:
             return False, "the scope is a dependency, build, or cache tree", labels
@@ -1228,6 +1360,9 @@ def _raw_discovery_shape(cmd: SimpleCommand, event: ToolEvent):
 def _raw_discovery_risk_flag(cmd: SimpleCommand) -> bool:
     lowered = [value.lower() for value in cmd.argv[1:]]
     if any(value in _DISCOVERY_RISK_FLAGS for value in lowered):
+        return True
+    if cmd.name in _DISCOVERY_FORCE_TOOLS and any(
+            value in {"-force", "--force"} for value in lowered):
         return True
     if cmd.name in {"rg", "ripgrep"} and any(
             re.fullmatch(r"-u{1,3}", value) for value in lowered):
@@ -1516,6 +1651,10 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
     for cmd in parsed.commands:
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
 
+    # The files this command would clobber get the Write path's cloud guard,
+    # before anything tries to take a pre-image of them.
+    decisions.append(_eval_clobber_cloud(event, parsed, dialect))
+
     # content rules also see payloads the command would write (heredocs, echo)
     # and the inner text of any wrapper we recursed (so secrets smuggled through
     # a -EncodedCommand / cmd /c string are scanned, not just the argv).
@@ -1723,6 +1862,14 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         return Decision(ALLOW, "", "builtin:agw")
 
     # ---- built-in semantic deny table ----
+    # A `-WhatIf` run of a supported cmdlet reports what it would do and
+    # changes nothing, so it is the safest way for an agent to show its work
+    # before asking for the real operation. Blocking it taught the agent that
+    # checking first is pointless. `-Confirm` gets no such allowance: it still
+    # deletes once the prompt is answered, and the hook never sees the answer.
+    if powershell_bind.bind(cmd.argv, cmd.dialect).recognized \
+            and _powershell_whatif(cmd):
+        return Decision(ALLOW, "dry run (-WhatIf)", "builtin:powershell-whatif")
     if name in _DELETE_VERBS or name in _SECURE_WIPE_VERBS:
         # Regenerable build/dependency dirs are routine to delete and pointless
         # (and huge) to archive — allow deletion when every path operand is
@@ -1899,6 +2046,57 @@ SHRINK_GUARD_MIN = 64 * 1024     # only guard files larger than this
 SHRINK_GUARD_RATIO = 0.2         # new content < 20% of old size → ask
 
 
+def _cloud_write_decision(path: str):
+    """The Write-path verdict for a cloud stub or placeholder, or None.
+
+    Shared with the exec path: a `>` redirect, `mv`/`cp`/`tee` destination or
+    Set-Content target lands on exactly the same files a Write would, and an
+    unprotected one forces a full cloud hydration inside the hook's budget.
+    """
+    if prof.is_gdoc_stub(path):
+        return Decision(DENY, "This is a Google Docs pointer stub — it has no "
+                              "document content and editing it corrupts the "
+                              "link. Use the Drive connector to export the "
+                              "doc through a Google connector/export workflow.",
+                        "builtin:gdoc-stub")
+    if prof.is_placeholder(path):
+        return Decision(DENY, "This file is a cloud-only placeholder — its "
+                              "local content is not fully present, and "
+                              "editing it can corrupt the cloud copy. "
+                              "Hydrate it first (mark 'Always keep on this "
+                              "device' / 'Available offline').",
+                        "builtin:placeholder")
+    return None
+
+
+# Commands whose targets clobber_targets resolves. Only these justify the
+# second parse the cloud guard needs; a read-only command never reaches it.
+_CLOBBER_WRITE_NAMES = {
+    "mv", "cp", "tee", "dd", "install", "truncate", "touch", "mkdir", "md",
+    "move", "copy", "ren", "rename", "move-item", "mi", "copy-item", "cpi",
+    "set-content", "sc", "out-file", "new-item", "ni",
+}
+
+
+def _eval_clobber_cloud(event: ToolEvent, parsed, dialect) -> Decision:
+    """Run the Write-path cloud guard over the files a command would clobber.
+
+    Without this the guard only ever saw `event.paths`, so
+    `echo x > "...\\OneDrive\\big.xlsx"` was never denied and the pre-image
+    copy hydrated the whole file inside the hook.
+    """
+    if not (any(cmd.name in _CLOBBER_WRITE_NAMES for cmd in parsed.commands)
+            or _WRITEALLTEXT_RE.search(event.command)
+            or redirect_targets(event.command)):
+        return Decision()
+    try:
+        targets = clobber_targets(event.command, event.cwd, dialect=dialect)
+    except Exception:
+        return Decision()
+    verdicts = [_cloud_write_decision(target) for target in targets]
+    return worst([verdict for verdict in verdicts if verdict is not None])
+
+
 def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
     decisions = []
     for path in event.paths:
@@ -1921,20 +2119,9 @@ def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
                 enforcement_class=zone_rule["enforcement_class"]))
             continue
 
-        if prof.is_gdoc_stub(p):
-            decisions.append(Decision(DENY, "This is a Google Docs pointer stub — it has no "
-                                            "document content and editing it corrupts the "
-                                            "link. Use the Drive connector to export the "
-                                            "doc through a Google connector/export workflow.",
-                                      "builtin:gdoc-stub"))
-            continue
-        if prof.is_placeholder(p):
-            decisions.append(Decision(DENY, "This file is a cloud-only placeholder — its "
-                                            "local content is not fully present, and "
-                                            "editing it can corrupt the cloud copy. "
-                                            "Hydrate it first (mark 'Always keep on this "
-                                            "device' / 'Available offline').",
-                                      "builtin:placeholder"))
+        cloud = _cloud_write_decision(p)
+        if cloud is not None:
+            decisions.append(cloud)
             continue
         if prof.is_sync_artifact(p):
             decisions.append(Decision(ASK, "This looks like a sync conflict/lock artifact — "
