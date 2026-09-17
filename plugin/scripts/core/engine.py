@@ -715,6 +715,37 @@ def _powershell_directory_creation(argv: list[str]) -> bool:
 
 
 SKIP_REGENERABLE = "regenerable, no pre-image required"
+SKIP_WHATIF = "dry run (-WhatIf), nothing is changed"
+
+# `-WhatIf` short-circuits ShouldProcess: the cmdlet reports what it would do
+# and changes nothing. PowerShell resolves any unambiguous prefix, and every
+# bound parameter starting with "wh" is WhatIf. `-Confirm` is deliberately not
+# here: it still deletes once the prompt is answered, and the hook cannot see
+# that answer.
+_WHATIF_PREFIXES = frozenset(
+    "whatif"[:length] for length in range(2, len("whatif") + 1)
+)
+_SWITCH_TRUE = {"true", "$true", "1"}
+
+
+def _powershell_whatif(cmd: SimpleCommand) -> bool:
+    if cmd.dialect != DIALECT_POWERSHELL:
+        return False
+    for token in cmd.argv[1:]:
+        if not token.startswith("-") or token == "-":
+            continue
+        raw = token[1:]
+        value = None
+        if ":" in raw:
+            raw, value = raw.split(":", 1)
+        if raw.lower() not in _WHATIF_PREFIXES:
+            continue
+        if value is None:
+            return True
+        # `-WhatIf:$flag` is a dry run only when the literal says so; an
+        # explicit false or a runtime value is not one.
+        return value.strip().lower() in _SWITCH_TRUE
+    return False
 
 
 def _regenerable_delete_operands(cmd: SimpleCommand, binding, regenerable: set):
@@ -796,6 +827,12 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             name = cmd.name
             argv_low = [a.lower() for a in cmd.argv]
             binding = powershell_bind.bind(cmd.argv, cmd.dialect)
+            if binding.recognized and _powershell_whatif(cmd):
+                # The engine allows this as a dry run; there is nothing to
+                # snapshot, and demanding a pre-image would deny it anyway.
+                covered = True
+                skipped.append((cmd.name, SKIP_WHATIF))
+                continue
             regen_operands = _regenerable_delete_operands(
                 cmd, binding, regenerable
             )
@@ -1787,6 +1824,14 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         return Decision(ALLOW, "", "builtin:agw")
 
     # ---- built-in semantic deny table ----
+    # A `-WhatIf` run of a supported cmdlet reports what it would do and
+    # changes nothing, so it is the safest way for an agent to show its work
+    # before asking for the real operation. Blocking it taught the agent that
+    # checking first is pointless. `-Confirm` gets no such allowance: it still
+    # deletes once the prompt is answered, and the hook never sees the answer.
+    if powershell_bind.bind(cmd.argv, cmd.dialect).recognized \
+            and _powershell_whatif(cmd):
+        return Decision(ALLOW, "dry run (-WhatIf)", "builtin:powershell-whatif")
     if name in _DELETE_VERBS or name in _SECURE_WIPE_VERBS:
         # Regenerable build/dependency dirs are routine to delete and pointless
         # (and huge) to archive — allow deletion when every path operand is

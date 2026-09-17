@@ -212,6 +212,36 @@ def test_a_finder_that_disables_ignore_rules_still_denies(hook, tmp_path, tool,
     assert "agw " in reason
 
 
+# --- G3: -WhatIf is a dry run -------------------------------------------------
+
+@pytest.mark.parametrize("command", [
+    "Remove-Item .\\temp -Recurse -WhatIf",
+    "Remove-Item -Path temp -Recurse -Force -WhatIf",
+    "ri temp -Recurse -whatif",
+    "Set-Content notes.txt -Value hi -WhatIf",
+])
+def test_whatif_is_a_dry_run(hook, tmp_path, command):
+    project = _project(tmp_path)
+    _tree(project, "temp/note.txt", "notes.txt")
+    decision, reason = hook("PowerShell", command, project)
+    assert decision == "allow", f"{command!r} was {decision}: {reason}"
+    assert "dry run (-WhatIf)" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "Remove-Item .\\temp -Recurse -Confirm",
+    "Remove-Item .\\temp -Recurse -WhatIf:$false",
+    "Remove-Item .\\temp -Recurse",
+])
+def test_only_whatif_gets_the_dry_run_allowance(hook, tmp_path, command):
+    """-Confirm still deletes once answered, and the hook never sees the answer."""
+    project = _project(tmp_path)
+    _tree(project, "temp/note.txt")
+    decision, reason = hook("PowerShell", command, project)
+    assert decision == "deny", f"{command!r} was {decision}"
+    assert "agw archive" in reason
+
+
 def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     """The operation-scope prompt is a floor for ASK only; DENY must not soften."""
     project = _project(tmp_path)

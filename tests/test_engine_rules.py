@@ -721,6 +721,43 @@ def test_force_is_a_risk_flag_only_on_the_finders(tmp_path, policy):
         assert decision.rule_id == "builtin:unbounded-discovery"
 
 
+def test_whatif_is_allowed_and_schedules_no_preimage(tmp_path, policy):
+    """G3: -WhatIf was parsed and then ignored, so a dry run was denied."""
+    from core import mutations
+
+    (tmp_path / "temp").mkdir()
+    (tmp_path / "temp" / "note.txt").write_text("x\n", encoding="utf-8")
+    event = _ev(EXEC, tool="PowerShell",
+                command="Remove-Item .\\temp -Recurse -WhatIf", cwd=str(tmp_path))
+    decision = engine.evaluate(event, policy, REPO)
+    assert decision.action == ALLOW
+    assert decision.rule_id == "builtin:powershell-whatif"
+    assert "dry run (-WhatIf)" in decision.reason
+    plan = mutations.plan([event], engine.clobber_targets)
+    assert plan.complete and plan.targets == []
+    assert plan.skipped == [("remove-item", engine.SKIP_WHATIF)]
+
+
+def test_confirm_and_a_false_whatif_are_not_dry_runs(tmp_path, policy):
+    (tmp_path / "temp").mkdir()
+    for command in ("Remove-Item .\\temp -Recurse -Confirm",
+                    "Remove-Item .\\temp -Recurse -WhatIf:$false",
+                    "Remove-Item .\\temp -Recurse -WhatIf:$flag"):
+        decision = engine.evaluate(
+            _ev(EXEC, tool="PowerShell", command=command, cwd=str(tmp_path)),
+            policy, REPO)
+        assert decision.action == DENY, command
+        assert "agw archive" in decision.reason
+
+
+def test_a_posix_command_never_reads_whatif(tmp_path, policy):
+    """The allowance is PowerShell binding data, not a free-floating token."""
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="rm -rf temp -WhatIf", cwd=str(tmp_path)),
+        policy, REPO)
+    assert decision.action == DENY
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)
