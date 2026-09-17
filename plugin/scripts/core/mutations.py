@@ -45,14 +45,16 @@ def _blank_data_heredocs(command: str) -> str:
     """Blank heredoc bodies that are data, keep the ones an interpreter runs.
 
     `git commit -F - <<EOF` carries a message; an arrow like `->` in it is not
-    a redirect. `bash <<EOF` runs its body as a script, so a `>` there is one.
-    The consumer is the head of the statement the `<<` belongs to.
+    a redirect. `bash <<EOF` runs its body as a shell script, so a `>` there
+    is one. A Python or Node body is not shell syntax (`def f() -> int:`),
+    and `_inline_sources` inspects it for real write calls instead. The
+    consumer is the head of the statement the `<<` belongs to.
     """
     def replace(match):
         statement = _STATEMENT_SPLIT_RE.split(command[:match.start()])[-1]
         tokens = statement.split()
-        head = _normalized_head(tokens[0]) if tokens else ""
-        if _is_script_interpreter(head):
+        suffix = _interpreter_suffix(_normalized_head(tokens[0])) if tokens else ""
+        if suffix in {".sh", ".ps1"}:
             return match.group(0)
         return " "
     return _HEREDOC_RE.sub(replace, command)
@@ -468,6 +470,100 @@ def _is_script_interpreter(name: str) -> bool:
     )
 
 
+def _source_write_evidence(raw: bytes, path: str,
+                           suffix: str) -> ScriptWriteEvidence | None:
+    """Write-like evidence in one script body, wherever it came from.
+
+    ``path`` is the label the evidence carries: a file path, or `<stdin>` /
+    `<inline>` for code the interpreter receives without a file.
+    """
+    source = raw.decode("utf-8-sig", "replace")
+    digest = hashlib.sha256(raw).hexdigest()
+    if suffix == ".py":
+        evidence = _python_write_evidence(source, path, digest)
+        if evidence:
+            return evidence
+        # Invalid or dynamically generated Python remains reviewable rather
+        # than silently bypassing lexical evidence.
+        try:
+            ast.parse(source, filename=path)
+        except SyntaxError:
+            evidence = _regex_write_evidence(source, path, digest)
+            if evidence:
+                return ScriptWriteEvidence(
+                    evidence.path, evidence.primitive, evidence.line,
+                    "low", evidence.sha256,
+                )
+        return None
+    masked = _mask_noncode(source, suffix)
+    evidence = _regex_write_evidence(
+        source, path, digest, scan_source=masked,
+    )
+    if not evidence and _dynamic_noncode_execution(masked, suffix):
+        dynamic = _regex_write_evidence(source, path, digest)
+        if dynamic:
+            evidence = ScriptWriteEvidence(
+                dynamic.path, dynamic.primitive, dynamic.line,
+                "high", dynamic.sha256,
+            )
+    if not evidence and suffix in {".sh", ".bash"} \
+            and ("$(" in masked or "`" in masked):
+        evidence = _dynamic_shell_evidence(masked, path, digest)
+    return evidence
+
+
+# The language an interpreter runs, by its bare name (`python3.12` -> python).
+_INTERPRETER_SUFFIXES = {
+    "python": ".py", "pythonw": ".py", "py": ".py",
+    "node": ".js", "nodejs": ".js",
+    "ruby": ".rb", "perl": ".pl", "php": ".php",
+    "bash": ".sh", "sh": ".sh", "zsh": ".sh", "ksh": ".sh", "dash": ".sh",
+    "ash": ".sh",
+    "powershell": ".ps1", "pwsh": ".ps1",
+}
+# Flags whose next token is code. Shells' `-c` and PowerShell's `-Command`
+# are not here: shellparse already recurses those into real commands.
+_INLINE_CODE_FLAGS = {
+    ".py": {"-c"},
+    ".js": {"-e", "--eval", "-p", "--print"},
+    ".rb": {"-e"},
+    ".pl": {"-e", "-E"},
+    ".php": {"-r"},
+}
+_INLINE_LABEL = "<inline>"
+_STDIN_LABEL = "<stdin>"
+
+
+def _interpreter_suffix(name: str) -> str:
+    return _INTERPRETER_SUFFIXES.get(re.sub(r"\d+(?:\.\d+)*$", "", name), "")
+
+
+def _inline_sources(command: str, parsed) -> list[tuple[str, str, str]]:
+    """Code an interpreter runs without a script file: ``(label, source,
+    suffix)`` for each `-c`/`-e` body and each heredoc on its stdin.
+
+    `python - <<EOF` with `open(path, "w")` in the body wrote a repo file
+    with no pre-image because only script files were ever inspected.
+    """
+    found = []
+    for cmd in parsed.commands:
+        suffix = _interpreter_suffix(cmd.name)
+        flags = _INLINE_CODE_FLAGS.get(suffix, ())
+        if not flags:
+            continue
+        for index, token in enumerate(cmd.argv[1:], start=1):
+            if token in flags and index + 1 < len(cmd.argv):
+                found.append((_INLINE_LABEL, cmd.argv[index + 1], suffix))
+                break
+    for match in _HEREDOC_RE.finditer(command):
+        statement = _STATEMENT_SPLIT_RE.split(command[:match.start()])[-1]
+        tokens = statement.split()
+        suffix = _interpreter_suffix(_normalized_head(tokens[0])) if tokens else ""
+        if suffix:
+            found.append((_STDIN_LABEL, match.group(2), suffix))
+    return found
+
+
 def _write_capable_script(command: str, cwd: str,
                           dialect: str = None) -> ScriptWriteEvidence | None:
     """Return bounded source evidence when a local script may write files."""
@@ -499,39 +595,15 @@ def _write_capable_script(command: str, cwd: str,
                 raw = handle.read(1024 * 1024 + 1)
         except OSError:
             continue
-        source = raw.decode("utf-8-sig", "replace")
-        digest = hashlib.sha256(raw).hexdigest()
-        if os.path.splitext(path)[1].lower() == ".py":
-            evidence = _python_write_evidence(source, path, digest)
-            if evidence:
-                return evidence
-            # Invalid or dynamically generated Python remains reviewable rather
-            # than silently bypassing lexical evidence.
-            try:
-                ast.parse(source, filename=path)
-            except SyntaxError:
-                evidence = _regex_write_evidence(source, path, digest)
-                if evidence:
-                    return ScriptWriteEvidence(
-                        evidence.path, evidence.primitive, evidence.line,
-                        "low", evidence.sha256,
-                    )
-            continue
-        suffix = os.path.splitext(path)[1].lower()
-        masked = _mask_noncode(source, suffix)
-        evidence = _regex_write_evidence(
-            source, path, digest, scan_source=masked,
+        evidence = _source_write_evidence(
+            raw, path, os.path.splitext(path)[1].lower(),
         )
-        if not evidence and _dynamic_noncode_execution(masked, suffix):
-            dynamic = _regex_write_evidence(source, path, digest)
-            if dynamic:
-                evidence = ScriptWriteEvidence(
-                    dynamic.path, dynamic.primitive, dynamic.line,
-                    "high", dynamic.sha256,
-                )
-        if not evidence and suffix in {".sh", ".bash"} \
-                and ("$(" in masked or "`" in masked):
-            evidence = _dynamic_shell_evidence(masked, path, digest)
+        if evidence:
+            return evidence
+    for label, source, suffix in _inline_sources(command, parsed):
+        evidence = _source_write_evidence(
+            source.encode("utf-8", "replace"), label, suffix,
+        )
         if evidence:
             return evidence
     return None
