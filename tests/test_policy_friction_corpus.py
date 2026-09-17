@@ -326,12 +326,11 @@ def test_a_heredoc_script_bash_runs_keeps_its_redirect(hook, tmp_path):
     assert decision == "deny", f"was {decision}: {reason}"
 
 
-# --- H3: branch creation never rewrites tracked files -------------------------
+# --- H3: branch operations never rewrite tracked files ------------------------
 # `git checkout -b` is `git switch -c`; both only move HEAD, and git refuses to
-# clobber local edits. Forms that can rewrite files - a pathspec, a bare
-# argument that may be a file, force/merge/patch - keep their protection, and
-# `git switch --discard-changes` gains it. git's global options (`-c k=v`,
-# `-C dir`) no longer hide the subcommand from the classifier.
+# clobber local edits. A bare `git checkout <name>` is a branch switch when
+# nothing on disk has that name, which is how git reads it too. git's global
+# options (`-c k=v`, `-C dir`) no longer hide the subcommand.
 
 BRANCH_OPERATIONS = [
     ("Bash", "git checkout -b feature/x"),
@@ -339,35 +338,83 @@ BRANCH_OPERATIONS = [
     ("Bash", "git checkout --orphan gh-pages"),
     ("Bash", "git checkout -b feature/x origin/main"),
     ("Bash", "git -c core.autocrlf=false checkout -b feature/x"),
+    ("Bash", "git checkout feature/x"),
+    ("Bash", "git checkout main"),
     ("Bash", "git switch -c feature/x"),
     ("Bash", "git switch main"),
+    ("Bash", "git restore --staged README.md"),
     ("PowerShell", "git checkout -b feature/x"),
+    ("PowerShell", "git checkout main"),
 ]
 
 
 @pytest.mark.parametrize("tool,command", BRANCH_OPERATIONS)
-def test_branch_creation_needs_no_pre_image(hook, tmp_path, tool, command):
-    decision, reason = hook(tool, command, _project(tmp_path))
-    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
-
-
-WORKTREE_REWRITES = [
-    ("Bash", "git checkout -- README.md"),
-    ("Bash", "git checkout README.md"),
-    ("Bash", "git checkout -f main"),
-    ("Bash", "git checkout -b feature/x -- README.md"),
-    ("Bash", "git -c core.autocrlf=false checkout -- README.md"),
-    ("Bash", "git -C . checkout README.md"),
-    ("Bash", "git switch --discard-changes main"),
-    ("Bash", "git switch -f main"),
-    ("Bash", "git switch -m main"),
-    ("Bash", "git restore README.md"),
-]
-
-
-@pytest.mark.parametrize("tool,command", WORKTREE_REWRITES)
-def test_worktree_rewrites_keep_their_protection(hook, tmp_path, tool, command):
+def test_branch_operations_need_no_pre_image(hook, tmp_path, tool, command):
     project = _project(tmp_path)
     _tree(project, "README.md")
     decision, reason = hook(tool, command, project)
-    assert decision in ("ask", "deny"), f"{command!r} was {decision}: {reason}"
+    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
+
+
+# --- H4: discarding local edits is the user's call, with a pre-image ----------
+# The engine always meant `git checkout -- file` to ASK (`builtin:git-checkout`),
+# but the planner could not name a target and turned it into the non-waivable
+# pre-image invariant, so the prompt never reached anyone. Named files now get
+# a pre-image and the prompt; a force/merge/discard form, which can rewrite any
+# tracked file, gets the prompt without one (a review, not an invariant).
+
+NAMED_DISCARDS = [
+    ("Bash", "git checkout -- README.md"),
+    ("Bash", "git checkout README.md"),
+    ("Bash", "git checkout main -- README.md"),
+    ("Bash", "git -c core.autocrlf=false checkout -- README.md"),
+    ("Bash", "git -C . checkout README.md"),
+    ("Bash", "git restore README.md"),
+    ("PowerShell", "git checkout -- README.md"),
+]
+
+
+@pytest.mark.parametrize("tool,command", NAMED_DISCARDS)
+def test_a_named_discard_asks_after_taking_a_pre_image(tmp_path, tool, command):
+    project = _project(tmp_path)
+    _tree(project, "README.md")
+    home = tmp_path / "agw-home"
+    home.mkdir()
+    decision, reason = run_hook(tool, command, project, home)
+    assert decision == "ask", f"{command!r} was {decision}: {reason}"
+    assert "could not be identified" not in reason
+    snapshots = [path for path in home.rglob("*")
+                 if path.is_file() and "readme" in path.name.lower()]
+    assert snapshots, f"no pre-image of README.md under {home}"
+
+
+UNBOUNDED_DISCARDS = [
+    ("Bash", "git checkout -f main"),
+    ("Bash", "git checkout --merge main"),
+    ("Bash", "git checkout -p"),
+    ("Bash", "git checkout -- src"),
+    ("Bash", "git checkout -- '*.md'"),
+    ("Bash", "git switch --discard-changes main"),
+    ("Bash", "git switch -f main"),
+    ("Bash", "git switch -m main"),
+    ("PowerShell", "git switch --discard-changes main"),
+]
+
+
+@pytest.mark.parametrize("tool,command", UNBOUNDED_DISCARDS)
+def test_an_unbounded_discard_is_a_review_not_an_invariant(hook, tmp_path, tool,
+                                                          command):
+    project = _project(tmp_path)
+    _tree(project, "README.md", "src/app.py")
+    decision, reason = hook(tool, command, project)
+    assert decision == "ask", f"{command!r} was {decision}: {reason}"
+    assert "could not be identified" not in reason
+    assert "invariant:prestate-unavailable" not in reason
+
+
+def test_git_clean_and_reset_hard_are_still_denied(hook, tmp_path):
+    project = _project(tmp_path)
+    _tree(project, "README.md")
+    for command in ("git reset --hard", "git clean -fd"):
+        decision, reason = hook("Bash", command, project)
+        assert decision == "deny", f"{command!r} was {decision}: {reason}"
