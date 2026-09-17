@@ -1116,8 +1116,8 @@ def run_codex_dispatch_raw(payload, tmp_path, event="pretooluse"):
 @pytest.mark.parametrize("payload,label", [
     ({"tool_name": "Shell", "tool_input": {"command": "rm -rf ~/Documents"}},
      "'Shell'"),
-    ({"tool_name": "shell", "tool_input": {"command": "rm -rf ~/Documents"}},
-     "'shell'"),
+    ({"tool_name": "sh_exec", "tool_input": {"command": "rm -rf ~/Documents"}},
+     "'sh_exec'"),
     ({"tool_input": {"command": "rm -rf ~/Documents"}}, "no tool name"),
 ])
 def test_codex_unrecognized_tool_never_silently_allows(payload, label, tmp_path):
@@ -1184,7 +1184,23 @@ def test_codex_registry_recognizes_modeled_and_mcp_tools():
     for name in ("Bash", "PowerShell", "Monitor", "apply_patch", "Read",
                  "Glob", "Grep", "mcp__anything__at_all"):
         assert unrecognized_tool({"tool_name": name}) is None, name
-    # Codex's own raw exec surfaces are not modeled anywhere, so they must
-    # prompt rather than pass.
-    for name in ("shell", "local_shell", "exec_command"):
-        assert unrecognized_tool({"tool_name": name}) == name
+    # Codex's own exec surfaces are modeled, so a readable payload evaluates
+    # normally instead of prompting on every call.
+    for name in ("shell", "local_shell"):
+        assert unrecognized_tool(
+            {"tool_name": name, "tool_input": {"command": ["git", "status"]}}
+        ) is None, name
+    assert unrecognized_tool(
+        {"tool_name": "exec_command", "tool_input": {"cmd": "git status"}}
+    ) is None
+    # A recognized tool carrying nothing readable still fails closed, with its
+    # own label rather than the "unknown tool" one.
+    from codex.adapter_common import UNINSPECTABLE_STDIN, UNREADABLE_SHELL
+
+    assert unrecognized_tool({"tool_name": "shell"}) == UNREADABLE_SHELL
+    assert unrecognized_tool(
+        {"tool_name": "exec_command", "tool_input": {"cmd": 17}}
+    ) == UNREADABLE_SHELL
+    assert unrecognized_tool(
+        {"tool_name": "write_stdin", "tool_input": {"chars": "y\n"}}
+    ) == UNINSPECTABLE_STDIN
