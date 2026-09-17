@@ -186,3 +186,28 @@ def test_encoded_powershell_inner_failure_preserves_payload_provenance():
     parsed = extract_commands(f"pwsh -EncodedCommand {encoded}")
     inner = next(cmd for cmd in parsed.commands if cmd.name == "set-content")
     assert inner.dialect == DIALECT_POWERSHELL
+
+
+# ---- F3: one normalized interpreter head before every wrapper test --------
+
+@pytest.mark.parametrize("command, inner", [
+    ('bash.exe -c "rm -rf X"', "rm"),
+    ('BASH.EXE -c "rm -rf X"', "rm"),
+    ('sh.exe -c "rm file"', "rm"),
+    ('"C:\\Program Files\\PortableShell\\bin\\bash.exe" -c "rm -rf X"', "rm"),
+    (r"C:\Windows\System32\cmd.exe /c del X", "del"),
+    (r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+     r' -Command "Remove-Item -Recurse -Force C:\x"', "remove-item"),
+    ('"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c '
+     '"Remove-Item -Recurse -Force C:\\x"', "remove-item"),
+    (r"cmd.bat /c del X", "del"),
+])
+def test_suffixed_and_full_path_interpreters_are_recursed(command, inner):
+    assert inner in names(command)
+
+
+def test_normalized_head_does_not_rename_the_wrapper_itself():
+    # Only the wrapper *lookup* is normalized; SimpleCommand.name keeps the
+    # spelling downstream tables (and the launcher handshake) rely on.
+    parsed = extract_commands("agw.cmd status")
+    assert [c.name for c in parsed.commands] == ["agw.cmd"]

@@ -33,6 +33,25 @@ _SHELLS = {"bash", "sh", "zsh", "ksh", "dash", "ash"}
 _PWSH = {"powershell", "pwsh"}
 _WIN_CMD = {"cmd"}
 
+# Windows spells one interpreter four ways: `bash`, `bash.exe`, a full path, and
+# a quoted full path with spaces in it. Every wrapper table above is keyed on the
+# bare name, so argv0 is reduced to that spelling *once*, before any table is
+# consulted. Stripping the suffix after the lookup (the old order) made
+# `bash.exe -c "rm -rf X"` a silent allow while `bash -c` was denied.
+_WRAPPER_EXT_RE = re.compile(r"\.(?:exe|cmd|bat)$")
+
+
+def _normalized_head(token: str) -> str:
+    """argv0 as the wrapper tables spell it: basename on both separators,
+    surrounding quotes dropped, trailing `.exe`/`.cmd`/`.bat` removed, lowered.
+
+    `SimpleCommand.name` keeps its own narrower normalization on purpose: the
+    command tables downstream must still tell `agw` from `agw.cmd`.
+    """
+    head = str(token or "").strip().strip("'\"")
+    head = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    return _WRAPPER_EXT_RE.sub("", head)
+
 # PowerShell parameter prefixes (it accepts any unambiguous abbreviation). We
 # only need the exec-surface ones: -Command, -EncodedCommand, -File, plus the
 # value-taking setup flags so we can skip them and their argument.
@@ -373,7 +392,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", head):
             toks.pop(0)
             continue
-        base = head.rsplit("/", 1)[-1].lower()
+        base = _normalized_head(head)
         if base in _TRANSPARENT:
             toks.pop(0)
             # skip option-style args of wrappers (env -i, nice -n 10 ...)
@@ -392,7 +411,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
     if not toks:
         return []
 
-    head_base = toks[0].rsplit("/", 1)[-1].lower()
+    head_base = _normalized_head(toks[0])
 
     # command name supplied by variable or substitution output => indirection.
     # $_ / $PSItem are the pipeline current-object (e.g. `| % { $_.Name }`), not
@@ -438,21 +457,9 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
         if inner and inner != toks:
             return _analyze_segment(inner, result, depth, dialect)
 
-    # bash -c "string" → recurse into the string
-    if head_base in _SHELLS:
-        for i, tok in enumerate(toks[1:], start=1):
-            if tok == "-c" and i + 1 < len(toks):
-                inner = extract_commands(toks[i + 1], depth + 1,
-                                         dialect=DIALECT_POSIX)
-                result.flags.update(inner.flags)
-                return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
-        return [SimpleCommand(argv=toks, dialect=dialect)]
-
-    # Windows interpreters. Strip a trailing .exe so 'cmd.exe'/'powershell.exe'
-    # match. A destructive command can hide in their inner command line exactly
-    # as it does in `bash -c`, so we recurse it and record the inner text.
-    wname = head_base[:-4] if head_base.endswith(".exe") else head_base
-
+    # Recurse the inner command line a wrapper hands to an interpreter and keep
+    # the recovered text as a payload, so the engine's content scans still see a
+    # deletion that argv parsing alone cannot reach.
     def _recurse_inner(inner_text: str, inner_dialect: str):
         if not inner_text.strip():
             return [SimpleCommand(argv=toks, dialect=dialect)]
@@ -469,8 +476,21 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
         result.payloads.extend(inner.payloads)
         return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
 
+    # bash -c "string" → recurse into the string. `head_base` is already the
+    # bare name, so the `bash.exe` spelling and a full path to it land here too.
+    if head_base in _SHELLS:
+        for i, tok in enumerate(toks[1:], start=1):
+            if tok == "-c" and i + 1 < len(toks):
+                inner = extract_commands(toks[i + 1], depth + 1,
+                                         dialect=DIALECT_POSIX)
+                result.flags.update(inner.flags)
+                return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
+        return [SimpleCommand(argv=toks, dialect=dialect)]
+
+    # Windows interpreters. A destructive command can hide in their inner
+    # command line exactly as it does in `bash -c`.
     # cmd /c <command> / cmd /k <command> → the real command follows the switch
-    if wname in _WIN_CMD:
+    if head_base in _WIN_CMD:
         rest = toks[1:]
         for i, tok in enumerate(rest):
             if tok.lower() in ("/c", "/k", "/r"):
@@ -478,7 +498,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
         return [SimpleCommand(argv=toks, dialect=dialect)]
 
     # powershell / pwsh -Command "..." / -EncodedCommand <b64> / positional
-    if wname in _PWSH:
+    if head_base in _PWSH:
         rest = toks[1:]
         i = 0
         while i < len(rest):

@@ -474,3 +474,20 @@ def test_quoted_diagnostic_pattern_is_not_treated_as_mutation(tmp_path):
     assert not plan.mutating
     assert plan.complete
     assert plan.targets == []
+
+
+# ---- F3: .exe-suffixed and full-path interpreters -------------------------
+
+@pytest.mark.parametrize("command", [
+    'bash.exe -c "rm -rf X"',
+    'sh.exe -c "rm file"',
+    'BASH.EXE -c "rm -rf X"',
+    r"C:\Windows\System32\cmd.exe /c del X",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    r' -Command "Remove-Item -Recurse -Force C:\work\notes"',
+    '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c '
+    '"Remove-Item -Recurse -Force C:\\work\\notes"',
+    r'"C:\Program Files\PortableShell\bin\bash.exe" -c "rm -rf X"',
+])
+def test_suffixed_and_full_path_interpreters_are_denied(evaluate, command):
+    assert evaluate(command).action == DENY, command

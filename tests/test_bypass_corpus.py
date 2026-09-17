@@ -37,6 +37,12 @@ CORPUS = [
     "bash -c 'rm -rf /tmp/y'",
     "sh -c \"rm file\"",
     "bash -c \"bash -c 'rm x'\"",
+    # F3: the Windows spellings of the same interpreters
+    'bash.exe -c "rm -rf X"',
+    'sh.exe -c "rm file"',
+    r"C:\Windows\System32\cmd.exe /c del X",
+    r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -Command "Remove-Item -Recurse -Force C:\work\notes"',
+    '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -c "Remove-Item -Recurse -Force C:\\work\\notes"',
     # substitution
     "echo $(rm -rf /tmp/z)",
     "`rm file`",
