@@ -7,8 +7,13 @@ import hashlib
 import os
 import re
 
-from . import events, workflows
+from . import events, powershell_bind, workflows
 from .shellparse import ParseUncertain, extract_commands
+
+# Re-exported so an adapter can recognize the one incomplete plan that is a
+# question for the user rather than a fail-closed invariant, without reaching
+# past this planner for the binder's own constants.
+UNRESOLVED_PATH_ASK = powershell_bind.UNRESOLVED_PATH_ASK
 
 
 _LOCAL_MUTATION = re.compile(
@@ -649,11 +654,40 @@ def _tool_words(name: str) -> set[str]:
     return set(re.findall(r"[a-z]+", spaced.lower()))
 
 
-def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
-    """Return exact canonical targets, or an explicit incomplete plan."""
+def _is_inert(ev, inert_tools) -> bool:
+    """Whether the host vouched that this tool touches no file at all.
+
+    The name-based net below is a last line of defence: an unmodeled tool whose
+    name contains a mutation word is assumed to change files we cannot see. But
+    a host's own planning and bookkeeping tools are named exactly that way —
+    TodoWrite, TaskCreate, TaskUpdate, Codex's update_plan — and change
+    nothing. Denying them would tell the agent that keeping a plan is a policy
+    violation, for a tool the adapter has already classified as inert.
+    """
+    if ev.extra.get("inert"):
+        return True
+    return str(ev.tool or "") in set(inert_tools or ())
+
+
+def plan(evlist, clobber_resolver, plugin_root: str = "",
+         regenerable=None, inert_tools=()) -> MutationPlan:
+    """Return exact canonical targets, or an explicit incomplete plan.
+
+    `regenerable` is the engine's resolved regenerable-tree set for the active
+    level, which a site extends through `regenerable_globs`. Without it the
+    resolver falls back to the built-in set, so a site-added tree the engine
+    ALLOWED deleting was still asked for a pre-image it could never produce.
+
+    `inert_tools` is the host adapter's registry of tools that neither run a
+    command nor touch a file, which exempts them from the name-based net for
+    unmodeled tools.
+    """
     result = MutationPlan()
     seen = set()
     covered_without_target = False
+    # Omitted rather than passed as None, so a resolver that does not model
+    # regenerable trees at all keeps working unchanged.
+    resolver_options = {} if regenerable is None else {"regenerable": regenerable}
 
     def add_paths(paths, cwd):
         for path in paths:
@@ -682,7 +716,8 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
             if ev.kind == events.EXEC:
                 dialect = "powershell" if ev.tool.lower() in {"powershell", "pwsh"} else None
                 targets = clobber_resolver(
-                    ev.command, ev.cwd, include_absent=True, dialect=dialect
+                    ev.command, ev.cwd, include_absent=True, dialect=dialect,
+                    **resolver_options
                 )
                 trusted_help = _trusted_agw_help(
                     ev.command, ev.cwd, plugin_root, dialect=dialect
@@ -737,6 +772,14 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
                     or _looks_locally_mutating(ev.command, dialect=dialect)
                 if not getattr(targets, "complete", True):
                     result.mutating = True
+                    if getattr(targets, "incomplete_kind", "") \
+                            == powershell_bind.UNRESOLVED_PATH:
+                        # A recognized write cmdlet whose path only exists at
+                        # run time (splatting, a variable, a here-string). The
+                        # operation is not itself dangerous, so it belongs at a
+                        # waivable review rather than a non-waivable invariant.
+                        result.review_required = True
+                        raise ValueError(powershell_bind.UNRESOLVED_PATH_ASK)
                     raise ValueError(getattr(targets, "reason", "") or
                                      "PowerShell target binding was incomplete")
                 if looks_mutating:
@@ -758,7 +801,9 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
                 # EXEC before reaching this planner, so local mutations issued
                 # through a connector still receive normal preimage coverage.
                 continue
-            if ev.kind == events.OTHER and (_tool_words(ev.tool) & _MUTATION_WORDS):
+            if ev.kind == events.OTHER \
+                    and (_tool_words(ev.tool) & _MUTATION_WORDS) \
+                    and not _is_inert(ev, inert_tools):
                 result.mutating = True
                 raise ValueError(
                     "this operation may change files, but its targets are not available to guardrails"

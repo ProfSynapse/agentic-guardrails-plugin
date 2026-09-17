@@ -70,6 +70,12 @@ def _unrecognized_tool_decision(label):
     }}
 
 
+# The host's registry of tools that neither run a command nor touch a file.
+# Bound at import time so the planner can be told which unmodeled tool names
+# are inert without the platform-neutral core learning any of them.
+from adapter_common import INERT_TOOLS  # noqa: E402
+
+
 def main():
     payload = json.load(sys.stdin)
     unknown = unrecognized_tool(payload)
@@ -117,34 +123,63 @@ def main():
     # Prestate failures are safety invariants. Unlike advisory policy choices,
     # they cannot be approved away or suppressed by observe mode.
     mutation_plan = mutations.plan(
-        [event], engine.clobber_targets, plugin_root=PLUGIN_ROOT
+        [event], engine.clobber_targets, plugin_root=PLUGIN_ROOT,
+        regenerable=cfg.get("regenerable"), inert_tools=INERT_TOOLS,
     )
     invariant_failure = ""
+    # Structured detail behind the refusal. Only the capacity failure has any,
+    # and `render_safe_next` needs it to print the cap and the shortfall rather
+    # than a sizeless "the cache is full".
+    invariant_details = {}
     if mutation_plan.mutating and will_run:
         if not mutation_plan.complete:
             if mutation_plan.review_required:
                 ambiguous_action = (
                     events.DENY if cfg.get("level") == "strict" else events.ASK
                 )
-                decision = decision.merge(engine.Decision(
-                    ambiguous_action,
-                    "Guardrails found ambiguous write-like source evidence but could "
-                    "not confirm that this invocation writes files. Review this exact, "
-                    f"hash-bound run before continuing: {mutation_plan.reason}",
-                    "builtin:script-write-ambiguous",
-                    policy_revision=policy.revision, policy_health=policy.health,
-                    enforcement_class=events.POLICY_ENFORCEMENT,
-                    presentation_context=events.DecisionContext.FILE_CHANGE,
-                    presentation_details={
+                if mutation_plan.reason == mutations.UNRESOLVED_PATH_ASK:
+                    # A recognized PowerShell write whose path only exists at
+                    # run time (splatting, a variable, a here-string). Nothing
+                    # about it says the operation is dangerous, only that the
+                    # file cannot be named here, so it is a question for the
+                    # user. The target is described by category so the prompt
+                    # still carries enough for informed consent.
+                    review_rule = "builtin:powershell-path-unresolved"
+                    review_reason = (
+                        "Guardrails recognized this as a file-writing PowerShell "
+                        f"command, but its {mutations.UNRESOLVED_PATH_ASK}."
+                    )
+                    review_details = {
+                        "operation": "write a file named at run time",
+                        "targets": ["A file the command names at run time"],
+                        "target_kind": "category",
+                        "signal": "a file path supplied at run time",
+                        "trigger": ("The command supplies its target path at run "
+                                    "time, so Guardrails cannot read it statically."),
+                    }
+                else:
+                    review_rule = "builtin:script-write-ambiguous"
+                    review_reason = (
+                        "Guardrails found ambiguous write-like source evidence but could "
+                        "not confirm that this invocation writes files. Review this exact, "
+                        f"hash-bound run before continuing: {mutation_plan.reason}"
+                    )
+                    review_details = {
                         "operation": "run script with ambiguous write evidence",
                         "targets": [mutation_plan.evidence.get("path", "")],
                         "target_kind": "file",
                         "signal": mutation_plan.evidence.get("primitive", "write-like source"),
                         "trigger": "Static source analysis found ambiguous write evidence.",
-                    },
+                    }
+                decision = decision.merge(engine.Decision(
+                    ambiguous_action, review_reason, review_rule,
+                    policy_revision=policy.revision, policy_health=policy.health,
+                    enforcement_class=events.POLICY_ENFORCEMENT,
+                    presentation_context=events.DecisionContext.FILE_CHANGE,
+                    presentation_details=review_details,
                 ))
                 if decision.action == events.DENY \
-                        and decision.rule_id == "builtin:script-write-ambiguous":
+                        and decision.rule_id == review_rule:
                     decision.safe_next = None
                     decision.safe_next = remediation.for_events(decision, [event])
                 effective = enforcement.resolve(decision, observe)
@@ -172,11 +207,13 @@ def main():
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason
+                    invariant_details = dict(receipt.details)
     if invariant_failure:
         decision = engine.Decision(
             events.DENY, invariant_failure, "invariant:prestate-unavailable",
             policy_revision=policy.revision, policy_health=policy.health,
             enforcement_class=events.NON_WAIVABLE_INVARIANT,
+            presentation_details=invariant_details,
         )
         decision.safe_next = None
         decision.safe_next = remediation.for_events(decision, [event])

@@ -633,10 +633,14 @@ class TargetList(list):
     """List-compatible clobber result carrying conservative completeness."""
 
     def __init__(self, values=(), complete=True, reason="", covered=False,
-                 skipped=()):
+                 skipped=(), incomplete_kind=""):
         super().__init__(values)
         self.complete = complete
         self.reason = reason
+        # Why the analysis is incomplete, as one of the powershell_bind kind
+        # constants. A caller routes on it: an unresolved path is a question
+        # for the user, an unsupported shape stays a fail-closed invariant.
+        self.incomplete_kind = incomplete_kind
         # True when a recognized mutator was fully analyzed but legitimately
         # needs no pre-image (for example mkdir -p on an existing directory).
         self.covered = covered
@@ -659,6 +663,26 @@ def _absent_creation_root(path: str) -> str:
         root = parent
         parent = os.path.dirname(root)
     return root
+
+
+# A bulk directory copy names no files, so the set it would overwrite has to
+# be read off the source. Only immediate entries are listed, and only that many
+# of them: the point is to protect the files a routine `robocopy src dst` would
+# replace, not to model every recursive switch. A deeper collision still has no
+# pre-image, which is the same gap the copy had before it was analyzed at all.
+_TREE_COPY_SCAN_LIMIT = 512
+
+
+def _tree_copy_sources(source: str) -> list:
+    """Immediate entries of a copied directory, for destination planning."""
+    try:
+        entries = sorted(os.listdir(source))[:_TREE_COPY_SCAN_LIMIT]
+    except OSError:
+        return []
+    # Files only: a subdirectory has no pre-image of its own, and naming one
+    # as a target would fail the pre-image step instead of protecting anything.
+    return [os.path.join(source, entry) for entry in entries
+            if os.path.isfile(os.path.join(source, entry))]
 
 
 def _covered_by_absent_root(path: str, roots: set[str]) -> bool:
@@ -729,12 +753,13 @@ SKIP_WHATIF = "dry run (-WhatIf), nothing is changed"
 
 # `-WhatIf` short-circuits ShouldProcess: the cmdlet reports what it would do
 # and changes nothing. PowerShell resolves any unambiguous prefix, and every
-# bound parameter starting with "wh" is WhatIf. `-Confirm` is deliberately not
-# here: it still deletes once the prompt is answered, and the hook cannot see
-# that answer.
+# bound parameter starting with "wh" is WhatIf; it also documents `-wi`, which
+# is no prefix of the name at all. `-Confirm` is deliberately not here: it
+# still deletes once the prompt is answered, and the hook cannot see that
+# answer.
 _WHATIF_PREFIXES = frozenset(
     "whatif"[:length] for length in range(2, len("whatif") + 1)
-)
+) | powershell_bind.WHATIF_ALIASES
 _SWITCH_TRUE = {"true", "$true", "1"}
 
 
@@ -813,6 +838,7 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     absent_dir_roots = set()
     complete = True
     incomplete_reason = ""
+    incomplete_kind = ""
     covered = False
     skipped = []
     try:
@@ -853,6 +879,8 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                 continue
             if binding.recognized:
                 if not binding.complete:
+                    if complete:
+                        incomplete_kind = binding.kind
                     complete = False
                     incomplete_reason = incomplete_reason or binding.reason
                     continue
@@ -953,13 +981,52 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                        if not a.startswith("-") and not _CMD_SWITCH_RE.fullmatch(a)]
                 if len(pos) >= 2:
                     targets.add(_abs(pos[-1]))
+            elif name in ("xcopy", "robocopy"):
+                # Both overwrite their destination and neither is modeled by
+                # the PowerShell binder. Their switches are multi-letter and
+                # `/`-prefixed (`/Y`, `/MIR`, `/XF`), so `_CMD_SWITCH_RE` —
+                # which matches one letter — would read `/MIR` as a path.
+                pos = [a for a in cmd.argv[1:]
+                       if not a.startswith("/") and not a.startswith("-")]
+                if len(pos) < 2:
+                    continue
+                # xcopy: `<source> <destination>`, destination last.
+                # robocopy: `<source> <destination> [files...]`, so the
+                # destination is the second positional and the rest name
+                # individual files inside it.
+                dest = pos[-1] if name == "xcopy" else pos[1]
+                sources = ([pos[0]] if name == "xcopy"
+                           else [os.path.join(pos[0], value) for value in pos[2:]])
+                if not _static_shell_path(dest) or any(
+                        not _static_shell_path(source) for source in sources):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        f"{name} source or destination uses runtime expansion or a wildcard"
+                    continue
+                covered = True
+                dest_abs = _abs(dest)
+                if os.path.isdir(dest_abs) or dest_abs in planned_dirs \
+                        or dest.endswith(("/", "\\")):
+                    # A directory destination is not itself replaced and has no
+                    # pre-image; the files copied into it are what get
+                    # clobbered. Naming the directory as a target instead would
+                    # fail the pre-image step and deny every routine copy.
+                    for source in (sources or _tree_copy_sources(_abs(pos[0]))):
+                        destination = os.path.join(
+                            dest_abs, os.path.basename(source)
+                        )
+                        if not _covered_by_absent_root(
+                                destination, absent_dir_roots):
+                            targets.add(destination)
+                else:
+                    targets.add(dest_abs)
     # [IO.File]::WriteAllText("path", ...) in the raw line or a wrapper payload.
     for text in [command] + (parsed.payloads if parsed else []):
         for m in _WRITEALLTEXT_RE.finditer(text):
             targets.add(_abs(m.group(1)))
     values = list(targets) if include_absent else [p for p in targets if os.path.isfile(p)]
     return TargetList(values, complete, incomplete_reason, covered=covered,
-                      skipped=skipped)
+                      skipped=skipped, incomplete_kind=incomplete_kind)
 
 
 def _zone_rule_for(path: str, policy: Policy):
@@ -1015,6 +1082,27 @@ def _has_mutation_evidence(command: str) -> bool:
     return bool(_MUTATION_EVIDENCE_RE.search(command)
                 or _PWSH_DESTRUCTIVE.search(command)
                 or redirect_targets(command))
+
+
+# A short POSIX flag cluster carrying both recursion and force — `-rf`, `-fr`,
+# `-Rf`, `-rfv`. The letter bounds keep this to real clusters rather than any
+# long word after a dash.
+#
+# Only the indirect-command evidence test consults it. There, the command name
+# is exactly what we could not resolve (`$RM -rf ~/My-Documents`), so the flag
+# cluster is the whole signal. Everywhere else the head is known and read-only
+# heads spell the same letters for unrelated reasons: `grep -rf patterns.txt .`
+# reads patterns from a file, `tar -rf archive.tar` appends to an archive.
+# Widening the general evidence test would make clobber_targets snapshot both.
+_FORCED_RECURSIVE_FLAGS_RE = re.compile(
+    r"(?<![\w-])-[a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}\b"
+    r"|(?<![\w-])-[a-zA-Z]{0,8}[fF][a-zA-Z]{0,8}[rR][a-zA-Z]{0,8}\b")
+
+
+def _has_indirect_mutation_evidence(command: str) -> bool:
+    """Whether a command whose name we could not read still looks destructive."""
+    return bool(_has_mutation_evidence(command)
+                or _FORCED_RECURSIVE_FLAGS_RE.search(command))
 
 
 _SEARCH_VALUE_FLAGS = {
@@ -1584,7 +1672,7 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
                            "cannot read.",
             }))
     if FLAG_INDIRECT in parsed.flags:
-        if _has_mutation_evidence(event.command):
+        if _has_indirect_mutation_evidence(event.command):
             decisions.append(Decision(
                 DENY, "Guardrails could not identify a potentially file-changing action. "
                       "Ask the agent to use the direct command name so it can be checked.",

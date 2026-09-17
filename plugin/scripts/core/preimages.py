@@ -62,6 +62,10 @@ class PreimageResult:
     # Stable machine-readable failure class. ``recovery_store_busy`` marks a
     # transient condition an adapter may surface as retryable.
     error_code: str = ""
+    # Structured failure detail for the one reason code whose instruction is
+    # sized by it: the capacity refusal carries the cap and the shortfall, and
+    # `remediation.capacity_instruction` prints both only if they get this far.
+    details: dict = field(default_factory=dict)
 
 
 ERROR_STORE_BUSY = "recovery_store_busy"
@@ -96,7 +100,8 @@ def _nearest_existing_parent(path: str) -> str:
     return os.path.realpath(parent)
 
 
-def _plain_failure(path: str, detail: str, error_code: str = "") -> PreimageResult:
+def _plain_failure(path: str, detail: str, error_code: str = "",
+                   details: dict = None) -> PreimageResult:
     name = os.path.basename(path) or path or "the target"
     return PreimageResult(
         False,
@@ -104,6 +109,7 @@ def _plain_failure(path: str, detail: str, error_code: str = "") -> PreimageResu
                 f"a recovery point for {name}. {detail} Nothing was changed by this operation."),
         failed_target=path,
         error_code=error_code,
+        details=dict(details or {}),
     )
 
 
@@ -215,6 +221,7 @@ def prepare(targets, label: str, max_file_bytes: int,
             remediation.capacity_instruction(exc.details)
             + f" (error code {remediation.CAPACITY_ERROR_CODE})",
             error_code=remediation.CAPACITY_ERROR_CODE,
+            details=exc.details,
         )
     except TimeoutError:
         # Must precede OSError: TimeoutError is an OSError subclass.

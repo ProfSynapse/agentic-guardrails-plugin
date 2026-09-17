@@ -11,6 +11,12 @@ from .decisions import GuardrailDecision, PromptRequest, TARGET_CATEGORY, \
     TARGET_EXACT, TARGET_UNRESOLVED
 
 
+# An adapter raises this when the host names a tool it cannot model. The
+# decision's own reason carries the tool name, which is the only fact that
+# makes the block actionable, so the generic copy below never replaces it.
+UNRECOGNIZED_TOOL_RULE = "builtin:unrecognized-tool"
+
+
 def operation_fingerprint(payload: dict, evlist, policy_revision: str = "") -> str:
     """Bind an approval to the exact operation without displaying raw input."""
     material = {
@@ -48,6 +54,11 @@ _COPY_BY_RULE = {
         "The agent wants to run a script with ambiguous write-like source evidence.",
         "Guardrails found a possible write call but could not confirm this invocation writes files.",
         "The script could change files that have no verified recovery copy.",
+    ),
+    "builtin:powershell-path-unresolved": (
+        "The agent wants to write a file whose name the command supplies at run time.",
+        "Guardrails recognized the write but could not read its target path statically.",
+        "A file that cannot be named here may be created or replaced.",
     ),
     "builtin:patch-opaque": (
         "The agent wants to apply a file change whose targets are unclear.",
@@ -277,7 +288,14 @@ def build_denial_feedback(decision: GuardrailDecision,
         blocked = "The requested operation was not approved."
         advice = remediation.approval_outcome(advice, approval_outcome)
     elif approval_outcome == "prompt-incomplete":
-        blocked = (
+        # An unrecognized tool has already said the one thing that makes the
+        # block actionable: which tool it was, and that this plugin does not
+        # model it. Replacing that with the generic sentence hides the name and
+        # leaves the agent nothing to report or update.
+        own_reason = str(decision.reason or "").strip()
+        blocked = own_reason if (
+            decision.rule_id == UNRECOGNIZED_TOOL_RULE and own_reason
+        ) else (
             "Guardrails could not identify enough structured information to "
             "request informed approval."
         )
@@ -619,6 +637,11 @@ def _generic_prompt_eligible(decision: GuardrailDecision, evlist) -> bool:
     """
     if decision.action != events.ASK:
         return False
+    if decision.rule_id == UNRECOGNIZED_TOOL_RULE:
+        # An unmodeled tool has no structured targets to offer and never will;
+        # the whole finding is its name. Refusing the prompt for want of a
+        # target would turn "we do not know this tool" into a wall.
+        return True
     if decision.presentation_context != events.DecisionContext.UNKNOWN:
         return False
     if any(getattr(ev, "paths", None) for ev in evlist or []):
