@@ -126,12 +126,20 @@ _SERVICE_LABELS = {
 }
 
 
-def render_safe_next(advice: remediation.SafeNext) -> str:
+def render_safe_next(advice: remediation.SafeNext, details: dict = None) -> str:
     """Return closed, actionable recovery copy for a denied operation.
 
     The instruction is selected only from the closed structured reason code.
+    `details` carries the decision's structured presentation details for the
+    one reason code whose instruction is sized by them.
     """
     reason_code = advice.reason_code
+    if reason_code == remediation.REASON_CAPACITY:
+        # The generic "propose something narrower" sentence is a lie here:
+        # every remaining rollback point is protected, so no narrower
+        # operation can succeed. The only doors are a human-gated prune or a
+        # larger cap, and the store package writes both into this text.
+        return remediation.capacity_instruction(details)
     if reason_code == remediation.REASON_ARCHIVE:
         return (
             "Use a reversible archive, move, or soft-delete operation for each "
@@ -282,7 +290,7 @@ def build_denial_feedback(decision: GuardrailDecision,
         advice = remediation.approval_outcome(advice, approval_outcome)
     else:
         blocked = decision.reason or "The requested operation did not meet the active safety policy."
-    next_step = render_safe_next(advice)
+    next_step = render_safe_next(advice, decision.presentation_details)
     if advice.safe_to_retry:
         next_step += (
             "\n\nRecommended argv (submit as a new operation for policy evaluation): "

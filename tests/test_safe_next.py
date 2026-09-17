@@ -321,3 +321,34 @@ def test_capacity_denial_gets_reclaim_advice_not_direct_retry():
     # An ordinary prestate refusal keeps the direct-operation advice.
     plain = Decision(DENY, "could not identify the target", "invariant:prestate-unavailable")
     assert remediation.for_event(plain, event).reason_code == remediation.REASON_DIRECT
+
+
+def test_a_capacity_denial_renders_the_reclaim_instruction_not_the_fallback():
+    """The generic sentence cannot be acted on when the cache is full.
+
+    Every remaining rollback point is protected, so "propose something
+    narrower" can never succeed; the safe-next text has to name the prune.
+    """
+    from core import presentation
+
+    advice = remediation.SafeNext(
+        remediation.REASON_CAPACITY, requires_user_choice=True,
+        missing_fields=("recommended_argv",),
+    )
+    text = presentation.render_safe_next(
+        advice, {"maximum_bytes": 20 * 1024 * 1024, "required_free_bytes": 4096},
+    )
+    assert "agw prune" in text
+    assert "--yes-i-am-a-human" in text
+    assert "20,971,520" in text
+    assert "Propose a narrower, reversible operation" not in text
+    # Robust without details, which is how the hook reaches it today.
+    assert "agw prune" in presentation.render_safe_next(advice)
+
+    decision = GuardrailDecision(
+        DENY, reason="the recovery cache is full",
+        rule_id="invariant:prestate-unavailable", safe_next=advice,
+    )
+    feedback = presentation.build_denial_feedback(decision, "", [_event()])
+    assert "agw prune" in feedback
+    assert "Propose a narrower, reversible operation" not in feedback
