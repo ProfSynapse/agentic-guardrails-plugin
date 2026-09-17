@@ -758,6 +758,65 @@ def test_a_posix_command_never_reads_whatif(tmp_path, policy):
     assert decision.action == DENY
 
 
+CLOBBER_CLOUD_COMMANDS = [
+    ("Bash", 'echo x > "{target}"'),
+    ("Bash", 'cp notes.txt "{target}"'),
+    ("Bash", 'mv notes.txt "{target}"'),
+    ("Bash", 'echo x | tee "{target}"'),
+    ("PowerShell", 'Set-Content -Path "{target}" -Value hi'),
+    ("PowerShell", 'Out-File -FilePath "{target}"'),
+]
+
+
+def test_a_clobbered_cloud_placeholder_is_denied_like_a_write(policy, tmp_path):
+    """G9: the guard only ever saw event.paths, never the clobber targets.
+
+    An unguarded redirect onto a placeholder forced a full cloud hydration
+    inside the hook's own budget before anything could stop it.
+    """
+    project = tmp_path / "OneDrive" / "proj"
+    placeholder = project / "big.xlsx"
+    _sparse(placeholder, 1024 * 1024)
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    write = engine.evaluate(
+        _ev(WRITE, paths=[str(placeholder)], content="x"), policy, REPO)
+    assert write.action == DENY
+    for tool, template in CLOBBER_CLOUD_COMMANDS:
+        decision = engine.evaluate(
+            _ev(EXEC, tool=tool, command=template.format(target=placeholder),
+                cwd=str(project)),
+            policy, REPO)
+        assert decision.action == DENY, template
+        assert decision.rule_id == write.rule_id == "builtin:placeholder"
+        assert decision.reason == write.reason
+
+
+def test_a_clobbered_gdoc_stub_is_denied_like_a_write(policy, tmp_path):
+    project = tmp_path / "OneDrive" / "proj"
+    project.mkdir(parents=True)
+    stub = project / "plan.gdoc"
+    stub.write_text('{"url": "https://docs.google.com/x"}\n', encoding="utf-8")
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    for tool, template in CLOBBER_CLOUD_COMMANDS:
+        decision = engine.evaluate(
+            _ev(EXEC, tool=tool, command=template.format(target=stub),
+                cwd=str(project)),
+            policy, REPO)
+        assert decision.action == DENY, template
+        assert decision.rule_id == "builtin:gdoc-stub"
+
+
+def test_an_ordinary_clobber_target_is_untouched_by_the_cloud_guard(policy,
+                                                                    tmp_path):
+    project = tmp_path / "OneDrive" / "proj"
+    project.mkdir(parents=True)
+    (project / "notes.txt").write_text("x\n", encoding="utf-8")
+    decision = engine.evaluate(
+        _ev(EXEC, tool="Bash", command="echo x > notes.txt", cwd=str(project)),
+        policy, REPO)
+    assert decision.action != DENY
+
+
 def test_corrupt_policy_pack_degrades_with_warning(agw_home):
     pol_dir = os.path.join(agw_home, "policies.d")
     os.makedirs(pol_dir)

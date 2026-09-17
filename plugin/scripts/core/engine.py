@@ -1617,6 +1617,10 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
     for cmd in parsed.commands:
         decisions.append(_eval_simple_command(cmd, policy, plugin_root, event, cfg))
 
+    # The files this command would clobber get the Write path's cloud guard,
+    # before anything tries to take a pre-image of them.
+    decisions.append(_eval_clobber_cloud(event, parsed, dialect))
+
     # content rules also see payloads the command would write (heredocs, echo)
     # and the inner text of any wrapper we recursed (so secrets smuggled through
     # a -EncodedCommand / cmd /c string are scanned, not just the argv).
@@ -1994,6 +1998,57 @@ SHRINK_GUARD_MIN = 64 * 1024     # only guard files larger than this
 SHRINK_GUARD_RATIO = 0.2         # new content < 20% of old size → ask
 
 
+def _cloud_write_decision(path: str):
+    """The Write-path verdict for a cloud stub or placeholder, or None.
+
+    Shared with the exec path: a `>` redirect, `mv`/`cp`/`tee` destination or
+    Set-Content target lands on exactly the same files a Write would, and an
+    unprotected one forces a full cloud hydration inside the hook's budget.
+    """
+    if prof.is_gdoc_stub(path):
+        return Decision(DENY, "This is a Google Docs pointer stub — it has no "
+                              "document content and editing it corrupts the "
+                              "link. Use the Drive connector to export the "
+                              "doc through a Google connector/export workflow.",
+                        "builtin:gdoc-stub")
+    if prof.is_placeholder(path):
+        return Decision(DENY, "This file is a cloud-only placeholder — its "
+                              "local content is not fully present, and "
+                              "editing it can corrupt the cloud copy. "
+                              "Hydrate it first (mark 'Always keep on this "
+                              "device' / 'Available offline').",
+                        "builtin:placeholder")
+    return None
+
+
+# Commands whose targets clobber_targets resolves. Only these justify the
+# second parse the cloud guard needs; a read-only command never reaches it.
+_CLOBBER_WRITE_NAMES = {
+    "mv", "cp", "tee", "dd", "install", "truncate", "touch", "mkdir", "md",
+    "move", "copy", "ren", "rename", "move-item", "mi", "copy-item", "cpi",
+    "set-content", "sc", "out-file", "new-item", "ni",
+}
+
+
+def _eval_clobber_cloud(event: ToolEvent, parsed, dialect) -> Decision:
+    """Run the Write-path cloud guard over the files a command would clobber.
+
+    Without this the guard only ever saw `event.paths`, so
+    `echo x > "...\\OneDrive\\big.xlsx"` was never denied and the pre-image
+    copy hydrated the whole file inside the hook.
+    """
+    if not (any(cmd.name in _CLOBBER_WRITE_NAMES for cmd in parsed.commands)
+            or _WRITEALLTEXT_RE.search(event.command)
+            or redirect_targets(event.command)):
+        return Decision()
+    try:
+        targets = clobber_targets(event.command, event.cwd, dialect=dialect)
+    except Exception:
+        return Decision()
+    verdicts = [_cloud_write_decision(target) for target in targets]
+    return worst([verdict for verdict in verdicts if verdict is not None])
+
+
 def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
     decisions = []
     for path in event.paths:
@@ -2016,20 +2071,9 @@ def _eval_write(event: ToolEvent, policy: Policy) -> Decision:
                 enforcement_class=zone_rule["enforcement_class"]))
             continue
 
-        if prof.is_gdoc_stub(p):
-            decisions.append(Decision(DENY, "This is a Google Docs pointer stub — it has no "
-                                            "document content and editing it corrupts the "
-                                            "link. Use the Drive connector to export the "
-                                            "doc through a Google connector/export workflow.",
-                                      "builtin:gdoc-stub"))
-            continue
-        if prof.is_placeholder(p):
-            decisions.append(Decision(DENY, "This file is a cloud-only placeholder — its "
-                                            "local content is not fully present, and "
-                                            "editing it can corrupt the cloud copy. "
-                                            "Hydrate it first (mark 'Always keep on this "
-                                            "device' / 'Available offline').",
-                                      "builtin:placeholder"))
+        cloud = _cloud_write_decision(p)
+        if cloud is not None:
+            decisions.append(cloud)
             continue
         if prof.is_sync_artifact(p):
             decisions.append(Decision(ASK, "This looks like a sync conflict/lock artifact — "

@@ -242,6 +242,25 @@ def test_only_whatif_gets_the_dry_run_allowance(hook, tmp_path, command):
     assert "agw archive" in reason
 
 
+# --- G9: clobbering a cloud stub is a write ----------------------------------
+
+@pytest.mark.parametrize("tool,template", [
+    ("Bash", 'echo x > "{target}"'),
+    ("Bash", 'cp notes.txt "{target}"'),
+    ("PowerShell", 'Set-Content -Path "{target}" -Value hi'),
+])
+def test_a_clobbered_cloud_stub_is_denied_before_any_pre_image(hook, tmp_path,
+                                                               tool, template):
+    project = _project(tmp_path / "OneDrive", "proj")
+    _tree(project, "notes.txt")
+    stub = project / "plan.gdoc"
+    stub.write_text('{"url": "https://docs.google.com/x"}\n', encoding="utf-8")
+    decision, reason = hook(tool, template.format(target=stub), project)
+    assert decision == "deny", f"{template!r} was {decision}"
+    assert "pointer stub" in reason
+    assert "Drive connector" in reason
+
+
 def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     """The operation-scope prompt is a floor for ASK only; DENY must not soften."""
     project = _project(tmp_path)
