@@ -217,9 +217,27 @@ def test_workspace_or_path_agw_cmd_shim_is_never_privileged(policy, tmp_path, mo
         assert decision.rule_id == "builtin:agw-impostor"
 
 
-def test_git_checkout_branch_vs_discard(evaluate):
+def test_git_checkout_branch_vs_discard(evaluate, policy, tmp_path):
     assert evaluate("git checkout -b feature").action in (DEFER, ALLOW)
-    assert evaluate("git checkout -- file.py").action == ASK
+    assert evaluate("git switch main").action in (DEFER, ALLOW)
+    # A pathspec is only a discard when the file has something to lose.
+    (tmp_path / "file.py").write_text("x\n", encoding="utf-8")
+
+    def here(command):
+        return engine.evaluate(
+            _ev(EXEC, tool="Bash", command=command, cwd=str(tmp_path)), policy, REPO)
+    assert here("git checkout -- file.py").action == ASK
+    assert here("git checkout file.py").action == ASK
+    assert here("git -c core.autocrlf=false checkout -- file.py").action == ASK
+    assert here("git checkout -- absent.py").action in (DEFER, ALLOW)
+    assert here("git checkout feature").action in (DEFER, ALLOW)
+    for command in ("git checkout -f main", "git checkout --merge main",
+                    "git switch --discard-changes main", "git switch -f main"):
+        decision = here(command)
+        assert decision.action == ASK, command
+        assert decision.rule_id == "builtin:git-checkout"
+    assert here("git restore file.py").action == ASK
+    assert here("git restore --staged file.py").action in (DEFER, ALLOW)
 
 
 def test_unparseable_fails_closed(evaluate):

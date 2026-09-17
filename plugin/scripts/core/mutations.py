@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 
-from . import events, powershell_bind, workflows
+from . import events, gitargs, powershell_bind, workflows
 from .shellparse import (
     _HEREDOC_RE, _normalized_head, ParseUncertain, extract_commands,
 )
@@ -16,6 +16,9 @@ from .shellparse import (
 # question for the user rather than a fail-closed invariant, without reaching
 # past this planner for the binder's own constants.
 UNRESOLVED_PATH_ASK = powershell_bind.UNRESOLVED_PATH_ASK
+# Likewise for a git checkout/switch that may rewrite tracked files it does
+# not name (`-f`, `--merge`, `--discard-changes`, a directory pathspec).
+GIT_UNBOUNDED_ASK = gitargs.UNBOUNDED_ASK
 
 
 _LOCAL_MUTATION = re.compile(
@@ -60,60 +63,6 @@ def _redirect_surface(command: str) -> str:
     blanked, so a remaining `>` really is a truncating file redirect."""
     surface = _unquoted_surface(_blank_data_heredocs(str(command or "")))
     return _FD_DUP_REDIRECT.sub("", _NULL_REDIRECT.sub("", surface))
-
-
-# git's own options that take a value and precede the subcommand
-# (`git -c core.autocrlf=false commit`, `git -C ../repo checkout`).
-_GIT_GLOBAL_VALUE_OPTIONS = {
-    "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
-    "--config-env",
-}
-# checkout/switch forms that can rewrite tracked files even without a
-# pathspec: git only refuses to clobber local edits when none of these is set.
-_GIT_DISCARD_OPTIONS = {
-    "-f", "--force", "--discard-changes", "-m", "--merge", "-p", "--patch",
-}
-_GIT_BRANCH_CREATE_OPTIONS = {"-b", "-B", "--orphan"}
-
-
-def _git_subcommand(argv: list) -> tuple[str, list]:
-    """Return ``(subcommand, its arguments)`` with git's global options skipped.
-
-    Reading ``argv[1]`` as the subcommand let `git -c k=v checkout -- file`
-    through as a non-mutating command.
-    """
-    index = 1
-    while index < len(argv):
-        token = str(argv[index])
-        if token in _GIT_GLOBAL_VALUE_OPTIONS:
-            index += 2
-            continue
-        if token.startswith("-"):
-            index += 1
-            continue
-        return token.lower(), [str(value) for value in argv[index + 1:]]
-    return "", []
-
-
-def _git_rewrites_worktree(argv: list) -> bool:
-    """Whether this git invocation can change tracked files on disk.
-
-    `checkout -b`/`-B`/`--orphan` only move HEAD to a new branch; git refuses
-    to clobber uncommitted edits, so they need no pre-image, exactly like
-    `switch -c`. A pathspec (`--`), a bare argument that may be a file, or a
-    force/merge/patch option can rewrite files and still counts. `switch` is
-    branch-only, so it counts only with a discard-changes form.
-    """
-    subcommand, args = _git_subcommand(argv)
-    if subcommand in {"clean", "reset", "restore"}:
-        return True
-    if subcommand == "checkout":
-        if "--" in args or any(arg in _GIT_DISCARD_OPTIONS for arg in args):
-            return True
-        return not any(arg in _GIT_BRANCH_CREATE_OPTIONS for arg in args)
-    if subcommand == "switch":
-        return any(arg in _GIT_DISCARD_OPTIONS for arg in args)
-    return False
 
 
 _MUTATION_WORDS = {
@@ -492,7 +441,8 @@ def _unquoted_surface(command: str) -> str:
     return "".join(out)
 
 
-def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
+def _looks_locally_mutating(command: str, dialect: str = None,
+                            cwd: str = "") -> bool:
     """Detect mutation command heads without treating quoted search data as code."""
     try:
         parsed = extract_commands(command, dialect=dialect)
@@ -502,7 +452,7 @@ def _looks_locally_mutating(command: str, dialect: str = None) -> bool:
         name = cmd.name
         if name in _LOCAL_MUTATION_NAMES:
             return True
-        if name == "git" and _git_rewrites_worktree(cmd.argv):
+        if name == "git" and gitargs.rewrites_worktree(cmd.argv, cwd):
             return True
         if name == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in cmd.argv[1:]):
             return True
@@ -858,7 +808,7 @@ def plan(evlist, clobber_resolver, plugin_root: str = "",
                         result.skipped.append(entry)
                 surface = _redirect_surface(ev.command)
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
-                    or _looks_locally_mutating(ev.command, dialect=dialect)
+                    or _looks_locally_mutating(ev.command, dialect=dialect, cwd=ev.cwd)
                 if not getattr(targets, "complete", True):
                     result.mutating = True
                     if getattr(targets, "incomplete_kind", "") \
@@ -869,6 +819,15 @@ def plan(evlist, clobber_resolver, plugin_root: str = "",
                         # waivable review rather than a non-waivable invariant.
                         result.review_required = True
                         raise ValueError(powershell_bind.UNRESOLVED_PATH_ASK)
+                    if getattr(targets, "incomplete_kind", "") \
+                            == gitargs.UNBOUNDED_KIND:
+                        # A force/merge/discard checkout can rewrite any
+                        # tracked file with local edits. Nothing can be
+                        # snapshotted, but it is a deliberate, common recovery
+                        # move, so it is a question for the user rather than
+                        # an invariant, like `git reset --hard`'s neighbours.
+                        result.review_required = True
+                        raise ValueError(gitargs.UNBOUNDED_ASK)
                     raise ValueError(getattr(targets, "reason", "") or
                                      "PowerShell target binding was incomplete")
                 if looks_mutating:

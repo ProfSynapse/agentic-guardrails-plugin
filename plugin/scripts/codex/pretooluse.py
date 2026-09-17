@@ -289,6 +289,26 @@ def main(approval_provider=None):
                         "trigger": ("The command supplies its target path at run "
                                     "time, so Guardrails cannot read it statically."),
                     }
+                elif mutation_plan.reason == mutations.GIT_UNBOUNDED_ASK:
+                    # A force/merge/discard checkout. It can replace local
+                    # edits in any tracked file, so nothing can be snapshotted
+                    # first; but it is a deliberate recovery move the user may
+                    # well want, so it is their call, not an invariant.
+                    review_rule = "builtin:git-checkout"
+                    review_reason = (
+                        "Guardrails recognized this as a source-control operation "
+                        "that can replace uncommitted working-file changes, but "
+                        f"{mutations.GIT_UNBOUNDED_ASK}."
+                    )
+                    review_details = {
+                        "operation": "replace uncommitted working-file changes",
+                        "targets": ["Tracked files with uncommitted changes"],
+                        "target_kind": "category",
+                        "signal": "a force, merge, or discard-changes option",
+                        "trigger": ("The operation can rewrite any tracked file that "
+                                    "has local edits, so Guardrails cannot list them "
+                                    "statically."),
+                    }
                 else:
                     review_rule = "builtin:script-write-ambiguous"
                     review_reason = (

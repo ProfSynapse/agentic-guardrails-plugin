@@ -43,6 +43,7 @@ scripts/core/decisions.py
 scripts/core/enforcement.py
 scripts/core/engine.py
 scripts/core/events.py
+scripts/core/gitargs.py
 scripts/core/launcher.py
 scripts/core/lazyimport.py
 scripts/core/mcpshell.py

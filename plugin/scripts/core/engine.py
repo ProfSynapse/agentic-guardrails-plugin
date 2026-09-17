@@ -19,8 +19,8 @@ import re
 import shutil
 from typing import Optional
 
-from . import agw_contract, launcher, policy_health, policycache, powershell_bind, \
-    profiles as prof, remediation
+from . import agw_contract, gitargs, launcher, policy_health, policycache, \
+    powershell_bind, profiles as prof, remediation
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     EnforcementClass, ToolEvent, worst
@@ -858,6 +858,22 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
             ops = [a for a in cmd.argv[1:] if not a.startswith("-")]
             name = cmd.name
             argv_low = [a.lower() for a in cmd.argv]
+            if name == "git":
+                # checkout/switch/restore: named files get a pre-image; a
+                # force/merge/discard form may rewrite tracked files it does
+                # not name, which the planner turns into a review, not an
+                # invariant. Branch operations rewrite nothing.
+                scope = gitargs.worktree_scope(cmd.argv, cwd)
+                if scope.unbounded:
+                    if complete:
+                        incomplete_kind = gitargs.UNBOUNDED_KIND
+                    complete = False
+                    incomplete_reason = incomplete_reason or scope.reason
+                    continue
+                if scope.files:
+                    covered = True
+                    targets.update(_abs(value) for value in scope.files)
+                continue
             binding = powershell_bind.bind(cmd.argv, cmd.dialect)
             if binding.recognized and _powershell_whatif(cmd):
                 # The engine allows this as a dry run; there is nothing to
@@ -2001,7 +2017,7 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                             "builtin:chmod")
         return Decision(ASK, "Recursive permission change — review scope.", "builtin:chmod-r")
     if name == "git":
-        return _eval_git(cmd)
+        return _eval_git(cmd, event.cwd)
     if name in ("python", "python3", "perl", "ruby", "node", "php"):
         flag = "-c" if name.startswith("py") or name == "php" else "-e"
         if flag in cmd.argv or "-e" in cmd.argv or "-c" in cmd.argv:
@@ -2097,9 +2113,11 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
     return worst(verdicts) if verdicts else Decision()
 
 
-def _eval_git(cmd: SimpleCommand) -> Decision:
-    args = cmd.argv[1:]
-    sub = next((a for a in args if not a.startswith("-")), "")
+def _eval_git(cmd: SimpleCommand, cwd: str = "") -> Decision:
+    # Skip git's own options first: the old "first non-dash token" read
+    # `core.autocrlf=false` as the subcommand of `git -c core.autocrlf=false
+    # checkout -- file` and let it through.
+    sub, args = gitargs.subcommand(cmd.argv)
     argset = set(args)
     if sub == "push" and ({"--force", "-f"} & argset) and "--force-with-lease" not in argset:
         return Decision(DENY, "git push --force is blocked (history destruction). Use "
@@ -2110,10 +2128,18 @@ def _eval_git(cmd: SimpleCommand) -> Decision:
     if sub == "clean" and any(a.startswith("-") and "f" in a for a in args):
         return Decision(DENY, "git clean -f deletes untracked files. Use `agw archive` for "
                               "specific files.", "builtin:git-clean")
-    if sub == "checkout" and "--" in args:
-        return Decision(ASK, "git checkout -- discards uncommitted changes to these files.",
-                        "builtin:git-checkout")
-    if sub == "restore" and "--staged" not in argset:
+    if sub in ("checkout", "switch"):
+        # Branch creation and a plain branch switch rewrite nothing: git
+        # refuses to clobber local edits. A pathspec, a bare argument that
+        # names an existing file, or a force/merge/discard option does.
+        scope = gitargs.worktree_scope(cmd.argv, cwd)
+        if scope.unbounded:
+            return Decision(ASK, f"git {sub} can replace uncommitted changes across the "
+                                 f"working tree: {scope.reason}.", "builtin:git-checkout")
+        if scope.files:
+            return Decision(ASK, f"git {sub} discards uncommitted changes to these files.",
+                            "builtin:git-checkout")
+    if sub == "restore" and gitargs.worktree_scope(cmd.argv, cwd).rewrites:
         return Decision(ASK, "git restore discards uncommitted changes.",
                         "builtin:git-restore")
     if sub == "stash" and ({"drop", "clear"} & argset):
