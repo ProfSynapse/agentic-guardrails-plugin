@@ -205,7 +205,6 @@ def collapse_powershell_line_continuations(command: str) -> str:
     return "".join(out)
 
 
-
 def _canonicalize_powershell_backticks(command: str) -> str:
     """Canonicalize the explicit safe subset of PowerShell backtick escapes."""
     out = []
