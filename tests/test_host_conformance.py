@@ -551,6 +551,53 @@ def test_sessionstart_uses_host_approval_without_security_workarounds():
         assert "path" in context
 
 
+def _gitattributes_lines():
+    text = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def test_batch_launchers_are_checked_out_with_crlf():
+    """cmd.exe seeks through a batch file by byte offset and re-reads after
+    every command, so `goto :label` and parenthesised blocks resolve against
+    file positions. agw.cmd uses both, and an LF-only checkout shifts them."""
+    lines = _gitattributes_lines()
+    for pattern in ("*.cmd", "*.bat"):
+        matches = [line for line in lines if line.split()[0] == pattern]
+        assert matches, f"{pattern} has no .gitattributes rule"
+        assert "eol=crlf" in matches[-1], matches
+    # A broad `plugin/bin/* text eol=lf` sits above these, and the last matching
+    # rule wins, so the batch rules have to come after it.
+    assert lines.index([l for l in lines if l.split()[0] == "*.cmd"][-1]) > \
+        lines.index([l for l in lines if l.split()[0] == "plugin/bin/*"][-1])
+
+
+def test_gitattributes_only_protects_paths_that_exist():
+    """A rule naming a path that does not exist protects nothing, silently.
+
+    `synthetic/cowork-safety-lab/workspace/**` was such a rule: the real tree is
+    `synthetic/safety-lab/`, so the byte-exact fixtures it claimed to protect
+    were normalized like any other text on a Windows checkout.
+    """
+    for line in _gitattributes_lines():
+        pattern = line.split()[0]
+        if "/" not in pattern or pattern.startswith("*"):
+            continue
+        base = pattern.split("*", 1)[0].rstrip("/")
+        assert (ROOT / base).exists(), f"{pattern} names a path that does not exist"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_git_resolves_the_batch_launcher_to_crlf():
+    resolved = subprocess.run(
+        ["git", "check-attr", "text", "eol", "--", "plugin/bin/agw.cmd"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=30,
+    )
+    if resolved.returncode != 0:  # not a work tree (packed artifact run)
+        pytest.skip(resolved.stderr.strip() or "git check-attr unavailable")
+    assert "eol: crlf" in resolved.stdout, resolved.stdout
+
+
 def test_host_registry_marks_only_maintained_hosts_release_blocking():
     text = (ROOT / "docs" / "HOST_PARITY.md").read_text(encoding="utf-8").lower()
     assert "| claude code | supported | yes |" in text
