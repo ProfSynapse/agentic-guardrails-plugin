@@ -10,6 +10,7 @@ import uuid
 
 from . import archive_transactions as archive_tx
 from . import recovery_contracts
+from . import remediation
 from . import retention_policy
 from . import store
 
@@ -206,11 +207,14 @@ def prepare(targets, label: str, max_file_bytes: int,
                 return _plain_failure(
                     present[0][0], "The recovery store does not have enough free disk space."
                 )
-    except store.ArchiveCapacityError:
+    except store.ArchiveCapacityError as exc:
+        # Contract 3: this refusal must name the door out. The error code is
+        # embedded so hosts that only see the reason text can classify it.
         return _plain_failure(
             first_target,
-            "The recovery store does not have enough configured capacity; "
-            "its protected rollback points cannot be pruned safely.",
+            remediation.capacity_instruction(exc.details)
+            + f" (error code {remediation.CAPACITY_ERROR_CODE})",
+            error_code=remediation.CAPACITY_ERROR_CODE,
         )
     except TimeoutError:
         # Must precede OSError: TimeoutError is an OSError subclass.

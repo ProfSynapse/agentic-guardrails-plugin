@@ -432,3 +432,84 @@ def test_bound_policy_revision_is_not_rewritten_after_commit(tmp_path, monkeypat
     assert os.stat(manifest).st_ino == before, "an already-bound manifest was rewritten"
     with pytest.raises(ValueError, match="different policy revision"):
         archive_tx.bind_policy_revision(store.agw_home(), entry["transaction_id"], "rev-2")
+
+
+# --- F10: capacity wall ---------------------------------------------------------
+
+def _capped(maximum: int):
+    return retention_policy.RetentionPolicy(
+        max_bytes=maximum, high_water_bytes=maximum * 9 // 10,
+        low_water_bytes=maximum // 2, min_protected_age_days=7,
+        inactive_collapse_age_days=30, max_candidates=256,
+        max_reclaim_bytes=1 << 30,
+    )
+
+
+def test_capacity_wall_yields_older_copies_but_never_the_newest(tmp_path):
+    from core import archive_transactions as archive_tx
+
+    heavy = tmp_path / "heavy.bin"
+    heavy.write_bytes(b"1" * 40_000)
+    first = _prepare(heavy)
+    assert first.ok, first.reason
+    heavy.write_bytes(b"2" * 40_000)
+    second = _prepare(heavy)
+    assert second.ok, second.reason
+    lone = tmp_path / "lone.bin"
+    lone.write_bytes(b"L" * 10_000)
+    lone_only = _prepare(lone)
+    assert lone_only.ok, lone_only.reason
+    current = store.archive_size_bytes()
+
+    # Every pre-image is minutes old: normal retention can reclaim nothing,
+    # so the next capture used to be refused for seven days.
+    heavy.write_bytes(b"3" * 40_000)
+    cap = current + 10_000
+    result = preimages.prepare(
+        [str(heavy)], "Edit", 1 << 20, policy_revision="rev-1",
+        retention_config=_capped(cap),
+    )
+    assert result.ok, result.reason
+    purged = archive_tx.load(store.agw_home(), first.receipts[0].transaction_id)
+    assert purged["artifact_state"] == "PURGED"
+    assert not os.path.exists(first.receipts[0].artifact)
+    # The newest prior copy of heavy.bin and the only copy of lone.bin survive.
+    assert os.path.exists(second.receipts[0].artifact)
+    assert os.path.exists(lone_only.receipts[0].artifact)
+    assert preimages.receipt_valid(second.receipts[0], "rev-1")
+    assert preimages.receipt_valid(result.receipts[0], "rev-1")
+    assert store.archive_size_bytes() <= cap
+
+
+def test_capacity_wall_refusal_names_prune_and_the_override(tmp_path):
+    lone = tmp_path / "lone.bin"
+    lone.write_bytes(b"L" * 30_000)
+    kept = _prepare(lone)
+    assert kept.ok, kept.reason
+    current = store.archive_size_bytes()
+
+    # Only newest copies exist: nothing may yield, so the refusal must teach.
+    incoming = tmp_path / "incoming.bin"
+    incoming.write_bytes(b"i" * 30_000)
+    with pytest.raises(store.ArchiveCapacityError) as failure:
+        store.archive_file(
+            str(incoming), mode="copy", retention_class="mutation_preimage",
+            retention_config=_capped(current + 1),
+        )
+    details = failure.value.details
+    assert details["error_code"] == "archive_capacity_exceeded"
+    assert "agw prune" in details["remediation"]
+    assert "AGW_ARCHIVE_MAX_BYTES" in details["remediation"]
+    assert "agw prune" in str(failure.value)
+    assert os.path.exists(kept.receipts[0].artifact)
+
+    result = preimages.prepare(
+        [str(incoming)], "Edit", 1 << 20, policy_revision="rev-1",
+        retention_config=_capped(current + 1),
+    )
+    assert result.ok is False
+    assert result.error_code == "archive_capacity_exceeded"
+    assert "agw prune --yes-i-am-a-human" in result.reason
+    assert "AGW_ARCHIVE_MAX_BYTES" in result.reason
+    assert "Retry with one direct" not in result.reason
+    assert store.list_versions(str(incoming)) == []

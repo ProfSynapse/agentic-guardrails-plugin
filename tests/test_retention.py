@@ -371,3 +371,85 @@ def test_staged_or_partial_purge_crash_resumes_to_purged(
     manifest = archive_tx.load(agw_home, old["transaction_id"])
     assert manifest["artifact_state"] == "PURGED"
     assert manifest["retention_plan_id"] == plan["plan_id"]
+
+
+# --- capacity pressure: non-newest same-source pre-images may yield ----------
+
+def _pressure_plan(home: str, *, capacity_pressure: bool, now_ns=NOW):
+    snapshot = retention.inventory(home, activity_records=[])
+    policy = _policy(snapshot["known_allocated_bytes"])
+    return retention.build_plan(
+        home, policy=policy, now_ns=now_ns, activity_records=[],
+        capacity_pressure=capacity_pressure,
+    )
+
+
+def test_capacity_pressure_reclaims_oldest_non_newest_copies_only(tmp_path, agw_home):
+    edited = tmp_path / "edited.txt"
+    versions = [
+        _archive(agw_home, edited, 1, 3, protected_until_ns=NOW + 4 * DAY),
+        _archive(agw_home, edited, 2, 2, protected_until_ns=NOW + 5 * DAY),
+        _archive(agw_home, edited, 3, 1, protected_until_ns=NOW + 6 * DAY),
+    ]
+    _source_mtime(edited, 1)
+    single = tmp_path / "single.txt"
+    only = _archive(agw_home, single, 1, 40)
+    _source_mtime(single, 40)
+    manual_source = tmp_path / "manual.txt"
+    manual_old = _archive(agw_home, manual_source, 1, 3, classification="manual_snapshot")
+    _archive(agw_home, manual_source, 2, 1, classification="manual_snapshot")
+    moved = tmp_path / "moved.txt"
+    moved_old = _archive(agw_home, moved, 1, 30, mode="move")
+    _archive(agw_home, moved, 2, 1)
+
+    # Normal retention: everything recent or sole is protected.
+    normal = _pressure_plan(agw_home, capacity_pressure=False)
+    assert normal["capacity_pressure"] is False
+    assert _candidate_ids(normal) == set()
+
+    pressure = _pressure_plan(agw_home, capacity_pressure=True)
+    assert pressure["capacity_pressure"] is True
+    selected = [item["transaction_id"] for item in pressure["candidates"]]
+    # Oldest first, and only behind a newer verified copy of the same file.
+    assert selected == [versions[0]["transaction_id"], versions[1]["transaction_id"]]
+    assert versions[2]["transaction_id"] not in selected  # newest copy
+    assert only["transaction_id"] not in selected  # the only copy of that file
+    assert manual_old["transaction_id"] not in selected  # protected class
+    assert moved_old["transaction_id"] not in selected  # move archive
+    # Plans of different modes hash differently.
+    assert pressure["plan_sha256"] != normal["plan_sha256"]
+
+
+def test_capacity_pressure_apply_keeps_the_newest_and_requires_it_verified(
+        tmp_path, agw_home):
+    edited = tmp_path / "edited.txt"
+    old = _archive(agw_home, edited, 1, 2, protected_until_ns=NOW + 5 * DAY)
+    newest = _archive(agw_home, edited, 2, 1, protected_until_ns=NOW + 6 * DAY)
+    _source_mtime(edited, 1)
+    other = tmp_path / "other.txt"
+    other_old = _archive(agw_home, other, 1, 2, protected_until_ns=NOW + 5 * DAY)
+    other_newest = _archive(agw_home, other, 2, 1, protected_until_ns=NOW + 6 * DAY)
+    _source_mtime(other, 1)
+    plan = _pressure_plan(agw_home, capacity_pressure=True)
+    assert _candidate_ids(plan) == {old["transaction_id"], other_old["transaction_id"]}
+
+    # The newer copy "other" yields behind is damaged before apply: that
+    # candidate must be skipped, never purged.
+    Path(other_newest["dest"]).write_bytes(b"corrupted after planning")
+    result = retention.apply_plan(
+        agw_home, plan, expected_plan_hash=plan["plan_sha256"], now_ns=NOW,
+        activity_records=[],
+    )
+    assert result["purged_transaction_ids"] == [old["transaction_id"]]
+    assert [item["transaction_id"] for item in result["skipped"]] \
+        == [other_old["transaction_id"]]
+    assert result["skipped"][0]["reasons"] == ["newer_copy_unverified"]
+    assert not Path(old["dest"]).exists()
+    assert Path(newest["dest"]).exists()
+    assert Path(other_old["dest"]).exists()
+    assert archive_tx.load(agw_home, newest["transaction_id"])["artifact_state"] \
+        == "PRESENT"
+
+    # A normal (non-pressure) apply of the same candidates would refuse them.
+    normal = _pressure_plan(agw_home, capacity_pressure=False)
+    assert _candidate_ids(normal) == set()

@@ -1972,17 +1972,24 @@ def _raise_if_over_capacity(policy: retention_policy.RetentionPolicy,
                             result: dict):
     final_projected = int(result["final_projected_bytes"])
     if not policy.unlimited and final_projected > policy.max_bytes:
+        # Imported here: remediation reaches store through workflows, so a
+        # module-level import would be circular.
+        from . import remediation
+        details = {
+            **result,
+            "error_code": ArchiveCapacityError.error_code,
+            "maximum_bytes": policy.max_bytes,
+            "required_free_bytes": final_projected - policy.max_bytes,
+            "protected_or_unavailable_bytes": max(
+                0, final_projected - policy.low_water_bytes
+                - int(result.get("reclaimed_bytes") or 0),
+            ),
+        }
+        details["remediation"] = remediation.capacity_instruction(details)
         raise ArchiveCapacityError(
-            "The recovery cache cannot safely make room for this operation.",
-            {
-                **result,
-                "maximum_bytes": policy.max_bytes,
-                "required_free_bytes": final_projected - policy.max_bytes,
-                "protected_or_unavailable_bytes": max(
-                    0, final_projected - policy.low_water_bytes
-                    - int(result.get("reclaimed_bytes") or 0),
-                ),
-            },
+            "The recovery cache cannot safely make room for this operation. "
+            + details["remediation"],
+            details,
         )
 
 
@@ -2053,6 +2060,28 @@ def _maintain_retention_locked(*,
             result["reclaimed_bytes"] = int(applied.get("reclaimed_bytes") or 0)
             # A prune is the one path that shrinks the archive; recount once
             # rather than trusting allocated-vs-logical arithmetic.
+            after = _refresh_archive_size_locked()
+
+    if not policy.unlimited and after + incoming > policy.max_bytes and after:
+        # Capacity wall: normal reclamation left the store over its hard cap.
+        # Let older same-source pre-images yield behind a newer verified copy
+        # before refusing; the newest copy of every file is still never
+        # touched, and `agw prune` remains the only human-gated path beyond.
+        pressure_plan = retention.build_plan(
+            agw_home(), policy=policy, current_bytes=after + incoming,
+            capacity_pressure=True,
+        )
+        result["capacity_pressure_plan"] = pressure_plan
+        if pressure_plan.get("applicable") and pressure_plan.get("candidates"):
+            applied = retention.apply_plan(
+                agw_home(), pressure_plan,
+                expected_plan_hash=pressure_plan["plan_sha256"],
+                policy=policy, lock_context=nullcontext(),
+            )
+            result["applied"] = True
+            result["capacity_pressure_apply"] = applied
+            result["reclaimed_bytes"] = int(result.get("reclaimed_bytes") or 0) \
+                + int(applied.get("reclaimed_bytes") or 0)
             after = _refresh_archive_size_locked()
 
     result["after_bytes"] = after

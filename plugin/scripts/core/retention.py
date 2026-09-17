@@ -67,6 +67,16 @@ PROTECTED_CLASSES = frozenset({
 })
 KNOWN_CLASSES = frozenset({ELIGIBLE_CLASS}) | PROTECTED_CLASSES
 
+# Protections that encode recency or generation policy rather than the
+# integrity or uniqueness of a recovery point. When the store is over its
+# hard cap and normal reclamation found nothing, they yield for every
+# eligible record except the newest usable copy of its source, oldest first.
+# Everything else (class, move archives, pins, unverified, noncommitted, and
+# the newest copy itself) keeps protecting.
+PRESSURE_SOFT_REASONS = frozenset({
+    "active_hold", "recent_generation", "daily_generation", "newest_active",
+})
+
 PREPARED = "PREPARED"
 STAGED = "STAGED"
 PURGED = "PURGED"
@@ -803,10 +813,46 @@ def _utc_day(timestamp_ns: int) -> str:
                                   tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+def _newest_available_by_source(records) -> dict:
+    newest = {}
+    for item in records:
+        if not item.get("available"):
+            continue
+        key = _canonical(item["source"])
+        marker = (item["created_at_ns"], item["version"], item["transaction_id"])
+        if key not in newest or marker > newest[key][0]:
+            newest[key] = (marker, item)
+    return {key: value[1] for key, value in newest.items()}
+
+
+def _newer_copy_verified(item: dict, newest_by_source: dict, cache: dict) -> bool:
+    """Under pressure a record may yield only behind a verified newer copy.
+
+    The newest usable copy of the same source must exist, be a different
+    record, and pass its artifact fingerprint check right now.
+    """
+    key = _canonical(item["source"])
+    newest = newest_by_source.get(key)
+    if newest is None or newest["transaction_id"] == item["transaction_id"]:
+        return False
+    if key not in cache:
+        try:
+            _verify_artifact(newest)
+            cache[key] = True
+        except (StalePlanError, OSError, KeyError, TypeError, ValueError):
+            cache[key] = False
+    return cache[key]
+
+
 def protection_map(snapshot: dict, *, now_ns: int | None = None,
-                   policy: retention_policy.RetentionPolicy | None = None
+                   policy: retention_policy.RetentionPolicy | None = None,
+                   capacity_pressure: bool = False
                    ) -> dict[str, list[str]]:
-    """Return deterministic protection reasons for every inventoried record."""
+    """Return deterministic protection reasons for every inventoried record.
+
+    With ``capacity_pressure`` the soft, recency-only reasons are dropped
+    from every record that is not the newest usable copy of its source.
+    """
     now_ns = int(now_ns or time.time_ns())
     recent_days = (policy.min_protected_age_days if policy else RECENT_DAYS)
     inactive_days = (policy.inactive_collapse_age_days if policy else ACTIVE_DAYS)
@@ -851,6 +897,13 @@ def protection_map(snapshot: dict, *, now_ns: int | None = None,
                 daily.setdefault(day, item)
             for item in daily.values():
                 protected[item["transaction_id"]].append("daily_generation")
+        if capacity_pressure:
+            # items[0] is the newest usable copy and keeps every reason.
+            for item in items[1:]:
+                protected[item["transaction_id"]] = [
+                    reason for reason in protected[item["transaction_id"]]
+                    if reason not in PRESSURE_SOFT_REASONS
+                ]
 
     return {transaction_id: sorted(set(reasons))
             for transaction_id, reasons in protected.items()}
@@ -860,9 +913,16 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
                       now_ns: int | None = None,
                       max_candidates: int = MAX_CANDIDATES,
                       max_reclaim_bytes: int = MAX_RECLAIM_BYTES,
-                      policy: retention_policy.RetentionPolicy | None = None
+                      policy: retention_policy.RetentionPolicy | None = None,
+                      capacity_pressure: bool = False
                       ) -> list[dict]:
-    """Select a bounded, deterministic subset only from explicit preimages."""
+    """Select a bounded, deterministic subset only from explicit preimages.
+
+    Under ``capacity_pressure`` the normally eligible set comes first; after
+    it, older copies of sources that still keep a newer verified copy are
+    added oldest first, so the store gives up the least recent history and
+    never the only usable copy of a file.
+    """
     if not snapshot.get("complete"):
         return []
     required = max(0, int(bytes_to_free or 0))
@@ -883,6 +943,23 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
         -item["allocated_bytes"], item["created_at_ns"],
         item["version"], item["transaction_id"],
     ))
+    if capacity_pressure:
+        relaxed = protection_map(
+            snapshot, now_ns=now_ns, policy=policy, capacity_pressure=True
+        )
+        chosen = {item["transaction_id"] for item in eligible}
+        newest_by_source = _newest_available_by_source(snapshot["records"])
+        verified = {}
+        pressure_eligible = [
+            item for item in snapshot["records"]
+            if item["transaction_id"] not in chosen
+            and not relaxed[item["transaction_id"]]
+            and _newer_copy_verified(item, newest_by_source, verified)
+        ]
+        pressure_eligible.sort(key=lambda item: (
+            item["created_at_ns"], item["version"], item["transaction_id"],
+        ))
+        eligible.extend(pressure_eligible)
     selected = []
     reclaimed = 0
     count_limit = max(0, min(int(max_candidates), MAX_CANDIDATES))
@@ -919,8 +996,13 @@ def build_plan(home: str, max_bytes: int | None = None, *,
                max_candidates: int = MAX_CANDIDATES,
                max_reclaim_bytes: int = MAX_RECLAIM_BYTES,
                max_records: int = MAX_INVENTORY_RECORDS,
-               max_walk_nodes: int = MAX_WALK_NODES) -> dict:
-    """Create a 15-minute, hash-bound plan.  This function never mutates data."""
+               max_walk_nodes: int = MAX_WALK_NODES,
+               capacity_pressure: bool = False) -> dict:
+    """Create a 15-minute, hash-bound plan.  This function never mutates data.
+
+    ``capacity_pressure`` is recorded in the plan (and so in its hash) and
+    lets non-newest same-source pre-images yield regardless of age.
+    """
     now_ns = int(now_ns or time.time_ns())
     if policy is None:
         maximum = int(max_bytes or 0)
@@ -946,10 +1028,11 @@ def build_plan(home: str, max_bytes: int | None = None, *,
     )
     current = (int(snapshot["known_allocated_bytes"])
                if current_bytes is None else int(current_bytes))
-    if current < snapshot["known_allocated_bytes"] or current < 0:
-        raise ValueError(
-            "current_bytes cannot be negative or below inventoried artifact bytes"
-        )
+    if current < 0:
+        raise ValueError("current_bytes cannot be negative")
+    # A logical byte count can sit below the allocated inventory (small files
+    # occupy whole blocks); the inventory is the conservative floor.
+    current = max(current, int(snapshot["known_allocated_bytes"]))
     state = retention_policy.classify_retention_state(policy, current)
     high_bytes = policy.high_water_bytes
     target_bytes = policy.low_water_bytes
@@ -962,6 +1045,7 @@ def build_plan(home: str, max_bytes: int | None = None, *,
     candidates = select_candidates(
         snapshot, required, now_ns=now_ns, max_candidates=max_candidates,
         max_reclaim_bytes=max_reclaim_bytes, policy=policy,
+        capacity_pressure=capacity_pressure,
     ) if applicable else []
     planned = sum(item["allocated_bytes"] for item in candidates)
     plan = {
@@ -970,6 +1054,7 @@ def build_plan(home: str, max_bytes: int | None = None, *,
         "plan_id": uuid.uuid4().hex,
         "created_at_ns": now_ns,
         "expires_at_ns": now_ns + PLAN_TTL_NS,
+        "capacity_pressure": bool(capacity_pressure),
         "store_identity": snapshot["store_identity"],
         "inventory_sha256": snapshot["inventory_sha256"],
         "inventory_complete": snapshot["complete"],
@@ -1226,14 +1311,24 @@ def apply_plan(home: str, plan: dict, *, expected_plan_hash: str,
             )
         elif policy.as_dict() != plan.get("policy"):
             raise InvalidPlanError("retention policy differs from the reviewed plan")
-        protected = protection_map(fresh, now_ns=now_ns, policy=policy)
+        pressure = bool(plan.get("capacity_pressure"))
+        protected = protection_map(
+            fresh, now_ns=now_ns, policy=policy, capacity_pressure=pressure
+        )
+        newest_by_source = _newest_available_by_source(fresh["records"])
+        newer_verified = {}
         selected, skipped = [], []
         for planned in plan.get("candidates") or ():
             transaction_id = planned.get("transaction_id")
             current = current_by_id.get(transaction_id)
             if current is None:
                 raise StalePlanError(f"planned candidate changed: {transaction_id}")
-            reasons = protected[transaction_id]
+            reasons = list(protected[transaction_id])
+            if pressure and not reasons and not _newer_copy_verified(
+                    current, newest_by_source, newer_verified):
+                # Re-checked at apply time: the newer copy this record yields
+                # behind must still exist and verify right now.
+                reasons = ["newer_copy_unverified"]
             if not _candidate_metadata_equal(planned, current):
                 # A refreshed last-reference/protection hold may only shrink the
                 # reviewed set.  All artifact-bound fields must remain exact.
