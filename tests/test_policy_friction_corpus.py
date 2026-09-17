@@ -276,3 +276,98 @@ def test_a_real_deny_is_still_a_deny(hook, tmp_path):
     decision, reason = hook("Bash", "rm -rf ./src", project)
     assert decision == "deny"
     assert "agw archive" in reason
+
+
+# --- H1: stream duplication is not a file redirect ---------------------------
+# `2>&1` and `1>&2` never name a file. The planner's overwrite scan read their
+# `>` as a truncating redirect, found no target, and raised the pre-image
+# invariant: `pytest ... 2>&1 | tail` was denied while `pytest ... | tail` ran.
+
+STREAM_DUPLICATIONS = [
+    ("Bash", "python -m pytest -q tests 2>&1 | tail -20"),
+    ("Bash", "ls 2>&1"),
+    ("Bash", "echo warn 1>&2"),
+    ("Bash", "echo warn >&2"),
+    ("Bash", "ls >/dev/null 2>&1"),
+    ("PowerShell", "Get-ChildItem 2>&1"),
+    ("PowerShell", "Get-ChildItem *>&1"),
+]
+
+
+@pytest.mark.parametrize("tool,command", STREAM_DUPLICATIONS)
+def test_stream_duplication_is_not_a_mutation(hook, tmp_path, tool, command):
+    decision, reason = hook(tool, command, _project(tmp_path))
+    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
+
+
+def test_a_real_truncating_redirect_beside_a_duplication_still_plans(hook, tmp_path):
+    """Stripping `2>&1` must not hide the `> out.txt` next to it."""
+    project = _project(tmp_path)
+    _tree(project, "out.txt")
+    decision, reason = hook("Bash", "ls 2>&1 > out.txt", project)
+    # A named, project-local target: the pre-image plan is complete.
+    assert decision in ("allow", "defer"), reason
+    assert "could not be identified" not in reason
+
+
+# --- H2: a heredoc fed to a data consumer is data ----------------------------
+# A commit message containing `->` is not a redirect. A heredoc bash itself
+# executes still is inspected.
+
+def test_a_commit_message_heredoc_with_an_arrow_is_not_a_redirect(hook, tmp_path):
+    command = "git commit -q -F - <<'EOF'\nMap paths\n\n`/mnt/f/x` -> `F:\\x`.\nEOF"
+    decision, reason = hook("Bash", command, _project(tmp_path))
+    assert decision in ("allow", "defer"), f"was {decision}: {reason}"
+
+
+def test_a_heredoc_script_bash_runs_keeps_its_redirect(hook, tmp_path):
+    command = "bash <<'EOF'\necho hi > out.txt\nEOF"
+    decision, reason = hook("Bash", command, _project(tmp_path))
+    assert decision == "deny", f"was {decision}: {reason}"
+
+
+# --- H3: branch creation never rewrites tracked files -------------------------
+# `git checkout -b` is `git switch -c`; both only move HEAD, and git refuses to
+# clobber local edits. Forms that can rewrite files - a pathspec, a bare
+# argument that may be a file, force/merge/patch - keep their protection, and
+# `git switch --discard-changes` gains it. git's global options (`-c k=v`,
+# `-C dir`) no longer hide the subcommand from the classifier.
+
+BRANCH_OPERATIONS = [
+    ("Bash", "git checkout -b feature/x"),
+    ("Bash", "git checkout -B feature/x"),
+    ("Bash", "git checkout --orphan gh-pages"),
+    ("Bash", "git checkout -b feature/x origin/main"),
+    ("Bash", "git -c core.autocrlf=false checkout -b feature/x"),
+    ("Bash", "git switch -c feature/x"),
+    ("Bash", "git switch main"),
+    ("PowerShell", "git checkout -b feature/x"),
+]
+
+
+@pytest.mark.parametrize("tool,command", BRANCH_OPERATIONS)
+def test_branch_creation_needs_no_pre_image(hook, tmp_path, tool, command):
+    decision, reason = hook(tool, command, _project(tmp_path))
+    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
+
+
+WORKTREE_REWRITES = [
+    ("Bash", "git checkout -- README.md"),
+    ("Bash", "git checkout README.md"),
+    ("Bash", "git checkout -f main"),
+    ("Bash", "git checkout -b feature/x -- README.md"),
+    ("Bash", "git -c core.autocrlf=false checkout -- README.md"),
+    ("Bash", "git -C . checkout README.md"),
+    ("Bash", "git switch --discard-changes main"),
+    ("Bash", "git switch -f main"),
+    ("Bash", "git switch -m main"),
+    ("Bash", "git restore README.md"),
+]
+
+
+@pytest.mark.parametrize("tool,command", WORKTREE_REWRITES)
+def test_worktree_rewrites_keep_their_protection(hook, tmp_path, tool, command):
+    project = _project(tmp_path)
+    _tree(project, "README.md")
+    decision, reason = hook(tool, command, project)
+    assert decision in ("ask", "deny"), f"{command!r} was {decision}: {reason}"
