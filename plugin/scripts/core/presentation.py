@@ -578,6 +578,74 @@ def _copy(decision: GuardrailDecision, evlist) -> tuple[str, str, str, str]:
     )
 
 
+# An operation-scope prompt is only honest when the engine never claimed to be
+# reasoning about specific files. The `*_UNKNOWN` contexts mean the opposite —
+# Guardrails knows files would change and could not say which — so those keep
+# their unresolved marking and never reach a provider on a vague scope.
+_GENERIC_SCOPE_BY_KIND = {
+    events.EXEC: "The command this agent is about to run",
+    events.READ: "The content this operation would read",
+    events.WRITE: "The files this operation would change",
+    events.EDIT: "The files this operation would change",
+    events.MCP: "An item in a connected service",
+}
+
+
+def _generic_scope(evlist) -> str:
+    kinds = [ev.kind for ev in evlist or []]
+    for kind in (events.WRITE, events.EDIT, events.MCP, events.READ, events.EXEC):
+        if kind in kinds:
+            return _GENERIC_SCOPE_BY_KIND[kind]
+    return "The operation this agent is about to run"
+
+
+def _generic_prompt_eligible(decision: GuardrailDecision, evlist) -> bool:
+    """True when an ASK may fall back to an operation-scope approval request.
+
+    Policy rules such as `pip install*` and shape rules such as `builtin:eval`
+    are about an operation, not a file set: they carry no structured targets
+    and never will. Refusing them for want of a target turned every shipped
+    `action: ask` rule into a hard block whose message named no alternative,
+    which contract 3 forbids. They are answered with a scope-level prompt
+    instead, so the human can still approve.
+    """
+    if decision.action != events.ASK:
+        return False
+    if decision.presentation_context != events.DecisionContext.UNKNOWN:
+        return False
+    if any(getattr(ev, "paths", None) for ev in evlist or []):
+        return False
+    return True
+
+
+def build_generic_prompt(decision: GuardrailDecision, payload: dict,
+                         evlist) -> PromptRequest:
+    """Render an operation-scope approval request from the rule's own reason."""
+    rule_id = str(decision.rule_id or "").strip() or "an active policy rule"
+    event_id = str(payload.get("event_id") or payload.get("invocation_id") or
+                   payload.get("tool_use_id") or "")
+    why = str(decision.reason or "").strip() or \
+        "An active safety rule holds this operation for review."
+    return PromptRequest(
+        title="Agent safety check",
+        action="The agent wants to run an operation that needs your approval.",
+        targets=(_generic_scope(evlist),),
+        reason="%s (policy rule %s)" % (why, rule_id),
+        consequence=(
+            "Guardrails identified no specific file targets for this operation, "
+            "so its full effect cannot be listed here. Approve only if the "
+            "operation described above is what you intended."
+        ),
+        safeguard="",
+        event_id=event_id,
+        operation_fingerprint=operation_fingerprint(
+            payload, evlist, decision.policy_revision
+        ),
+        target_resolution=TARGET_CATEGORY,
+        policy_revision=decision.policy_revision,
+    )
+
+
 def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRequest:
     action, reason, consequence, safeguard = _copy(decision, evlist)
     targets = _friendly_targets(decision, evlist)
@@ -590,7 +658,7 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
             events.DecisionContext.RESTORE_FILES,
         }
     )
-    return PromptRequest(
+    request = PromptRequest(
         title="Agent safety check",
         action=action,
         targets=targets,
@@ -607,3 +675,6 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
         cancel_label=("Cancel" if recommended_allow else "Cancel (recommended)"),
         default_choice=("allow" if recommended_allow else "cancel"),
     )
+    if request.validation_problem() and _generic_prompt_eligible(decision, evlist):
+        return build_generic_prompt(decision, payload, evlist)
+    return request

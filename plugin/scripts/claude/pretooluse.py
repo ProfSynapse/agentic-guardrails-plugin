@@ -201,6 +201,13 @@ def main():
             prompt_decision, evaluation_payload, [event]
         )
         if prompt_request.validation_problem():
+            # Only prompts the engine cannot make informed reach here: the
+            # `*_UNKNOWN` contexts, where Guardrails knows files change and
+            # cannot say which. An ASK that is simply about an operation
+            # rather than a file set (pip install, npm publish, builtin:eval,
+            # builtin:chmod-r) is rendered at operation scope by
+            # presentation.build_prompt and still asks — upgrading those would
+            # turn every shipped `action: ask` rule into a wall with no door.
             action = events.DENY
             approval_outcome = "prompt-incomplete"
 

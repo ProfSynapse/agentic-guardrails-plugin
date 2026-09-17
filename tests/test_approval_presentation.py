@@ -617,6 +617,85 @@ def test_technical_details_are_safely_omitted():
     assert "PowerShell -Command Remove-Item x" not in primary
 
 
+def test_operation_scope_ask_prompts_instead_of_failing_validation():
+    """An `action: ask` policy rule carries no file targets and never will.
+
+    Marking it unresolved converted every shipped ask rule into a hard block,
+    so a scope-level prompt is built from the rule's own reason instead.
+    """
+    decision = GuardrailDecision(
+        events.ASK, reason="Installing packages changes the environment.",
+        rule_id="core.yaml:commands[7]", policy_revision="revision-a",
+    )
+    event = events.ToolEvent(kind=events.EXEC, tool="Bash",
+                             command="pip install requests")
+    request = presentation.build_prompt(
+        decision,
+        {"event_id": "pip", "tool_input": {"command": "pip install requests"}},
+        [event],
+    )
+    assert request.validation_problem() == ""
+    rendered = request.action + "\n" + request.primary_text()
+    assert "Installing packages changes the environment." in rendered
+    assert "core.yaml:commands[7]" in rendered
+    assert "pip install requests" not in rendered
+
+
+def test_generic_prompt_reports_a_scope_for_every_event_kind():
+    decision = GuardrailDecision(
+        events.ASK, reason="Review this.", rule_id="builtin:review",
+    )
+    for kind, expected in (
+        (events.EXEC, "command"),
+        (events.READ, "read"),
+        (events.WRITE, "change"),
+        (events.MCP, "connected service"),
+    ):
+        request = presentation.build_generic_prompt(
+            decision, {"event_id": "scope"},
+            [events.ToolEvent(kind=kind, tool="Bash", command="x")],
+        )
+        assert request.validation_problem() == ""
+        assert expected in request.targets[0].lower()
+
+
+def test_generic_prompt_survives_a_rule_with_no_reason():
+    decision = GuardrailDecision(events.ASK, reason="", rule_id="builtin:review")
+    request = presentation.build_generic_prompt(
+        decision, {"event_id": "no-reason"},
+        [events.ToolEvent(kind=events.EXEC, tool="Bash", command="x")],
+    )
+    assert request.validation_problem() == ""
+    assert "builtin:review" in request.reason
+
+
+def test_file_target_contexts_still_refuse_a_generic_prompt():
+    """`*_UNKNOWN` means files change and we cannot say which - still unresolved."""
+    for context in (events.DecisionContext.PATCH_UNKNOWN,
+                    events.DecisionContext.AGW_UNKNOWN):
+        decision = GuardrailDecision(
+            events.ASK, reason="the patch could not be parsed",
+            rule_id="builtin:patch-opaque", policy_revision="revision-a",
+            presentation_context=context,
+        )
+        request = presentation.build_prompt(
+            decision, {"event_id": "opaque"},
+            [events.ToolEvent(kind=events.EXEC, command="private raw text")],
+        )
+        assert request.validation_problem() == "target-unresolved"
+
+
+def test_generic_prompt_is_never_built_for_a_deny():
+    decision = GuardrailDecision(
+        events.DENY, reason="Deletion is disabled.", rule_id="builtin:rm",
+    )
+    request = presentation.build_prompt(
+        decision, {"event_id": "deny"},
+        [events.ToolEvent(kind=events.EXEC, tool="Bash", command="rm -rf x")],
+    )
+    assert request.validation_problem() == "target-unresolved"
+
+
 def test_native_provider_initialization_fails_in_test_mode(monkeypatch):
     monkeypatch.setenv("AGW_TEST_MODE", "1")
     try:
