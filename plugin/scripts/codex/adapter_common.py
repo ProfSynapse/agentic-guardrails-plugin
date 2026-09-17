@@ -59,14 +59,21 @@ def _patch_text(ti: dict) -> str:
 CODEX_ARGV_SHELL_TOOLS = ("shell", "local_shell")
 
 
-def _exec_cwd(ti, common):
+def exec_workdir(ti, cwd):
     """`workdir` when the call names one, else the session cwd."""
     workdir = ti.get("workdir")
     if isinstance(workdir, str) and workdir.strip():
-        fields = dict(common)
-        fields["cwd"] = workdir
-        return fields
-    return common
+        return workdir
+    return cwd
+
+
+def _exec_cwd(ti, common):
+    resolved = exec_workdir(ti, common.get("cwd", ""))
+    if resolved == common.get("cwd", ""):
+        return common
+    fields = dict(common)
+    fields["cwd"] = resolved
+    return fields
 
 
 def exec_command_line(ti):

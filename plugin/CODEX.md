@@ -106,9 +106,13 @@ dispatches directly to `scripts/codex/*` with `PLUGIN_ROOT`. Claude Code uses
 manifests cover Bash, PowerShell, and Monitor through the shared EXEC policy,
 and the Codex manifest additionally covers `shell`, `local_shell`,
 `exec_command`, and `write_stdin`. The same adapters expand the short launcher
-for interactive Bash/PowerShell calls. Monitor commands remain literal and
-receive no shortcut expansion, and so do the Codex-native exec surfaces: a
-literal `agw` issued through `shell` is evaluated, not rewritten.
+on every surface that carries a command line, in whatever shape that surface
+uses: a string `command` (Bash/PowerShell), an argv list (`shell`,
+`local_shell`) or `cmd` (`exec_command`). The rewrite is written back in the
+shape it came from - an argv list stays an argv list, `cmd` stays `cmd` - so a
+native-tool build can invoke `agw` at all. Monitor commands remain literal and
+receive no shortcut expansion, and neither does `write_stdin`: its `chars` are
+keystrokes for a process already running, not a command line to rewrite.
 
 ## Verify before relying on it
 
@@ -142,6 +146,13 @@ it rather than assuming. In a session with the plugin enabled and trusted:
 # 3. Ask for something harmless - "run git status" - and confirm it is NOT
 #    prompted for. Every command prompting is the other failure mode: a
 #    guardrail agents learn to route around.
+#
+# 4. Confirm the door step 1 recommends actually opens, on the same tool:
+#       "archive ./scratch.txt with agw"
+#    Expect the file to move to the archive store (`agw restore ./scratch.txt`
+#    brings it back). A DENY saying the launcher "could not be verified" means
+#    the short `agw` form is reaching the engine unexpanded on this build -
+#    every denial then names an alternative that is itself blocked.
 ```
 
 If step 1 deletes without a decision, check `/hooks` in Codex CLI: the hook

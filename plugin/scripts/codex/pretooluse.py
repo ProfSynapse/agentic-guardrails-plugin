@@ -37,8 +37,19 @@ FAIL_CLOSED = {
     }
 }
 
-from adapter_common import to_events, unrecognized_tool, \
+from adapter_common import CODEX_ARGV_SHELL_TOOLS, exec_command_line, \
+    exec_workdir, to_events, unrecognized_tool, \
     unrecognized_tool_reason  # noqa: E402
+
+# Host surfaces whose command text carries the platform-neutral `agw` short
+# form, and so must be expanded to the active package before evaluation. The
+# Codex-native exec tools belong here as much as Bash does: leaving them out
+# made every denial on a native-tool build recommend `agw archive` while
+# `agw archive` itself denied as an unverified launcher - a wall with no door.
+# `write_stdin` is deliberately absent: its `chars` are keystrokes for a
+# process already running, not a command line this hook may rewrite.
+LAUNCHER_TOOLS = frozenset({"Bash", "PowerShell", "exec_command"}
+                           | set(CODEX_ARGV_SHELL_TOOLS))
 
 # Set once anything has reached stdout, so the fail-closed handler never
 # appends a second object to a stream that already carries a decision.
@@ -100,6 +111,31 @@ def _plan_mutations(evlist, engine, events, mutations, **options):
                           **options)
 
 
+def _launcher_command(tool_name, tool_input, payload):
+    """(command line, rewrite dialect, cwd) for a launcher-bearing call.
+
+    Each host surface spells its command differently - a string under
+    `command`, an argv list under `command`, a line under `cmd` - and the
+    rewriter reads one command line, so the shape is resolved here through the
+    same accessors `to_events` uses. Reading them apart is what made the gate
+    miss the native tools: `tool_input["command"]` on a `shell` call is a list,
+    and on an `exec_command` call it is not there at all.
+    """
+    if tool_name in CODEX_ARGV_SHELL_TOOLS or tool_name == "exec_command":
+        from core import mcpshell
+        command = (exec_command_line(tool_input) if tool_name == "exec_command"
+                   else mcpshell.argv_command(tool_input.get("command")))
+        # Never the PowerShell call-operator spelling: an argv list is exec'd
+        # directly (and a `-lc` body is a POSIX script), and `exec_command`
+        # names any PowerShell or cmd interpreter in `shell`, which puts a
+        # wrapper in front that no leading-token shortcut matches anyway.
+        return command or "", "posix", exec_workdir(tool_input,
+                                                    payload.get("cwd", ""))
+    command = tool_input.get("command", "")
+    return (command if isinstance(command, str) else ""), \
+        ("powershell" if os.name == "nt" else "posix"), payload.get("cwd", "")
+
+
 def _routine_read(payload):
     """The Read fast path: True means the engine would say nothing, so we say
     nothing without loading it. Anything else takes the full path below."""
@@ -131,29 +167,36 @@ def main(approval_provider=None):
     evaluation_payload = payload
     rewritten_command = None
     routed_workflow = ""
-    if payload.get("tool_name") in {"Bash", "PowerShell"}:
+    tool_name = payload.get("tool_name")
+    if tool_name in LAUNCHER_TOOLS:
         tool_input = payload.get("tool_input") or {}
-        command = tool_input.get("command", "")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        command, shell, cwd = _launcher_command(tool_name, tool_input, payload)
         rewritten_command = launcher.rewrite_shortcut(
-            command, PLUGIN_ROOT,
-            shell="powershell" if os.name == "nt" else "posix",
-        )
-        if not rewritten_command:
-            dialect = "powershell" if payload.get("tool_name") == "PowerShell" else None
+            command, PLUGIN_ROOT, shell=shell,
+        ) if command else None
+        if not rewritten_command and command:
+            dialect = "powershell" if tool_name == "PowerShell" else None
             matches = mutations.routable_trusted_workflows(
-                command, payload.get("cwd", ""), dialect=dialect,
+                command, cwd, dialect=dialect,
             )
             if len(matches) == 1:
                 rewritten_command = launcher.rewrite_trusted_workflow(
-                    command, matches[0], PLUGIN_ROOT,
-                    shell="powershell" if os.name == "nt" else "posix",
+                    command, matches[0], PLUGIN_ROOT, shell=shell,
                 )
                 routed_workflow = matches[0] if rewritten_command else ""
         if rewritten_command:
-            evaluation_payload = dict(payload)
-            evaluation_payload["tool_input"] = launcher.updated_tool_input(
-                payload, rewritten_command
-            )
+            updated = launcher.updated_tool_input(payload, rewritten_command)
+            if updated is None:
+                # The rewrite has no spelling in this payload's own shape.
+                # Evaluate what was actually asked for instead of allowing on
+                # the strength of a rewrite the host would never receive.
+                rewritten_command = None
+                routed_workflow = ""
+            else:
+                evaluation_payload = dict(payload)
+                evaluation_payload["tool_input"] = updated
 
     evlist = to_events(evaluation_payload)
     policy = engine.load_policy(PLUGIN_ROOT)
