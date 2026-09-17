@@ -805,3 +805,90 @@ def test_audit_exception_leaves_claude_decisions_identical_and_never_prompts(
     failed = invoke(tmp_path / "failed", fail)
     assert failed == baseline
     assert _decision(failed) == expected
+
+
+def run_dispatch_raw(payload, event="pretooluse"):
+    """Drive the real hooks.json entry point and keep stdout/stderr separate."""
+    dispatch = os.path.join(REPO, "scripts", "claude", "_dispatch.py")
+    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=REPO)
+    return subprocess.run([sys.executable, dispatch, event],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=30)
+
+
+@pytest.mark.parametrize("payload,label", [
+    ({"tool_name": "Shell", "tool_input": {"command": "rm -rf ~/Documents"}},
+     "'Shell'"),
+    ({"tool_name": "MultiEdit", "tool_input": {"file_path": "/tmp/x"}},
+     "'MultiEdit'"),
+    ({"tool_input": {"command": "rm -rf ~/Documents"}}, "no tool name"),
+    ({"tool_name": "   ", "tool_input": {}}, "no tool name"),
+    ({"tool_name": 17, "tool_input": {}}, "no tool name"),
+])
+def test_unrecognized_tool_asks_instead_of_silently_allowing(payload, label):
+    # Regression for the fail-open in the 2026-09-17 audit (F2): an unmodeled
+    # tool name reached events.OTHER, the engine DEFERred, and empty stdout is
+    # a silent allow.
+    payload = dict(payload, cwd="/tmp", session_id="unknown-tool",
+                   hook_event_name="PreToolUse")
+    result = run_dispatch_raw(payload)
+    assert result.returncode == 0
+    assert result.stdout.strip(), "unrecognized tool produced no decision"
+    out = json.loads(result.stdout)
+    assert _decision(out) == "ask"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert label in reason
+    assert "update the plugin" in reason
+    # One diagnosable line on stderr, so a host-side fall-through is visible.
+    assert len([line for line in result.stderr.splitlines() if line.strip()]) == 1
+    assert "agentic-guardrails:" in result.stderr
+    assert label in result.stderr
+
+
+# TodoWrite/TaskCreate/TaskUpdate are recognized here but still denied further
+# down the pipeline by mutations.plan's name-based net for events.OTHER
+# (_MUTATION_WORDS matches "write"/"create"/"update" in the tool name). That is
+# a separate, pre-existing behavior in core/mutations.py; none of those tools is
+# in the hooks.json matcher, so the hook never sees them in practice.
+@pytest.mark.parametrize("tool", [
+    "Task", "Agent", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode",
+    "Skill", "SlashCommand", "ToolSearch", "BashOutput", "KillShell", "LS",
+    "WebFetch", "WebSearch", "TaskList", "TaskGet", "SendMessage",
+    "ListMcpResourcesTool",
+])
+def test_known_harmless_tools_still_pass_without_prompting(tool):
+    out = run_hook({"tool_name": tool, "tool_input": {},
+                    "cwd": "/tmp", "session_id": "inert",
+                    "hook_event_name": "PreToolUse"})
+    assert _decision(out) == "defer"
+
+
+def test_mcp_tools_are_recognized_by_prefix():
+    from claude.adapter_common import unrecognized_tool
+
+    assert unrecognized_tool({"tool_name": "mcp__brand_new__thing"}) is None
+    assert unrecognized_tool({"tool_name": "Bash"}) is None
+    assert unrecognized_tool({"tool_name": "Shell"}) == "Shell"
+    assert unrecognized_tool("not-a-dict") is not None
+
+
+def test_matcher_tools_claude_models_never_prompt_as_unrecognized():
+    """Every tool this adapter models must also be one the matcher delivers.
+
+    A modeled tool missing from the matcher is a dead guard; a matcher tool the
+    adapter cannot model prompts on every call. `apply_patch` is deliberately in
+    the matcher and deliberately unmodeled here: Claude does not ship it, and if
+    it ever does, asking beats silently passing a patch we cannot read.
+    """
+    from claude.adapter_common import unrecognized_tool
+
+    manifest = json.loads(
+        open(os.path.join(REPO, "hooks", "hooks.json"), encoding="utf-8").read()
+    )
+    matcher = set(manifest["hooks"]["PreToolUse"][0]["matcher"].split("|"))
+    for name in matcher - {"mcp__.*", "apply_patch"}:
+        assert unrecognized_tool({"tool_name": name}) is None, name
+    assert unrecognized_tool({"tool_name": "apply_patch"}) == "apply_patch"
+    # Tools the adapter models must be tools the host actually sends us.
+    assert {"Bash", "PowerShell", "Monitor", "Write", "Edit", "NotebookEdit",
+            "Read"} <= matcher

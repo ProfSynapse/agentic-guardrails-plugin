@@ -37,7 +37,8 @@ FAIL_CLOSED = {
     }
 }
 
-from adapter_common import to_events  # noqa: E402
+from adapter_common import to_events, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 # Codex has no hook-driven approval prompt (permissionDecision "ask" is parsed
@@ -101,6 +102,21 @@ def main(approval_provider=None):
                 f"instead of removing it.",
                 "builtin:patch-delete",
                 enforcement_class=events.NON_WAIVABLE_INVARIANT))
+        if ev.extra.get("unrecognized_tool"):
+            # A tool identity this adapter cannot map to any guarded event.
+            # events.OTHER alone DEFERs and emits nothing, which Codex reads as
+            # allow. Ask instead — on Codex that routes through the approval
+            # provider, whose absence or timeout denies — and log one stderr
+            # line so the fall-through is diagnosable from the hook log.
+            reason = unrecognized_tool_reason(
+                unrecognized_tool(evaluation_payload)
+            )
+            sys.stderr.write("agentic-guardrails: %s\n" % reason)
+            d = d.merge(engine.Decision(
+                events.ASK, reason + ".", "builtin:unrecognized-tool",
+                policy_revision=policy.revision, policy_health=policy.health,
+                enforcement_class=events.NON_WAIVABLE_INVARIANT,
+                presentation_context=events.DecisionContext.UNKNOWN))
         if ev.extra.get("opaque"):
             d = d.merge(engine.Decision(
                 events.ASK,

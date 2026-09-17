@@ -25,14 +25,49 @@ FAIL_CLOSED = {
 }
 
 
-from adapter_common import to_event  # noqa: E402
+from adapter_common import to_event, unrecognized_tool, \
+    unrecognized_tool_reason  # noqa: E402
 
 
 PRESNAP_MAX_BYTES = int(os.environ.get("AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024))
 
 
+def _emit(out):
+    """Write one decision object in a single, already-serialized write.
+
+    Serializing first means an encoding failure leaves stdout untouched, so the
+    fail-closed handler can still write a decision the host can parse. A partial
+    object followed by a second one parses as neither, which the host reads as
+    "no decision" (= allow).
+    """
+    text = json.dumps(out)
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _unrecognized_tool_decision(label):
+    """Fail closed on a tool identity we cannot map to any guarded event.
+
+    An unmodeled tool name reaches the engine as events.OTHER, which DEFERs;
+    an empty stdout is a silent allow. The day the host renames Write or ships
+    a new file-mutating tool, that is exactly the wrong answer, so ask instead
+    and say why on stderr, where the host's hook log makes it diagnosable.
+    """
+    reason = unrecognized_tool_reason(label)
+    sys.stderr.write("agentic-guardrails: %s\n" % reason)
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason + ".",
+    }}
+
+
 def main():
     payload = json.load(sys.stdin)
+    unknown = unrecognized_tool(payload)
+    if unknown is not None:
+        _emit(_unrecognized_tool_decision(unknown))
+        return
     from core import approvals, auditlog, enforcement, engine, events, launcher, mutations, \
         preimages, presentation, remediation, retention_policy, store
     from core.decisions import GuardrailDecision
