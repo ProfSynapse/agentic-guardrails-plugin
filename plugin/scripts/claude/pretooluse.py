@@ -70,6 +70,12 @@ def _unrecognized_tool_decision(label):
     }}
 
 
+# The host's registry of tools that neither run a command nor touch a file.
+# Bound at import time so the planner can be told which unmodeled tool names
+# are inert without the platform-neutral core learning any of them.
+from adapter_common import INERT_TOOLS  # noqa: E402
+
+
 def main():
     payload = json.load(sys.stdin)
     unknown = unrecognized_tool(payload)
@@ -118,7 +124,7 @@ def main():
     # they cannot be approved away or suppressed by observe mode.
     mutation_plan = mutations.plan(
         [event], engine.clobber_targets, plugin_root=PLUGIN_ROOT,
-        regenerable=cfg.get("regenerable"),
+        regenerable=cfg.get("regenerable"), inert_tools=INERT_TOOLS,
     )
     invariant_failure = ""
     # Structured detail behind the refusal. Only the capacity failure has any,
