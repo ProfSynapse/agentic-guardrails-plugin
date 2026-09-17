@@ -654,11 +654,21 @@ def _tool_words(name: str) -> set[str]:
     return set(re.findall(r"[a-z]+", spaced.lower()))
 
 
-def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
-    """Return exact canonical targets, or an explicit incomplete plan."""
+def plan(evlist, clobber_resolver, plugin_root: str = "",
+         regenerable=None) -> MutationPlan:
+    """Return exact canonical targets, or an explicit incomplete plan.
+
+    `regenerable` is the engine's resolved regenerable-tree set for the active
+    level, which a site extends through `regenerable_globs`. Without it the
+    resolver falls back to the built-in set, so a site-added tree the engine
+    ALLOWED deleting was still asked for a pre-image it could never produce.
+    """
     result = MutationPlan()
     seen = set()
     covered_without_target = False
+    # Omitted rather than passed as None, so a resolver that does not model
+    # regenerable trees at all keeps working unchanged.
+    resolver_options = {} if regenerable is None else {"regenerable": regenerable}
 
     def add_paths(paths, cwd):
         for path in paths:
@@ -687,7 +697,8 @@ def plan(evlist, clobber_resolver, plugin_root: str = "") -> MutationPlan:
             if ev.kind == events.EXEC:
                 dialect = "powershell" if ev.tool.lower() in {"powershell", "pwsh"} else None
                 targets = clobber_resolver(
-                    ev.command, ev.cwd, include_absent=True, dialect=dialect
+                    ev.command, ev.cwd, include_absent=True, dialect=dialect,
+                    **resolver_options
                 )
                 trusted_help = _trusted_agw_help(
                     ev.command, ev.cwd, plugin_root, dialect=dialect

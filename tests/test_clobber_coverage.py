@@ -152,3 +152,67 @@ def test_the_hook_still_allows_a_plain_bulk_copy(project, agw_home):
     for base, _dirs, files in os.walk(os.path.join(agw_home, "archive")):
         archived.extend(files)
     assert any(name.endswith("a.txt") for name in archived), archived
+
+
+# --- the site-extended regenerable set --------------------------------------
+
+@pytest.fixture()
+def site_regenerable(agw_home):
+    """A drop-in policy pack that calls `.custom-cache` regenerable."""
+    policies = os.path.join(agw_home, "policies.d")
+    os.makedirs(policies, exist_ok=True)
+    with open(os.path.join(policies, "site.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("version: 1\nsettings:\n  regenerable_globs:\n"
+                 "    - .custom-cache\n")
+    return agw_home
+
+
+@pytest.fixture()
+def cache_project(tmp_path):
+    work = tmp_path / "work"
+    (work / ".custom-cache").mkdir(parents=True)
+    (work / ".custom-cache" / "a").write_text("1\n", encoding="utf-8")
+    return str(work)
+
+
+def test_the_planner_honours_a_site_regenerable_tree(site_regenerable,
+                                                     cache_project):
+    """Without the set threaded through, the planner asks for a pre-image.
+
+    The engine already ALLOWs the delete under `builtin:rm-regenerable`, so the
+    only thing left to fail is the pre-image step — an invariant DENY on a
+    command policy says is fine.
+    """
+    from core import mutations
+    from core.events import ToolEvent, EXEC
+
+    policy = engine.load_policy(REPO)
+    cfg = engine.resolve_settings(policy)
+    assert ".custom-cache" in cfg["regenerable"]
+    event = ToolEvent(kind=EXEC, tool="Bash", command="rm -rf .custom-cache",
+                      cwd=cache_project)
+
+    without = mutations.plan([event], engine.clobber_targets, plugin_root=REPO)
+    assert without.complete is False
+
+    threaded = mutations.plan([event], engine.clobber_targets, plugin_root=REPO,
+                              regenerable=cfg["regenerable"])
+    assert threaded.complete is True
+    assert threaded.targets == []
+    assert any(reason == engine.SKIP_REGENERABLE
+               for _target, reason in threaded.skipped)
+
+
+def test_the_hook_allows_a_site_regenerable_delete(site_regenerable,
+                                                   cache_project):
+    action, reason = run_hook("rm -rf .custom-cache", cache_project,
+                              site_regenerable)
+    assert action == "allow", reason
+
+
+def test_a_non_regenerable_delete_is_untouched(site_regenerable, cache_project):
+    with open(os.path.join(cache_project, "keep.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write("keep\n")
+    action, _ = run_hook("rm -rf keep.txt", cache_project, site_regenerable)
+    assert action == "deny"
