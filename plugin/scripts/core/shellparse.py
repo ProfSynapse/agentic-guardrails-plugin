@@ -161,6 +161,51 @@ _PWSH_INDIRECT_PREFIX = "PS_INDIRECT_"
 _PWSH_LITERAL_BACKTICK_ESCAPES = frozenset("._-/\\")
 
 
+def collapse_powershell_line_continuations(command: str) -> str:
+    """Remove only PowerShell's exact backtick-newline continuation.
+
+    A backtick must be the final character on the physical line. Backticks in
+    single-quoted strings are literal, and any whitespace between a backtick
+    and newline intentionally leaves the newline for fail-closed handling: a
+    backtick-space is an escaped space in PowerShell and the statement really
+    does end at that newline, so joining the lines would parse a command the
+    host never runs.
+    """
+    out = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "'" and not in_double:
+            if in_single and index + 1 < len(command) and command[index + 1] == "'":
+                out.extend((char, char))
+                index += 2
+                continue
+            in_single = not in_single
+            out.append(char)
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            out.append(char)
+            index += 1
+            continue
+        if char == "`" and not in_single and index + 1 < len(command):
+            following = command[index + 1]
+            if following == "\n":
+                index += 2
+                continue
+            if following == "\r" and index + 2 < len(command) \
+                    and command[index + 2] == "\n":
+                index += 3
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+
 def _canonicalize_powershell_backticks(command: str) -> str:
     """Canonicalize the explicit safe subset of PowerShell backtick escapes."""
     out = []
@@ -351,6 +396,11 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
     dialect = dialect or _detect_dialect(command)
 
     if dialect == DIALECT_POWERSHELL:
+        # A backtick at the end of a physical line is PowerShell's line
+        # continuation, not an escape. Collapse those first, or every
+        # multi-line PowerShell command raises ParseUncertain below and is
+        # never parsed at all.
+        command = collapse_powershell_line_continuations(command)
         command = _canonicalize_powershell_backticks(command)
 
     # Pull out heredoc bodies so shlex doesn't choke; bodies are inspected by

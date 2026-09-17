@@ -537,3 +537,17 @@ def test_uninspected_command_bodies_ask(evaluate, command):
     decision = evaluate(command)
     assert decision.action == ASK, f"{command} -> {decision.action}"
     assert "not inspected" in decision.reason
+
+
+# ---- G5: multi-line PowerShell is parsed, not waved through --------------
+
+def test_multi_line_powershell_deletion_is_denied(evaluate):
+    assert evaluate(
+        "Remove-Item `\n  -Recurse `\n  -Force C:\\work\\notes"
+    ).action == DENY
+
+
+def test_multi_line_benign_powershell_is_not_denied(evaluate):
+    assert evaluate(
+        "Copy-Item README.md README.bak `\n  -Force"
+    ).action != DENY

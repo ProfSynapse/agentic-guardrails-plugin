@@ -165,7 +165,6 @@ def test_powershell_static_backtick_escape_table(escaped, canonical):
     'Set-Content victim`"name changed',
     "Set-Content victim`n.txt changed",
     "Set-Content victim` changed",
-    "Set-Content victim`\n.txt changed",
 ])
 def test_powershell_ambiguous_backtick_escapes_are_uncertain(script):
     with pytest.raises(ParseUncertain):
@@ -324,3 +323,47 @@ def test_variable_head_on_the_bash_tool_is_no_longer_dialect_confused():
     parsed = extract_commands("$RM -rf ~/My-Documents")
     assert [c.argv for c in parsed.commands] == [["$RM", "-rf", "~/My-Documents"]]
     assert FLAG_INDIRECT in parsed.flags
+
+
+# ---- G5: backtick line continuation ------------------------------------
+
+def test_powershell_line_continuation_is_collapsed_not_uncertain():
+    parsed = extract_commands("Copy-Item README.md README.bak `\n  -Force",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.argv for c in parsed.commands] == \
+        [["Copy-Item", "README.md", "README.bak", "-Force"]]
+
+
+def test_powershell_multi_line_deletion_is_parsed():
+    parsed = extract_commands(
+        "Remove-Item `\n  -Recurse `\n  -Force C:\\work\\notes",
+        dialect=DIALECT_POWERSHELL)
+    assert [c.name for c in parsed.commands] == ["remove-item"]
+
+
+def test_powershell_line_continuation_joins_the_token():
+    # PowerShell consumes the backtick and the newline entirely, so the
+    # characters on either side end up in one token.
+    parsed = extract_commands("Set-Content victim`\n.txt changed",
+                              dialect=DIALECT_POWERSHELL)
+    assert parsed.commands[0].argv == ["Set-Content", "victim.txt", "changed"]
+
+
+def test_powershell_crlf_line_continuation_is_collapsed():
+    parsed = extract_commands("Copy-Item a.txt b.txt `\r\n  -Force",
+                              dialect=DIALECT_POWERSHELL)
+    assert [c.argv for c in parsed.commands] == \
+        [["Copy-Item", "a.txt", "b.txt", "-Force"]]
+
+
+@pytest.mark.parametrize("script", [
+    # A backtick-space is an escaped space; the statement really does end at
+    # the newline, so joining the lines would parse a command that never runs.
+    "Write-Output a` \nRemove-Item -Recurse -Force C:\\work",
+    "Write-Output a`b",
+    "Write-Output a`",
+    "Set-Content victim`'name changed",
+])
+def test_unpaired_backticks_elsewhere_stay_uncertain(script):
+    with pytest.raises(ParseUncertain):
+        extract_commands(script, dialect=DIALECT_POWERSHELL)

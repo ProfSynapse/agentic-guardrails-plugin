@@ -17,7 +17,14 @@ import re
 import shlex
 from typing import Optional
 
-from .shellparse import DIALECT_POWERSHELL, ParseUncertain, extract_commands
+from .shellparse import (DIALECT_POWERSHELL, ParseUncertain,
+                         collapse_powershell_line_continuations,
+                         extract_commands)
+
+# The canonical collapser now lives in the parser, which has to apply it
+# before it can tokenize a multi-line PowerShell command at all. Kept under
+# the old private name so the launcher's call sites read unchanged.
+_collapse_powershell_line_continuations = collapse_powershell_line_continuations
 
 
 _SHORTCUT = re.compile(r"^(?P<indent>\s*)(?P<name>agw(?:\.cmd)?)(?=$|\s)", re.IGNORECASE)
@@ -79,47 +86,6 @@ def _has_powershell_control_syntax(command: str) -> bool:
             return True
         index += 1
     return bool(quote)
-
-
-def _collapse_powershell_line_continuations(command: str) -> str:
-    """Remove only PowerShell's exact backtick-newline continuation.
-
-    A backtick must be the final character on the physical line. Backticks in
-    single-quoted strings are literal, and any whitespace between a backtick
-    and newline intentionally leaves the newline for fail-closed handling.
-    """
-    out = []
-    in_single = False
-    in_double = False
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "'" and not in_double:
-            if in_single and index + 1 < len(command) and command[index + 1] == "'":
-                out.extend((char, char))
-                index += 2
-                continue
-            in_single = not in_single
-            out.append(char)
-            index += 1
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            out.append(char)
-            index += 1
-            continue
-        if char == "`" and not in_single and index + 1 < len(command):
-            following = command[index + 1]
-            if following == "\n":
-                index += 2
-                continue
-            if following == "\r" and index + 2 < len(command) \
-                    and command[index + 2] == "\n":
-                index += 3
-                continue
-        out.append(char)
-        index += 1
-    return "".join(out)
 
 
 def _powershell_segment_end(command: str, start: int) -> tuple[int, bool]:
