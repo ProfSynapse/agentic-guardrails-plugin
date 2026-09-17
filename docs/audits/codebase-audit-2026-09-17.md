@@ -139,3 +139,60 @@ F4 model `wsl`, `Start-Process`, `robocopy /MIR|/PURGE|/MOV`, `-File` · F7 `FLA
 F10 remediation text plus reclaim of non-newest same-source pre-images · F11 route `undo_last` through `publish_restore` under the lock with `entry_is_verified` · G8 port the Claude PostToolUse checks to Codex · G10 protect `.claude/settings*.json` · G17 reserved names and `\\?\` prefixing · G18 run the full suite on the Windows leg and spawn the literal `commandWindows` line in one test · a minimal append-only decision log so the next silent failure is diagnosable.
 
 **Tests to add alongside**: an adapter-level fixture that drives the full `pretooluse` pipeline (not `engine.evaluate`), with the 40-command PowerShell corpus as its benign/deny spec, run against a cwd that actually contains `node_modules`, `build`, `dist`, and a folder named `OneDrive - Acme`.
+
+---
+
+## 6. Resolution, 2026-09-17 (branch `claude/kind-curie-rfhklm`)
+
+Seven work packages landed the same day, each in its own branch, gated by the
+full suite and by a 46-row decision corpus driven through the real hook. The
+suite went from 1216 to 1718 passing tests; the corpus from 21 to 46 rows
+matching. Every P1 above is closed. Findings map to merges as follows.
+
+| Finding | Status | Merge |
+|---|---|---|
+| F1 lock timeout vs hook budget | Fixed: 8 s hook budget, "store busy" refusal | wp-a |
+| F2 unknown tool silent allow | Fixed: ASK naming the tool, both hosts | wp-d |
+| F3 `.exe` / full-path interpreters | Fixed: one normalized head before every wrapper test | wp-b |
+| F4 wsl, robocopy, Start-Process, xcopy, fsutil, -File | Fixed; -File is ASK; destinations pre-imaged | wp-b, wp-f |
+| F5 ASK upgraded to DENY | Fixed: generic prompt from the rule's own reason | wp-c |
+| F6 regenerable dirs blocked | Fixed: skipped from the plan with an honest receipt | wp-c, wp-f |
+| F7 `$var` heads, dialect misdetection | Fixed: FLAG_INDIRECT, verb-prefixed cmdlet detection, POSIX -rf evidence | wp-b, wp-f |
+| F8 Windows launcher without fallback | Fixed: `py.exe -3 || python`; POSIX fallback only on 127 | wp-d |
+| F9 archive walk per Edit, no dedupe | Fixed: running counter, single admission, dedupe, single-pass hashing, 24 → 8 fsyncs | wp-a |
+| F10 capacity wall | Fixed: reclaim behind a verified newer copy; refusal names `agw prune` and the sizes | wp-a, wp-f |
+| F11 unsafe `agw undo` | Fixed: locked, verified restore | wp-a |
+| F12 per-call import and policy parse | Fixed: lazy imports, persisted policy and profile caches, miniyaml first | wp-e |
+| F13 miniyaml not fail-closed | Fixed, plus a stdlib-only CI leg | wp-d |
+| G1 OneDrive project denies discovery | Fixed: project-local scope | wp-c |
+| G2 `-Force` on Get-ChildItem | Fixed: scoped to finders | wp-c |
+| G3 `-WhatIf` ignored | Fixed, including the `-wi` alias | wp-c, wp-f |
+| G4 splatting and here-strings non-waivable | Fixed: `$`/`@` shapes ask; backticks and wildcards stay fail-closed | wp-b, wp-f |
+| G5 backtick continuation | Fixed: exact backtick-newline collapses | wp-b |
+| G8 Codex approvals unverified | Fixed: Claude gate ported | wp-d |
+| G9 placeholders on clobber targets | Fixed | wp-c |
+| G11, G12, G13 PostToolUse order, Read fast path, prescan | Fixed | wp-e |
+| G15 `.gitattributes` | Fixed: CRLF batch files, two dead rules revived | wp-d |
+| G16 README banner | Fixed | wp-d |
+| Codex native `shell` / `local_shell` / `exec_command` / `write_stdin` (found during D) | Fixed: matched, routed, `agw` door works through them | wp-g, wp-h |
+| P3 ctypes import, session-start policy warning, dirty stdout, bytecode | Fixed | wp-d, wp-e |
+
+**Measured after** (Linux, warm bytecode, median of 10, empty store):
+
+| Scenario | Before | After |
+|---|---:|---:|
+| PreToolUse Read | 94 | 32 |
+| PreToolUse Bash | 99 | 75 |
+| PreToolUse Edit | 96 | 79 |
+| PreToolUse mcp__ | 95 | 55 |
+| PostToolUse Read | 73 | 26 |
+| Pre-image prepare, 2000-entry store | 129 | 22 |
+| fsyncs per Edit | 24 | 8 |
+
+**Still open**
+
+- G6 and G7 (Office publish `os.replace` without retry; temp files staged inside the synced folder), G10 (`.claude/settings.json` not in protected globs), G14 (100 MB pre-image inside the 15 s budget), G17 (reserved names, long paths), G18 (full suite on the Windows CI leg, no live `commandWindows` spawn), and the P3 `_RetentionLock` staleness and macOS case-folding items.
+- Bash, Edit and MCP hook latency sit at 55 to 79 ms against targets of 35 to 65. The remaining cost is `core.events` (dataclasses), the MCP rule tables living in `engine`, and `workflows` importing `store` at module level; the fix directions are in the wp-e merge message.
+- `Glob`/`Grep` are modeled as reads but not in either matcher.
+- Windows plus Codex native tools is untested on a real Windows machine.
+- Both hook command strings changed (F8) and the Codex matcher changed (native tools): Codex installs pin the hook-definition hash and must re-trust. Say so at the top of the release notes.
