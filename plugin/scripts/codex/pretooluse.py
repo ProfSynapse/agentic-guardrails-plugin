@@ -199,6 +199,13 @@ def main(approval_provider=None):
                 evaluation_payload["tool_input"] = updated
 
     evlist = to_events(evaluation_payload)
+    if os.name != "nt":
+        for ev in evlist:
+            if ev.kind == events.EXEC:
+                # `cd DIR && ...`: the rest runs in DIR, so resolve it there.
+                cd_dir = launcher.leading_cd_directory(ev.command, ev.cwd)
+                if cd_dir:
+                    ev.cwd = cd_dir
     policy = engine.load_policy(PLUGIN_ROOT)
     cfg = engine.resolve_settings(policy)
     observe = cfg.get("enforcement") == "observe"

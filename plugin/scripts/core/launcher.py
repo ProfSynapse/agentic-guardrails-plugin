@@ -293,18 +293,269 @@ def _rewrite_powershell_later_shortcuts(command: str, target: str) -> str | None
     return rewritten
 
 
+# --- POSIX: literal `agw` in later command positions -------------------------
+#
+# A model commonly writes `cd <dir> && agw run ...`, two `agw` calls joined by
+# `;` or a newline, or `agw ... | tail`. Only the leading token used to be
+# expanded, so every later `agw` reached the shell as a bare PATH lookup and was
+# (correctly) refused as an unverifiable launcher. Rewriting a later literal
+# `agw` to the exact packaged path is safe only when nothing earlier in the same
+# command can change what that word, or the launcher it names, resolves to.
+# The scan therefore refuses to vouch (returns None, leaving the bare word for
+# the engine to deny) on anything it cannot read statically.
+
+_POSIX_OPERATORS = ("&&", "||", ";;", "|&", ";", "|", "&", "\n")
+_POSIX_REDIRECT_RE = re.compile(
+    r"(?:\d+|&)?(?P<op><<<|<<-?|>>|>&|>\||<>|<&|>|<)"
+)
+_POSIX_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_POSIX_PREFIX_WORDS = frozenset({
+    "do", "then", "else", "elif", "if", "while", "until", "!", "time",
+})
+_POSIX_CLOSING_WORDS = frozenset({"done", "fi"})
+# Statements that can redefine a command word, change the environment the
+# launcher runs in, or move the working directory under a later command.
+_POSIX_TAINTING_WORDS = frozenset({
+    "alias", "unalias", "function", "export", "unset", "declare", "typeset",
+    "readonly", "local", "hash", "enable", "shopt", "source", ".", "eval",
+    "exec", "builtin", "command", "trap", "pushd", "popd", "cd", "case",
+    "select", "coproc", "set",
+})
+# Plain `NAME=value` statements are ordinary shell locals. They only reach a
+# child process when NAME is already exported, so the names that can steer the
+# launcher (its interpreter lookup, imports, shell start-up, or store) refuse.
+_POSIX_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?:PATH|CDPATH|HOME|TMPDIR|TMP|TEMP|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|"
+    r"PS4|GLOBIGNORE|PROMPT_COMMAND|LD_\w*|DYLD_\w*|PYTHON\w*|AGW_\w*|CLAUDE_\w*|"
+    r"CODEX_\w*|PLUGIN_ROOT)"
+)
+
+
+def _posix_words(command: str):
+    """Tokenize into (kind, raw, start, end); ``None`` on unreadable syntax.
+
+    Only the syntax needed to find command positions is modelled. Quotes and
+    escapes stay inside words. Command or process substitution, arithmetic,
+    subshells, groups, heredocs and comments are refused outright.
+    """
+    tokens = []
+    index = 0
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if char in " \t\r":
+            index += 1
+            continue
+        if char == "\\" and command[index + 1:index + 2] == "\n":
+            index += 2
+            continue
+        redirect = _POSIX_REDIRECT_RE.match(command, index)
+        if redirect:
+            if redirect.group("op").startswith("<<") \
+                    and not redirect.group("op").startswith("<<<"):
+                return None  # heredoc: its body is not shell syntax
+            if command.startswith("(", redirect.end()):
+                return None  # process substitution
+            tokens.append(("redirect", redirect.group(0), index, redirect.end()))
+            index = redirect.end()
+            continue
+        operator = next((op for op in _POSIX_OPERATORS
+                         if command.startswith(op, index)), "")
+        if operator:
+            tokens.append(("op", operator, index, index + len(operator)))
+            index += len(operator)
+            continue
+        if char in "(){}#`":
+            return None
+        start = index
+        quote = ""
+        while index < length:
+            char = command[index]
+            if quote:
+                if quote == '"' and char == "\\" and index + 1 < length:
+                    index += 2
+                    continue
+                if quote == '"' and (command.startswith("$(", index) or char == "`"):
+                    return None
+                if char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < length:
+                if command[index + 1] == "\n":
+                    return None
+                index += 2
+                continue
+            if command.startswith("$(", index) or char == "`":
+                return None
+            if command.startswith("<(", index) or command.startswith(">(", index):
+                return None
+            if char in " \t\r\n;&|<>()":
+                break
+            index += 1
+        if quote:
+            return None
+        tokens.append(("word", command[start:index], start, index))
+    return tokens
+
+
+def _literal_word(raw: str) -> Optional[str]:
+    """The value of a word with no expansion, or ``None`` when it has any."""
+    if any(char in raw for char in "$`*?[]{}"):
+        return None
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return None
+    return parts[0] if len(parts) == 1 else None
+
+
+def posix_launcher_plan(command: str, names: frozenset = frozenset({"agw"})):
+    """Find later literal launcher words a POSIX shell will run as commands.
+
+    Returns ``{"spans": [(start, end), ...], "cd": literal_dir_or_empty}`` or
+    ``None`` when the command contains anything that could change what a later
+    command word resolves to. ``cd`` is accepted only as the very first
+    statement, with one literal operand, joined by ``&&``.
+    """
+    if not isinstance(command, str) or "\x00" in command:
+        return None
+    tokens = _posix_words(command)
+    if tokens is None:
+        return None
+    spans = []
+    leading_cd = ""
+    expect_command = True
+    prefix_assignment = False
+    statement = 0
+    index = 0
+    while index < len(tokens):
+        kind, raw, start, end = tokens[index]
+        if kind == "op":
+            if raw == ";;":
+                return None
+            expect_command = True
+            prefix_assignment = False
+            statement += 1
+            index += 1
+            continue
+        if kind == "redirect":
+            # A redirect's operand is a file (or descriptor), not a command word.
+            if index + 1 >= len(tokens) or tokens[index + 1][0] != "word":
+                return None
+            index += 2
+            continue
+        if not expect_command:
+            index += 1
+            continue
+        if _POSIX_ASSIGNMENT_RE.match(raw):
+            name = raw.split("=", 1)[0]
+            if _POSIX_SENSITIVE_ASSIGNMENT_RE.fullmatch(name):
+                return None
+            prefix_assignment = True
+            index += 1
+            continue
+        if raw in _POSIX_PREFIX_WORDS:
+            index += 1
+            continue
+        if raw in _POSIX_CLOSING_WORDS:
+            expect_command = False
+            index += 1
+            continue
+        if raw == "for":
+            # `for NAME in WORDS` is data up to the next separator; the body
+            # starts at the `do` that follows it.
+            expect_command = False
+            index += 1
+            continue
+        if raw == "cd":
+            operand = tokens[index + 1] if index + 1 < len(tokens) else None
+            joiner = tokens[index + 2] if index + 2 < len(tokens) else None
+            literal = _literal_word(operand[1]) if operand and operand[0] == "word" else None
+            if (statement != 0 or prefix_assignment or leading_cd
+                    or literal is None or not literal or literal.startswith("-")
+                    or joiner is None or joiner[:2] != ("op", "&&")):
+                return None
+            leading_cd = literal
+            expect_command = False
+            index += 2
+            continue
+        if raw == "set" and index + 1 < len(tokens) \
+                and tokens[index + 1][:2] == ("word", "--"):
+            expect_command = False
+            index += 1
+            continue
+        if raw in _POSIX_TAINTING_WORDS:
+            return None
+        if raw in names:
+            if prefix_assignment:
+                return None
+            spans.append((start, end))
+        expect_command = False
+        index += 1
+    return {"spans": spans, "cd": leading_cd}
+
+
+def leading_cd_directory(command: str, cwd: str) -> str:
+    """Absolute directory of an accepted leading literal ``cd DIR &&``.
+
+    Evaluation then resolves later relative paths where the shell will. Returns
+    an empty string when there is no such prefix or it does not name an
+    existing directory (the shell's `&&` would then run nothing further).
+    """
+    plan = posix_launcher_plan(command, frozenset())
+    if not plan or not plan["cd"]:
+        return ""
+    target = os.path.expanduser(plan["cd"])
+    if not os.path.isabs(target):
+        if not cwd:
+            return ""
+        target = os.path.join(cwd, target)
+    target = os.path.realpath(os.path.abspath(target))
+    return target if os.path.isdir(target) else ""
+
+
+def _rewrite_posix_shortcuts(command: str, replacement: str,
+                             names: frozenset) -> str | None:
+    plan = posix_launcher_plan(command, names)
+    if not plan or not plan["spans"]:
+        return None
+    rewritten = command
+    for start, end in reversed(plan["spans"]):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+    return rewritten
+
+
 def rewrite_shortcut(command: str, plugin_root: str, *, platform: Optional[str] = None,
                      shell: str = "posix") -> str | None:
     """Return an exact-launcher command, or ``None`` when no shortcut matched.
 
     A literal leading command token is eligible. On Windows PowerShell, the
     same literal token is also eligible as a later top-level pipeline receiver
-    or statement command so stdin and preceding value setup are retained.
+    or statement command so stdin and preceding value setup are retained. In
+    POSIX shells a literal ``agw`` in any later command position is eligible
+    when `posix_launcher_plan` can prove nothing earlier redefines it.
     Wrappers, quoted names, paths, and ambiguous segments remain untrusted.
     """
     if not isinstance(command, str) or not plugin_root:
         return None
     platform = os.name if platform is None else platform
+    if shell != "powershell":
+        if platform == "nt":
+            posix_target = shlex.quote(
+                ntpath.join(plugin_root, "bin", "agw.cmd").replace("\\", "/")
+            )
+            names = frozenset({"agw", "agw.cmd"})
+        else:
+            posix_target = shlex.quote(os.path.join(plugin_root, "bin", "agw"))
+            names = frozenset({"agw"})
+        rewritten = _rewrite_posix_shortcuts(command, posix_target, names)
+        if rewritten is not None:
+            return rewritten
     match = _SHORTCUT.match(command)
     if not match:
         if platform == "nt" and shell == "powershell":

@@ -166,6 +166,11 @@ def main():
             )
 
     event = to_event(evaluation_payload)
+    if event.kind == events.EXEC and payload.get("tool_name") == "Bash":
+        # `cd DIR && ...`: the rest runs in DIR, so resolve it there.
+        cd_dir = launcher.leading_cd_directory(event.command, event.cwd)
+        if cd_dir:
+            event.cwd = cd_dir
     policy = engine.load_policy(PLUGIN_ROOT)
     cfg = engine.resolve_settings(policy)
     decision = engine.evaluate(event, policy, PLUGIN_ROOT)
