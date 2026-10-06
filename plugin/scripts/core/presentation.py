@@ -17,8 +17,8 @@ from .decisions import GuardrailDecision, PromptRequest, TARGET_CATEGORY, \
 UNRECOGNIZED_TOOL_RULE = "builtin:unrecognized-tool"
 
 
-def operation_fingerprint(payload: dict, evlist, policy_revision: str = "") -> str:
-    """Bind an approval to the exact operation without displaying raw input."""
+def exact_operation(payload: dict, evlist, policy_revision: str = "") -> str:
+    """Canonical operation for authenticated full review; never an audit field."""
     material = {
         "tool": payload.get("tool_name", ""),
         "cwd": payload.get("cwd", ""),
@@ -29,9 +29,13 @@ def operation_fingerprint(payload: dict, evlist, policy_revision: str = "") -> s
         ],
         "policy_revision": str(policy_revision or ""),
     }
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"),
-                         ensure_ascii=False, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return json.dumps(material, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def operation_fingerprint(payload: dict, evlist, policy_revision: str = "") -> str:
+    return hashlib.sha256(exact_operation(
+        payload, evlist, policy_revision).encode("utf-8")).hexdigest()
 
 
 _COPY_BY_RULE = {
@@ -668,6 +672,8 @@ def build_generic_prompt(decision: GuardrailDecision, payload: dict,
             "operation described above is what you intended."
         ),
         safeguard="",
+        exact_operation=exact_operation(payload, evlist, decision.policy_revision),
+        session_id=str(payload.get("session_id") or ""),
         event_id=event_id,
         operation_fingerprint=operation_fingerprint(
             payload, evlist, decision.policy_revision
@@ -696,6 +702,8 @@ def build_prompt(decision: GuardrailDecision, payload: dict, evlist) -> PromptRe
         reason=reason,
         consequence=consequence,
         safeguard=safeguard,
+        exact_operation=exact_operation(payload, evlist, decision.policy_revision),
+        session_id=str(payload.get("session_id") or ""),
         event_id=event_id,
         operation_fingerprint=operation_fingerprint(
             payload, evlist, decision.policy_revision

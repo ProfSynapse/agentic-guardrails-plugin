@@ -474,16 +474,12 @@ def main(approval_provider=None):
                     ("Approval could not be safely obtained, so this action was blocked.")
 
     out = {}
-    refusal_metadata = None
     if action in (events.ALLOW, events.ASK, events.DENY):
         if action == events.DENY:
             from core.decisions import GuardrailDecision
             denial_decision = GuardrailDecision.from_legacy(decision)
             denial_decision.action = events.DENY
             reason = presentation.build_denial_feedback(
-                denial_decision, approval_outcome, evlist
-            )
-            refusal_metadata = presentation.build_refusal_metadata(
                 denial_decision, approval_outcome, evlist
             )
         else:
@@ -494,8 +490,8 @@ def main(approval_provider=None):
             "hookEventName": "PreToolUse",
             "permissionDecision": action,
             "permissionDecisionReason": reason or f"rule {decision.rule_id}"}}
-        if refusal_metadata is not None:
-            out["hookSpecificOutput"]["agwRefusal"] = refusal_metadata
+        # Codex rejects unknown hook fields. Structured refusal detail already
+        # travels inside permissionDecisionReason; never add agwRefusal here.
     elif decision.warnings:
         out = {"systemMessage": "; ".join(decision.warnings)}
 

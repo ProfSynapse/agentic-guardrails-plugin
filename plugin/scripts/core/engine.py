@@ -19,7 +19,7 @@ import re
 import shutil
 from typing import Optional
 
-from . import agw_contract, gitargs, launcher, policy_health, policycache, \
+from . import action_contracts, agw_contract, gitargs, launcher, policy_health, policycache, \
     powershell_bind, profiles as prof, remediation
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
@@ -431,6 +431,8 @@ def _policy_from_document(policy: Policy, document: dict) -> None:
     settings = document["settings"]
     if not isinstance(settings, dict):
         raise TypeError("cached policy settings is not a mapping")
+    if "action_contracts" in settings:
+        action_contracts.validate(settings["action_contracts"])
     revision = document["revision"]
     baseline_revision = document["baseline_revision"]
     if not (isinstance(revision, str) and isinstance(baseline_revision, str)):
@@ -492,6 +494,8 @@ def _validate_pack(data, source_kind: str):
     settings = data.get("settings", {})
     if settings is not None and not isinstance(settings, dict):
         raise TypeError("policy settings must be a mapping")
+    if settings and "action_contracts" in settings:
+        action_contracts.validate(settings["action_contracts"])
     for rule in data.get("commands") or []:
         if not isinstance(rule.get("pattern"), str) or not rule["pattern"]:
             raise TypeError("command pattern must be a non-empty string")
@@ -568,6 +572,8 @@ def evaluate(event: ToolEvent, policy: Policy, plugin_root: str = "") -> Decisio
             "builtin:patch-targets-unknown")
     else:
         decision = Decision()
+    if event.kind == MCP and "action_contracts" in policy.settings:
+        decision = action_contracts.evaluate(event, policy.settings).merge(decision)
     if policy.health == policy_health.UNAVAILABLE:
         decision = Decision(
             DENY,

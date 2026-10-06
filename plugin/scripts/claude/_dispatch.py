@@ -73,7 +73,7 @@ def _ask(reason):
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
+                "permissionDecision": ("deny" if os.environ.get("AGW_APPROVAL_PROVIDER", "").lower() == "linux-socket" else "ask"),
                 "permissionDecisionReason": (
                     "agentic-guardrails %s; failing closed. "
                     "Review this operation manually." % reason

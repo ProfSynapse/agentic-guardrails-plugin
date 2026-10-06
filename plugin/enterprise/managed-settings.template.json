@@ -2,7 +2,7 @@
   "$comment": "Managed settings template for fleet deployment. Place at: /Library/Application Support/ClaudeCode/managed-settings.json (macOS), /etc/claude-code/managed-settings.json (Linux/WSL), or C:\\Program Files\\ClaudeCode\\managed-settings.json (Windows). Managed settings cannot be overridden by users or projects. Replace <ORG-MARKETPLACE-URL> with your internal marketplace git URL or path.",
 
   "extraKnownMarketplaces": {
-    "synaptic-guardrails": {
+    "agentic-guardrails-plugin": {
       "source": {
         "source": "git",
         "url": "<ORG-MARKETPLACE-URL>"
@@ -11,7 +11,7 @@
   },
 
   "enabledPlugins": {
-    "agentic-guardrails@synaptic-guardrails": true
+    "agentic-guardrails@agentic-guardrails-plugin": true
   },
 
   "allowManagedHooksOnly": false,

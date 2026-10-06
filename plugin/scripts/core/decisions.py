@@ -37,6 +37,7 @@ class GuardrailDecision:
     presentation_context: DecisionContext = DecisionContext.UNKNOWN
     presentation_details: dict = field(default_factory=dict)
     safe_next: object = None
+    fresh_approval: bool = False
 
     def __post_init__(self):
         self.enforcement_class = normalize_enforcement_class(
@@ -76,6 +77,7 @@ class GuardrailDecision:
                 getattr(decision, "presentation_details", {}) or {}
             ),
             safe_next=getattr(decision, "safe_next", None),
+            fresh_approval=getattr(decision, "fresh_approval", False),
         )
 
 
@@ -95,6 +97,8 @@ class PromptRequest:
     cancel_label: str = "Cancel (recommended)"
     default_choice: str = "cancel"
     technical_details: str = ""
+    exact_operation: str = ""
+    session_id: str = ""
 
     def validation_problem(self) -> str:
         """Return why this request cannot support informed consent."""

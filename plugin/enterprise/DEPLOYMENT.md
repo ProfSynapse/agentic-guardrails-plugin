@@ -14,7 +14,7 @@ Sanity check from any machine:
 ```bash
 claude  # then:
 /plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
-/plugin install agentic-guardrails@synaptic-guardrails
+/plugin install agentic-guardrails@agentic-guardrails-plugin
 ```
 
 If the marketplace UI reports a sync failure for the owner/repo shorthand, use

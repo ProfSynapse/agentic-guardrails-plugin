@@ -147,7 +147,12 @@ def test_codex_routes_the_unresolved_path_to_its_approval_provider(project,
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny"     # headless provider declines
-    assert out["agwRefusal"]["rule_id"] == "builtin:powershell-path-unresolved"
+    # Codex rejects unknown hook fields, so the structured refusal travels only
+    # inside permissionDecisionReason (see docs/CODEX_WIRE_COMPATIBILITY.md).
+    assert "agwRefusal" not in out
+    marker = "Machine-readable refusal: "
+    refusal = json.loads(out["permissionDecisionReason"].split(marker, 1)[1])
+    assert refusal["rule_id"] == "builtin:powershell-path-unresolved"
 
 
 def test_a_literal_write_is_still_untouched(project, agw_home):
