@@ -42,7 +42,8 @@ def test_schema_serializes_list_defaults_for_run():
     assert by_name["output"]["default"] == []
     # No explicit default: the limit is the fixed unreviewed bound (300 s) or a
     # trusted workflow's reviewed limits.timeout_seconds, resolved at run time.
-    assert by_name["timeout_seconds"]["default"] is None
+    assert "timeout_seconds" in by_name
+    assert by_name["timeout_seconds"].get("default") is None
 
 
 def test_schema_projects_plan_create_and_apply_contracts():
