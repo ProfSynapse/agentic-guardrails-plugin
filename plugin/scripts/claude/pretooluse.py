@@ -47,6 +47,13 @@ def _emit(out):
     untouched unless the whole object is ready.
     """
     global _EMITTED
+    if os.environ.get("AGW_APPROVAL_PROVIDER", "").lower() == "linux-socket":
+        specific = out.get("hookSpecificOutput", {})
+        if specific.get("permissionDecision") == "ask":
+            out = dict(out)
+            out["hookSpecificOutput"] = dict(specific,
+                permissionDecision="deny",
+                permissionDecisionReason="Owner review was not completed; operation blocked.")
     text = json.dumps(out)
     _EMITTED = True
     sys.stdout.write(text)
@@ -357,6 +364,23 @@ def main():
             # turn every shipped `action: ask` rule into a wall with no door.
             action = events.DENY
             approval_outcome = "prompt-incomplete"
+
+    # Opt-in Linux review must resolve outside Claude, including Auto mode.
+    # No reviewer, refusal, expiry or provider failure may fall back to host ASK.
+    if action == events.ASK and os.environ.get("AGW_APPROVAL_PROVIDER", "").lower() == "linux-socket":
+        try:
+            response = approvals.request_approval(
+                prompt_decision, prompt_request, approvals.default_provider(100)
+            )
+        except Exception:
+            response = approvals.ApprovalResponse(False, "provider-error")
+        approval_outcome = response.outcome
+        action = events.DEFER if response.authorizes() else events.DENY
+        _audit("pretooluse-approval", {
+            "category": "approval", "outcome": approval_outcome,
+            "rule_code": decision.rule_id, "platform": "claude",
+            "policy_revision": decision.policy_revision,
+        })
 
     if action == events.ASK and decision.memo_key and cfg.get("session_memory"):
         fingerprint = presentation.operation_fingerprint(

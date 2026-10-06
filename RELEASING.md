@@ -145,8 +145,8 @@ release must bump the version.
 ## How users update
 
 ```
-/plugin marketplace update synaptic-guardrails
-/plugin install agentic-guardrails@synaptic-guardrails
+/plugin marketplace update agentic-guardrails-plugin
+/plugin install agentic-guardrails@agentic-guardrails-plugin
 ```
 
 `marketplace update` re-reads `marketplace.json` from `main`; after step 5 it

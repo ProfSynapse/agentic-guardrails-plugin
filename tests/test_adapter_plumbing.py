@@ -72,7 +72,15 @@ def test_a_capacity_denial_names_the_cap_and_the_shortfall(platform, tmp_path,
     )
     assert out.get("permissionDecision") == "deny"
     reason = out["permissionDecisionReason"]
-    assert out["agwRefusal"]["reason_code"] == "reclaim-recovery-cache"
+    # Codex rejects unknown hook fields, so its structured refusal travels only
+    # inside the reason text; Claude also carries it as agwRefusal.
+    marker = "Machine-readable refusal: "
+    refusal = json.loads(reason.split(marker, 1)[1])
+    assert refusal["reason_code"] == "reclaim-recovery-cache"
+    if platform == "codex":
+        assert "agwRefusal" not in out
+    else:
+        assert out["agwRefusal"] == refusal
     instruction = _safe_next(reason)
     assert "The cap is 512 bytes" in instruction, instruction
     assert "this change needs" in instruction, instruction

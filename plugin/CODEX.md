@@ -11,11 +11,24 @@ see [`../docs/HOST_PARITY.md`](../docs/HOST_PARITY.md).
 | Capability | Claude Code | Codex |
 |---|---|---|
 | Pre/Post-tool hooks | `PreToolUse` / `PostToolUse` | same event names + JSON schema |
-| Block / ask / allow | `permissionDecision` | identical |
+| Block / ask / allow | `permissionDecision` | deny/allow; ASK needs the plugin's approval provider |
 | Session context | `SessionStart` | identical |
 | Skill | `skills/agentic-guardrails/SKILL.md` | compact router; loads safety references progressively |
 | Command discovery | CLI `--help` hierarchy | progressively scoped; no duplicated prompt catalog |
 | `agw` CLI | platform-neutral `agw` short form | same |
+
+### Strict response wire schema
+
+Codex 0.160.0 rejects unknown response fields, including fields nested inside
+`hookSpecificOutput`. The adapter emits refusal details inside the supported
+`permissionDecisionReason` string. Adding a custom `agwRefusal` member invalidated
+a deny response in a native synthetic test; the host then ran the operation.
+The corrected response passed absent-reviewer, decline and fresh-approval checks.
+Schema conformity is essential to denial enforcement; a generated deny string
+alone does not prove the host blocked execution. Regression tests capture the
+pinned embedded host schema and validate real adapter outputs against it.
+Claude 2.1.285 also passed the synthetic review matrix. These tested versions do
+not establish compatibility with every future host or protect unrelated clients.
 
 ### Two tool vocabularies, one set of guardrails
 
@@ -61,7 +74,8 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
 1. **Add the marketplace and install** - from a shell:
 
    ```bash
-   codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
+     codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
+     codex plugin add agentic-guardrails@agentic-guardrails
    ```
 
    Then inside Codex run `/plugins` and install **Agentic Guardrails**. Codex
@@ -115,6 +129,16 @@ receive no shortcut expansion, and neither does `write_stdin`: its `chars` are
 keystrokes for a process already running, not a command line to rewrite.
 
 ## Verify before relying on it
+
+On Linux and macOS the native Guardrails approval provider is unavailable, so
+ASK decisions deny. Do not replace them with a hook-level `ask`: Codex currently
+does not enforce that response. Missing or broken PreToolUse adapters must also
+return `deny`. The [official hook contract](https://learn.chatgpt.com/docs/hooks)
+documents these host semantics.
+
+The tests in [Linux validation](../docs/LINUX_VALIDATION.md) distinguish adapter
+behavior from actual host interception. A passing subprocess test or plugin
+install is not proof that an existing session invokes trusted hooks.
 
 `apply_patch` hook interception landed relatively recently in Codex (it was
 broken until ~April 2026, [openai/codex#16732]). Smoke-test on your installed

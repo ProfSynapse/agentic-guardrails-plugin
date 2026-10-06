@@ -395,7 +395,7 @@ def request_approval(decision: GuardrailDecision, request: PromptRequest,
     # Without a host identity there is no safe proof that two calls are the same
     # event, so intentionally skip de-duplication.
     key = ((request.event_id, request.operation_fingerprint, request.policy_revision)
-           if request.event_id else None)
+           if request.event_id and not decision.fresh_approval else None)
     now = time.monotonic()
     if key:
         with _CACHE_LOCK:
@@ -428,6 +428,13 @@ from .pending_approvals import (  # noqa: E402,F401
 
 
 def default_provider(timeout_s: int = 100) -> ApprovalProvider:
+    if os.environ.get("AGW_APPROVAL_PROVIDER", "").lower() == "linux-socket":
+        from .linux_review import SocketApprovalProvider
+        try:
+            uid = int(os.environ.get("AGW_REVIEWER_UID", ""))
+        except ValueError:
+            return HeadlessApprovalProvider()
+        return SocketApprovalProvider(os.environ.get("AGW_REVIEW_SOCKET", ""), uid, timeout_s)
     if os.environ.get("AGW_APPROVAL_PROVIDER", "").lower() == "headless":
         return HeadlessApprovalProvider()
     return NativeApprovalProvider(timeout_s)

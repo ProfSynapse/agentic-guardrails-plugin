@@ -28,7 +28,10 @@ def run_hook(payload, env_extra=None):
     result = subprocess.run([sys.executable, PRE], input=json.dumps(payload),
                             capture_output=True, text=True, env=env, timeout=30)
     assert result.returncode == 0, f"hook crashed the wrapper: {result.stderr}"
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+    output = json.loads(result.stdout) if result.stdout.strip() else {}
+    from codex_wire_contract import validate_wire
+    validate_wire(output)
+    return output
 
 
 def _decision(out):
@@ -1133,8 +1136,9 @@ def test_codex_unrecognized_tool_never_silently_allows(payload, label, tmp_path)
     assert result.stdout.strip(), "unrecognized tool produced no decision"
     out = json.loads(result.stdout)
     assert _decision(out) == "deny"
-    assert out["hookSpecificOutput"]["agwRefusal"]["rule_id"] == \
-        "builtin:unrecognized-tool"
+    specific = out["hookSpecificOutput"]
+    assert set(specific) <= {"hookEventName", "permissionDecision", "permissionDecisionReason", "additionalContext", "updatedInput"}
+    assert "builtin:unrecognized-tool" in specific["permissionDecisionReason"]
     assert "agentic-guardrails:" in result.stderr
     assert label in result.stderr
     assert "update the plugin" in result.stderr
@@ -1319,8 +1323,9 @@ def test_native_uninspectable_call_fails_closed(payload, fragment, tmp_path):
     assert result.stdout.strip(), "uninspectable call produced no decision"
     out = json.loads(result.stdout)
     assert _decision(out) == "deny"
-    assert out["hookSpecificOutput"]["agwRefusal"]["rule_id"] == \
-        "builtin:unrecognized-tool"
+    specific = out["hookSpecificOutput"]
+    assert set(specific) <= {"hookEventName", "permissionDecision", "permissionDecisionReason", "additionalContext", "updatedInput"}
+    assert "builtin:unrecognized-tool" in specific["permissionDecisionReason"]
     assert "agentic-guardrails:" in result.stderr
     assert fragment in result.stderr
 

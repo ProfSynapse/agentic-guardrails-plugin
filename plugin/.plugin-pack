@@ -34,6 +34,7 @@ scripts/codex/posttooluse.py
 scripts/codex/pretooluse.py
 scripts/codex/sessionstart.py
 scripts/core/__init__.py
+scripts/core/action_contracts.py
 scripts/core/agw_contract.py
 scripts/core/approvals.py
 scripts/core/archive_transactions.py
@@ -46,6 +47,7 @@ scripts/core/events.py
 scripts/core/gitargs.py
 scripts/core/launcher.py
 scripts/core/lazyimport.py
+scripts/core/linux_review.py
 scripts/core/mcpshell.py
 scripts/core/miniyaml.py
 scripts/core/mutations.py

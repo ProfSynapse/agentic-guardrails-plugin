@@ -7,9 +7,10 @@ self-locating shim that finds the plugin's ``scripts/codex`` directory and hands
 off here, so all error handling lives in a normal, testable file rather than an
 inline ``python -c`` string.
 
-Guarantee: any uncaught failure degrades to an ASK decision (for PreToolUse) and
-a clean ``exit 0`` - never a non-zero crash, which the host could read as
-block-everything or, worse, fail open.
+PreToolUse startup failures emit DENY and exit 0. Codex does not enforce a
+hook-level ASK: it reports an unsupported response and continues the tool call.
+The dispatcher must therefore use the same denial contract as pretooluse.py,
+including when that adapter is missing or cannot be imported.
 """
 import json
 import os
@@ -57,8 +58,8 @@ def _route_bytecode_cache():
         pass
 
 
-def _ask(reason):
-    """Emit a PreToolUse ASK decision. No-op for events that cannot block."""
+def _deny(reason):
+    """Emit a PreToolUse DENY decision. No-op for events that cannot block."""
     if EVENT != "pretooluse":
         return
     sys.stderr.write("agentic-guardrails: %s\n" % reason)
@@ -69,10 +70,11 @@ def _ask(reason):
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
+                "permissionDecision": "deny",
                 "permissionDecisionReason": (
                     "agentic-guardrails %s; failing closed. "
-                    "Review this operation manually." % reason
+                    "The requested operation is blocked. Repair the hook before "
+                    "retrying; do not bypass Guardrails." % reason
                 ),
             }
         }
@@ -84,7 +86,7 @@ def _ask(reason):
 def main():
     target = os.path.join(_HERE, EVENT + ".py")
     if not os.path.isfile(target):
-        _ask("could not find its adapter for %s" % EVENT)
+        _deny("could not find its adapter for %s" % EVENT)
         return
     try:
         _configure_utf8_stdio()
@@ -94,7 +96,7 @@ def main():
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 - last-resort fail-closed net
-        _ask("hit an internal error (%s)" % type(exc).__name__)
+        _deny("hit an internal error (%s)" % type(exc).__name__)
 
 
 if __name__ == "__main__":

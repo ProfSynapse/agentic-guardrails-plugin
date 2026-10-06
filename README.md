@@ -44,7 +44,7 @@ don't fire there. Tracking:
 
 ```
 /plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
-/plugin install agentic-guardrails@synaptic-guardrails
+/plugin install agentic-guardrails@agentic-guardrails-plugin
 ```
 
 If Claude's marketplace UI rejects `ProfSynapse/agentic-guardrails-plugin`, use
@@ -54,13 +54,20 @@ the full GitHub URL above instead of the owner/repo shorthand.
 
 ```bash
 codex plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin --ref main
+codex plugin add agentic-guardrails@agentic-guardrails
 ```
 
-Then run `/plugins` inside Codex, install **Agentic Guardrails**, and approve its
-hooks in the host's trust UI (`/hooks` in Codex CLI; desktop may show a trust
+Alternatively, install **Agentic Guardrails** through `/plugins` inside Codex.
+Approve its hooks in the host's trust UI (`/hooks` in Codex CLI; desktop may show a trust
 dialog). The full walkthrough — including the `apply_patch` deletion
 guard and a smoke test to confirm interception on your build — is in
 [plugin/CODEX.md](plugin/CODEX.md).
+
+On Linux and macOS, Codex actions requiring Guardrails approval currently deny:
+the bundled native approval provider supports Windows only. Installation alone
+does not prove interception in a host or an existing session. Review hook trust
+and perform the smoke tests before relying on protection. See
+[Linux validation and deployment boundaries](docs/LINUX_VALIDATION.md).
 
 ### Requirements
 
@@ -91,8 +98,8 @@ reject edits that unexpectedly rewrite unrelated parts of an Office file.
 New versions ship as a `version` bump on the default branch. Clients cache by
 that string, so an update only lands once it changes:
 
-- **Claude Code:** `/plugin marketplace update synaptic-guardrails`, then
-  `/plugin install agentic-guardrails@synaptic-guardrails`.
+- **Claude Code:** `/plugin marketplace update agentic-guardrails-plugin`, then
+  `/plugin install agentic-guardrails@agentic-guardrails-plugin`.
 - **Codex desktop:** open Plugins and use **Refresh** on the imported marketplace
   or workspace plugin when that control is available, then restart Codex. A
   personal/local marketplace may refresh automatically at startup and may not

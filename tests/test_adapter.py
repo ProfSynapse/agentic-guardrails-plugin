@@ -946,8 +946,8 @@ def test_fail_closed_handler_never_appends_a_second_object(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("host", ["claude", "codex"])
-def test_dispatcher_ask_is_one_write(host, monkeypatch):
-    """The dispatcher's last-resort ASK runs when an adapter could not even
+def test_dispatcher_failure_is_one_write(host, monkeypatch):
+    """The dispatcher's last-resort decision runs when an adapter could not even
     start, so it is the one decision that must never arrive half-written."""
     import importlib.util
 
@@ -959,11 +959,12 @@ def test_dispatcher_ask_is_one_write(host, monkeypatch):
 
     recorder = _RecordingStdout()
     monkeypatch.setattr("sys.stdout", recorder)
-    module._ask("hit an internal error (ImportError)")
+    emit = module._deny if host == "codex" else module._ask
+    emit("hit an internal error (ImportError)")
     assert len(recorder.writes) == 1, recorder.writes
     assert recorder.flushes >= 1
     decision = json.loads(recorder.writes[0])["hookSpecificOutput"]
-    assert decision["permissionDecision"] == "ask"
+    assert decision["permissionDecision"] == ("deny" if host == "codex" else "ask")
     assert "failing closed" in decision["permissionDecisionReason"]
 
 

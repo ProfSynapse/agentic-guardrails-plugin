@@ -39,7 +39,7 @@ don't fire there. Tracking:
 
 ```
 /plugin marketplace add https://github.com/ProfSynapse/agentic-guardrails-plugin.git
-/plugin install agentic-guardrails@synaptic-guardrails
+/plugin install agentic-guardrails@agentic-guardrails-plugin
 ```
 
 If Claude's marketplace UI rejects `ProfSynapse/agentic-guardrails-plugin`, use
@@ -84,8 +84,8 @@ reject edits that unexpectedly rewrite unrelated parts of an Office file.
 New versions ship as a `version` bump on the default branch. Clients cache by
 that string, so an update only lands once it changes:
 
-- **Claude Code:** `/plugin marketplace update synaptic-guardrails`, then
-  `/plugin install agentic-guardrails@synaptic-guardrails`.
+- **Claude Code:** `/plugin marketplace update agentic-guardrails-plugin`, then
+  `/plugin install agentic-guardrails@agentic-guardrails-plugin`.
 - **Codex desktop:** open Plugins and use **Refresh** on the imported marketplace
   or workspace plugin when that control is available, then restart Codex. A
   personal/local marketplace may refresh automatically at startup and may not

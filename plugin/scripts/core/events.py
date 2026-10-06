@@ -119,6 +119,7 @@ class Decision:
     presentation_details: dict = field(default_factory=dict)
     # Inert structured remediation; never an authorization to execute.
     safe_next: object = None
+    fresh_approval: bool = False
 
     def __post_init__(self):
         self.enforcement_class = normalize_enforcement_class(
@@ -134,7 +135,8 @@ class Decision:
         winner = self if _SEVERITY[self.action] >= _SEVERITY[other.action] else other
         merged = Decision(
             winner.action, winner.reason, winner.rule_id,
-            self.warnings + other.warnings, winner.memo_key,
+            self.warnings + other.warnings,
+            None if self.fresh_approval or other.fresh_approval else winner.memo_key,
             winner.policy_revision or self.policy_revision or other.policy_revision,
             winner.policy_health or self.policy_health or other.policy_health,
             strongest_enforcement_class(
@@ -143,6 +145,7 @@ class Decision:
             winner.presentation_context,
             dict(winner.presentation_details),
             winner.safe_next,
+            self.fresh_approval or other.fresh_approval,
         )
         return merged
 
