@@ -70,6 +70,11 @@ MAX_SCRIPT_SNAPSHOT_COMPRESSED_BYTES = 128 * 1024
 MAX_REFRESH_PLAN_BYTES = 512 * 1024
 MAX_REFRESH_DIFF_BYTES = 128 * 1024
 MAX_REFRESH_DIFF_LINES = 2000
+# A reviewed workflow may run longer than the untrusted `agw run` default
+# (agw/execution.py DEFAULT_TIMEOUT_SECONDS). The value lives inside the hashed
+# manifest, so raising it is a manifest change that needs a new explicit trust.
+MAX_WORKFLOW_TIMEOUT_SECONDS = 4 * 60 * 60
+LIMIT_KEYS = {"timeout_seconds"}
 REFRESH_PLAN_TTL_NS = 30 * 60 * 1_000_000_000
 
 _ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
@@ -299,7 +304,7 @@ def _validate_parameters(value, manifest_path: str) -> dict:
                 "type": "integer", "minimum": minimum, "maximum": maximum,
             }
         elif kind == "path":
-            _exact_keys(spec, {"type", "root", "must_exist", "kind"}, label)
+            _exact_keys(spec, {"type", "root", "must_exist", "kind", "pattern"}, label)
             root = _validate_template(
                 spec.get("root"), f"{label}.root", allow_args=False,
                 allow_parameters=False,
@@ -315,11 +320,41 @@ def _validate_parameters(value, manifest_path: str) -> dict:
                 "type": "path", "root": root, "must_exist": must_exist,
                 "kind": path_kind,
             }
+            if "pattern" in spec:
+                # Optional narrowing: the value's path relative to its root,
+                # with '/' separators, must fully match (e.g. one project's
+                # `renders/*.mp4`). Absent stays absent for existing records.
+                normalized[name]["pattern"] = _safe_regex(
+                    spec.get("pattern"), f"{label}.pattern"
+                )
         else:
             raise WorkflowError(
                 f"{label}.type must be enum, enum-file, regex, integer, or path"
             )
     return normalized
+
+
+def _validate_limits(value) -> dict:
+    """Normalize a manifest's reviewed execution limits."""
+    if not isinstance(value, dict) or not value:
+        raise WorkflowError("limits must be an object with at least one limit")
+    _exact_keys(value, LIMIT_KEYS, "limits")
+    timeout = value.get("timeout_seconds")
+    if (not isinstance(timeout, int) or isinstance(timeout, bool)
+            or not 1 <= timeout <= MAX_WORKFLOW_TIMEOUT_SECONDS):
+        raise WorkflowError(
+            "limits.timeout_seconds must be a whole number of seconds from 1 to "
+            f"{MAX_WORKFLOW_TIMEOUT_SECONDS}"
+        )
+    return {"timeout_seconds": timeout}
+
+
+def workflow_timeout_seconds(manifest: dict) -> Optional[int]:
+    """The reviewed run time limit, or ``None`` to use the untrusted default."""
+    limits = manifest.get("limits") if isinstance(manifest, dict) else None
+    if not limits:
+        return None
+    return _validate_limits(limits)["timeout_seconds"]
 
 
 def _ordinary_script(path: str) -> str:
@@ -346,9 +381,12 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
     }
     if schema == PARAMETERIZED_SCHEMA:
         manifest_keys.add("parameters")
+    if schema in {MANIFEST_SCHEMA, PARAMETERIZED_SCHEMA}:
+        manifest_keys.add("limits")
     _exact_keys(
         value, manifest_keys, "workflow manifest",
     )
+    limits = _validate_limits(value["limits"]) if "limits" in value else None
     workflow_id = value.get("id")
     if not isinstance(workflow_id, str) or not _ID_RE.fullmatch(workflow_id):
         raise WorkflowError("workflow id must be 1-128 lowercase letters, digits, '.', '_' or '-'")
@@ -497,8 +535,23 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
         _exact_keys(item, {"path", "patterns"}, f"observed_roots[{index}]")
         root = _validate_template(
             item.get("path"), f"observed_roots[{index}].path", allow_args=False,
-            allow_parameters=False,
+            allow_parameters=schema == PARAMETERIZED_SCHEMA,
         )
+        # A per-run observed root (`.../{param:project}/renders`) may only come
+        # from a reviewed `path` parameter, whose value is already confined to
+        # its own root; the resolved root must still lie inside allowed_roots.
+        for match in _PLACEHOLDER_RE.finditer(root):
+            token = match.group(1)
+            if not token.startswith("param:"):
+                continue
+            pieces = token.split(":")
+            spec = parameters.get(pieces[1], {})
+            if len(pieces) != 2 or spec.get("type") != "path" \
+                    or spec.get("kind") == "file":
+                raise WorkflowError(
+                    f"observed_roots[{index}].path may only use an unmodified "
+                    "directory-or-any `path` parameter"
+                )
         root = _compile_machine_template(root)
         patterns = item.get("patterns", [])
         if not isinstance(patterns, list):
@@ -534,6 +587,9 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
         "allowed_roots": normalized_roots,
         "outputs": normalized_outputs,
         "observed_roots": normalized_observed,
+        # Absent limits stay absent so records trusted before limits existed
+        # normalize, compare, and authenticate exactly as they always did.
+        **({"limits": limits} if limits is not None else {}),
     }
 
 
@@ -562,6 +618,7 @@ def validate_manifest_file(path: str, expected_manifest_hash: str = "") -> dict:
         "parameter_count": len(manifest.get("parameters", {})),
         "outputs": len(manifest["outputs"]),
         "observed_roots": len(manifest.get("observed_roots", [])),
+        "timeout_seconds": workflow_timeout_seconds(manifest),
         "manifest": manifest,
     }
 
@@ -605,6 +662,7 @@ def initialize_manifest(
     expected: Optional[list[str]] = None,
     allowed_roots: Optional[list[str]] = None,
     description: str = "",
+    timeout_seconds: Optional[int] = None,
 ) -> dict:
     """Build and validate a v2 manifest; the caller owns guarded publication."""
     script_path = _ordinary_script(script)
@@ -641,6 +699,7 @@ def initialize_manifest(
         outputs=outputs,
         expected_states=expected,
         allowed_roots=roots,
+        timeout_seconds=timeout_seconds,
     )
     normalized = validate_manifest(manifest, manifest_path)
     return {"manifest": manifest, "normalized": normalized}
@@ -657,9 +716,10 @@ def _build_v2_manifest(
     outputs: list[str],
     expected_states: list[str],
     allowed_roots: list[str],
+    timeout_seconds: Optional[int] = None,
 ) -> dict:
     """Assemble a v2 manifest; validation remains the caller's responsibility."""
-    return {
+    manifest = {
         "schema": MANIFEST_SCHEMA,
         "id": workflow_id,
         "description": description,
@@ -676,6 +736,9 @@ def _build_v2_manifest(
         ],
         "observed_roots": [],
     }
+    if timeout_seconds is not None:
+        manifest["limits"] = {"timeout_seconds": timeout_seconds}
+    return manifest
 
 
 def _explicit_string_list(value, label: str) -> list[str]:
@@ -707,6 +770,7 @@ def build_workflow_proposal(
     allowed_roots: list[str],
     expected_states: list[str],
     description: str = "",
+    timeout_seconds: Optional[int] = None,
 ) -> dict:
     """Return an inert, validated v2 proposal for one exact command.
 
@@ -735,6 +799,7 @@ def build_workflow_proposal(
         outputs=output_list,
         expected_states=expected_list,
         allowed_roots=root_list,
+        timeout_seconds=timeout_seconds,
     )
     # An absolute script path keeps the proposal valid regardless of where a
     # caller later chooses to serialize it.  The synthetic path is never used
@@ -1127,6 +1192,7 @@ def _trust_manifest_locked(path: str, expected_manifest_hash: str,
         "workflow": manifest["id"],
         "manifest_sha256": actual, "script": manifest["command"]["script"],
         "script_sha256": manifest["command"]["script_sha256"],
+        "timeout_seconds": workflow_timeout_seconds(manifest),
         "provenance": provenance,
     }
 
@@ -1192,6 +1258,7 @@ def list_trusted() -> list[dict]:
                 "runtime": manifest["command"]["runtime"],
                 "script": manifest["command"]["script"], "verified": True,
                 "provenance_available": record.get("schema") == RECORD_SCHEMA,
+                "timeout_seconds": workflow_timeout_seconds(manifest),
             })
         except (OSError, ValueError, TypeError, WorkflowError):
             result.append({"record": name, "verified": False, "error": "record verification failed"})
@@ -1750,6 +1817,14 @@ def _validate_runtime_parameter(name: str, value, spec: dict, context: dict) -> 
                 f"{label} resolves outside its reviewed root",
                 {"parameter": name, "path": candidate, "root": root},
             )
+        if spec.get("pattern"):
+            relative = os.path.relpath(candidate, root).replace("\\", "/")
+            if re.fullmatch(spec["pattern"], relative) is None:
+                raise WorkflowTrustError(
+                    f"{label} does not match its reviewed path pattern",
+                    {"parameter": name, "relative_path": relative,
+                     "pattern": spec["pattern"]},
+                )
         if spec["must_exist"] and not os.path.lexists(candidate):
             raise WorkflowTrustError(
                 f"{label} does not exist", {"parameter": name, "path": candidate},
@@ -1943,6 +2018,7 @@ def resolve_run(workflow_id: str, command: list[str], cwd: str,
         "manifest_sha256": record["manifest_sha256"],
         "script_sha256": normalized["script_sha256"],
         "parameters": parameter_values,
+        "timeout_seconds": workflow_timeout_seconds(manifest),
     }
 
 
@@ -2004,6 +2080,7 @@ def _parameter_constraint_metadata(spec: dict) -> dict:
     return {
         "type": kind, "root": spec["root"],
         "must_exist": spec["must_exist"], "kind": spec["kind"],
+        **({"pattern": spec["pattern"]} if spec.get("pattern") else {}),
     }
 
 

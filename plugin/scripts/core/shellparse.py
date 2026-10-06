@@ -122,6 +122,9 @@ class SimpleCommand:
     argv: list
     raw: str = ""
     dialect: str = DIALECT_POSIX
+    # `NAME=value` words that prefixed this command (`PATH=/x agw ...`). They
+    # change the command's environment, so a launcher identity check needs them.
+    assignments: list = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -152,8 +155,11 @@ class ParseResult:
     # contents (`powershell -File wipe.ps1`). The engine asks about these rather
     # than treating an uninspectable body as harmless.
     uninspected: list = field(default_factory=list)
+    # Every `NAME=value` word seen in a command position, whether it prefixed a
+    # command or stood alone as its own statement.
+    assignments: list = field(default_factory=list)
 
-FLAG_EVAL = "eval"                    # eval / source of dynamic strings
+FLAG_EVAL = "eval"                   # eval / source of dynamic strings
 FLAG_INDIRECT = "indirect-command"    # command name comes from a variable/substitution
 FLAG_DECODE_PIPE = "decode-pipe"      # base64/xxd/openssl output piped into a shell
 FLAG_DOWNLOAD_PIPE = "download-pipe"  # curl/wget piped into a shell
@@ -172,6 +178,11 @@ _PWSH_SUBEXPRESSION_RE = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)")
 # endings, and a heredoc the regex does not see is a script body the engine
 # never inspects (its lines were read as a second command instead).
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\r?\n(.*?)\r?\n\1", re.DOTALL)
+_HEREDOC_PLACEHOLDER = " HEREDOC_BODY"
+_POSIX_HEREDOC_START_RE = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
+# Shell reserved words that introduce a command without being one. `do rm x`
+# runs `rm`; reading `do` as the command name hid every loop body.
+_POSIX_RESERVED_PREFIXES = {"do", "then", "else", "elif", "if", "while", "until", "!"}
 _PWSH_LITERAL_ASSIGN_RE = re.compile(
     r"(?im)(?P<prefix>^|[;\n])\s*\$(?P<name>(?:env:)?[A-Za-z_][A-Za-z0-9_]*)"
     r"\s*=\s*(?P<value>'[^']*'|\"[^\"]*\"|[^\s;\n]+)\s*(?=;|\n|$)")
@@ -411,6 +422,112 @@ def redirect_targets(command: str) -> list:
     return out
 
 
+def posix_statement_surface(text: str) -> str:
+    """Make POSIX statement boundaries explicit for the tokenizer.
+
+    `shlex` treats a newline as ordinary whitespace, so `echo hi<newline>rm -rf x`
+    used to parse as one `echo` command whose arguments happened to include
+    `rm`. Bash runs two commands. This pass rewrites every *unquoted* newline
+    to ` ; `, drops comments (a comment must not swallow the newline that ends
+    it), removes backslash-newline continuations, and skips the body of any
+    heredoc the heredoc regex did not already take out (`cat <<EOF > f`), so
+    data lines are not mistaken for commands. Quoted newlines are data and
+    are kept. Unbalanced quotes are left for the tokenizer to reject.
+    """
+    out = []
+    index = 0
+    length = len(text)
+    quote = ""
+    pending_heredocs = []
+    word_start = True
+    while index < length:
+        char = text[index]
+        if quote == "'":
+            out.append(char)
+            index += 1
+            if char == "'":
+                quote = ""
+            continue
+        if quote == "$'":
+            if char == "\\" and index + 1 < length:
+                out.append(text[index:index + 2])
+                index += 2
+                continue
+            out.append(char)
+            index += 1
+            if char == "'":
+                quote = ""
+            continue
+        if quote == '"':
+            if char == "\\" and index + 1 < length:
+                if text[index + 1] == "\n":
+                    index += 2
+                    continue
+                out.append(text[index:index + 2])
+                index += 2
+                continue
+            out.append(char)
+            index += 1
+            if char == '"':
+                quote = ""
+            continue
+        if char == "\\" and index + 1 < length:
+            if text[index + 1] == "\n":
+                index += 2
+                continue
+            if text[index + 1:index + 3] == "\r\n":
+                index += 3
+                continue
+            out.append(text[index:index + 2])
+            index += 2
+            word_start = False
+            continue
+        if char == "$" and text[index + 1:index + 2] == "'":
+            quote = "$'"
+            out.append("$'")
+            index += 2
+            word_start = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            index += 1
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        if char == "<" and text.startswith("<<", index) \
+                and not text.startswith("<<<", index):
+            match = _POSIX_HEREDOC_START_RE.match(text, index)
+            if match:
+                out.append(match.group(0))
+                index = match.end()
+                if not text.startswith(_HEREDOC_PLACEHOLDER, index):
+                    pending_heredocs.append((match.group(3), match.group(1) == "-"))
+                word_start = False
+                continue
+        if char == "\n" or (char == "\r" and text[index + 1:index + 2] == "\n"):
+            index += 2 if char == "\r" else 1
+            out.append(" ; ")
+            for delimiter, strip_tabs in pending_heredocs:
+                while index < length:
+                    end = text.find("\n", index)
+                    end = length if end < 0 else end
+                    line = text[index:end].rstrip("\r")
+                    index = min(length, end + 1)
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        break
+            pending_heredocs = []
+            word_start = True
+            continue
+        out.append(char)
+        index += 1
+        word_start = char in " \t;&|()<>"
+    return "".join(out)
+
+
 def extract_commands(command: str, depth: int = 0, dialect: str = None) -> ParseResult:
     if depth > MAX_DEPTH:
         raise ParseUncertain("substitution nesting too deep")
@@ -427,7 +544,9 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
 
     # Pull out heredoc bodies so shlex doesn't choke; bodies are inspected by
     # the engine's content rules via extract_payloads().
-    work = _HEREDOC_RE.sub(lambda m: f"<<{m.group(1)} HEREDOC_BODY", command)
+    work = _HEREDOC_RE.sub(
+        lambda m: f"<<{m.group(1)}{_HEREDOC_PLACEHOLDER}", command
+    )
     if dialect == DIALECT_POWERSHELL:
         work = _prepare_powershell(work)
 
@@ -440,12 +559,14 @@ def extract_commands(command: str, depth: int = 0, dialect: str = None) -> Parse
             result.commands.extend(sub_result.commands)
             result.flags.update(sub_result.flags)
             result.uninspected.extend(sub_result.uninspected)
+            result.assignments.extend(sub_result.assignments)
         return "SUBST_OUT"
 
     if dialect == DIALECT_POSIX:
         work = _SUBST_RE.sub(_sub, work)
         if "$(" in work or "`" in work:
             raise ParseUncertain("unbalanced command substitution")
+        work = posix_statement_surface(work)
     elif dialect == DIALECT_POWERSHELL:
         work = _PWSH_SUBEXPRESSION_RE.sub(_sub, work)
         if "$(" in work:
@@ -563,12 +684,27 @@ def _start_process_shape(args: list):
 
 def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
     """Turn one pipeline segment into SimpleCommand(s), recursing wrappers."""
+    assignments = []
+    commands = _analyze_segment_body(tokens, result, depth, dialect, assignments)
+    if assignments:
+        result.assignments.extend(assignments)
+        if commands and not commands[0].assignments:
+            commands[0].assignments = list(assignments)
+    return commands
+
+
+def _analyze_segment_body(tokens, result: ParseResult, depth: int, dialect: str,
+                          assignments: list):
     toks = list(tokens)
 
-    # strip leading VAR=value assignments and transparent wrappers
+    # strip leading VAR=value assignments, reserved-word prefixes and
+    # transparent wrappers
     while toks:
         head = toks[0]
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", head):
+            assignments.append(toks.pop(0))
+            continue
+        if dialect == DIALECT_POSIX and head in _POSIX_RESERVED_PREFIXES:
             toks.pop(0)
             continue
         base = _normalized_head(head)
@@ -652,6 +788,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
         result.flags.update(inner.flags)
         result.payloads.extend(inner.payloads)
         result.uninspected.extend(inner.uninspected)
+        result.assignments.extend(inner.assignments)
         return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
 
     # bash -c "string" → recurse into the string. `head_base` is already the
@@ -663,6 +800,7 @@ def _analyze_segment(tokens, result: ParseResult, depth: int, dialect: str):
                                          dialect=DIALECT_POSIX)
                 result.flags.update(inner.flags)
                 result.uninspected.extend(inner.uninspected)
+                result.assignments.extend(inner.assignments)
                 return [SimpleCommand(argv=toks, dialect=dialect)] + inner.commands
         return [SimpleCommand(argv=toks, dialect=dialect)]
 

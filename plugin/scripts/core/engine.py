@@ -24,7 +24,8 @@ from . import action_contracts, agw_contract, gitargs, launcher, policy_health, 
 from .events import ALLOW, ASK, DENY, DEFER, EDIT, EXEC, MCP, OTHER, READ, WRITE, \
     NON_WAIVABLE_INVARIANT, POLICY_ENFORCEMENT, Decision, DecisionContext, \
     EnforcementClass, ToolEvent, worst
-from .shellparse import DIALECT_POWERSHELL, FLAG_DECODE_PIPE, FLAG_DOWNLOAD_PIPE, \
+from .shellparse import DIALECT_POSIX, DIALECT_POWERSHELL, FLAG_DECODE_PIPE, \
+    FLAG_DOWNLOAD_PIPE, \
     FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT, \
     ParseUncertain, SimpleCommand, \
     _HEREDOC_RE, extract_commands, extract_payloads, redirect_targets
@@ -1087,6 +1088,64 @@ def _is_protected(path: str, policy: Policy) -> bool:
     return False
 
 
+# --- launcher identity ----------------------------------------------------------
+
+# A literal launcher word that is not a path component or part of a longer name.
+_LAUNCHER_MENTION_RE = re.compile(r"(?<![\w./\\-])agw(?:\.cmd|\.py)?(?![\w.-])",
+                                  re.IGNORECASE)
+_LAUNCHER_FUNCTION_RE = re.compile(
+    r"(?<![\w./\\-])agw(?:\.cmd|\.py)?\s*\(\s*\)|\bfunction\s+agw(?:\.cmd|\.py)?\b",
+    re.IGNORECASE)
+# Statements that can redefine a bare command word or the environment the
+# launcher's own interpreter lookup depends on.
+_LAUNCHER_TAINTING_COMMANDS = frozenset({
+    "alias", "unalias", "function", "export", "unset", "declare", "typeset",
+    "readonly", "local", "hash", "enable", "shopt", "source", ".", "set",
+    "builtin", "exec", "eval", "trap",
+})
+
+
+def _bare_launcher_environment_tainted(cmd: SimpleCommand, event: ToolEvent) -> bool:
+    """Whether a bare POSIX `agw` may not mean what PATH says it means.
+
+    A bare name is only trusted through the hook's own PATH lookup. That lookup
+    says nothing once the same command line redefines the word (alias,
+    function), changes PATH or the interpreter environment (assignments,
+    export), or prefixes the launcher with its own environment.
+    """
+    if cmd.dialect != DIALECT_POSIX:
+        return False
+    if cmd.assignments:
+        return True
+    command = event.command or ""
+    if _LAUNCHER_FUNCTION_RE.search(command):
+        return True
+    try:
+        parsed = extract_commands(command)
+    except ParseUncertain:
+        return True
+    if parsed.assignments:
+        return True
+    return any(other.name in _LAUNCHER_TAINTING_COMMANDS for other in parsed.commands)
+
+
+def _dynamic_launcher_decision(event: ToolEvent, parsed) -> Optional[Decision]:
+    """Deny a launcher name that only appears through expansion or eval."""
+    if not (FLAG_INDIRECT in parsed.flags or FLAG_EVAL in parsed.flags):
+        return None
+    surface = _LAUNCHER_MENTION_RE.search(event.command or "")
+    if not surface:
+        return None
+    return Decision(
+        DENY,
+        "This launcher could not be verified as the active packaged "
+        "Guardrails launcher.",
+        "builtin:agw-impostor",
+        enforcement_class=NON_WAIVABLE_INVARIANT,
+        presentation_context=DecisionContext.AGW_UNKNOWN,
+    )
+
+
 # --- exec ---------------------------------------------------------------------
 
 _MUTATION_EVIDENCE_RE = re.compile(
@@ -1631,6 +1690,10 @@ def _eval_exec(event: ToolEvent, policy: Policy, plugin_root: str, cfg: dict) ->
 
     decisions = []
 
+    dynamic_launcher = _dynamic_launcher_decision(event, parsed)
+    if dynamic_launcher is not None:
+        decisions.append(dynamic_launcher)
+
     if re.match(
             r"(?is)^\s*(?:rg|ripgrep|grep|egrep|fgrep|ag|ack|find|fd|fdfind|"
             r"tree|get-childitem|gci|dir|ls|select-string)\b",
@@ -1791,6 +1854,10 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
         if "/" in head or "\\" in head or os.path.isabs(head):
             real = os.path.realpath(head if os.path.isabs(head)
                                     else os.path.join(event.cwd or ".", head))
+        elif _bare_launcher_environment_tainted(cmd, event):
+            # The hook's PATH lookup cannot speak for a word this command line
+            # redefines or runs under a different environment.
+            real = ""
         else:
             resolved = shutil.which(head)
             real = os.path.realpath(resolved) if resolved else ""
@@ -1935,7 +2002,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                      if refreshing else
                      "Installing or replacing a trusted workflow grants a specific, "
                      "hash-bound script permission to write its declared outputs. "
-                     "Review the manifest, script identity, output paths, and observed roots."),
+                     "Review the manifest, script identity, output paths, observed roots, "
+                     "and any run time limit (limits.timeout_seconds)."),
                     ("builtin:agw-workflow-refresh" if refreshing
                      else "builtin:agw-workflow-trust"),
                     enforcement_class=NON_WAIVABLE_INVARIANT,

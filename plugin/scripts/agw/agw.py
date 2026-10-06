@@ -42,6 +42,7 @@ from core import retention_policy           # noqa: E402
 from core import workflows                  # noqa: E402
 import converters                           # noqa: E402
 import cli_schema                           # noqa: E402
+import execution                            # noqa: E402
 import file_ops                             # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
@@ -961,6 +962,40 @@ def cmd_file(args):
         )
 
 
+def _run_timeout(requested, workflow) -> tuple[float, str]:
+    """Resolve `agw run`'s process time limit and where it came from.
+
+    An unreviewed run keeps the fixed default. Only a trusted workflow whose
+    hashed manifest declares `limits.timeout_seconds` may run longer, so a
+    longer limit always traces back to an owner-approved trust decision. An
+    explicit `--timeout-seconds` can only shorten whichever bound applies.
+    """
+    reviewed = (workflow or {}).get("timeout_seconds")
+    ceiling = float(reviewed) if reviewed else execution.DEFAULT_TIMEOUT_SECONDS
+    source = "workflow" if reviewed else "default"
+    if requested is None:
+        return ceiling, source
+    try:
+        value = float(requested)
+    except (TypeError, ValueError) as exc:
+        raise workflows.WorkflowError("--timeout-seconds must be a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise workflows.WorkflowError("--timeout-seconds must be greater than zero")
+    if value > ceiling:
+        if reviewed:
+            raise workflows.WorkflowError(
+                f"--timeout-seconds cannot exceed this workflow's reviewed limit of "
+                f"{ceiling:g} seconds"
+            )
+        raise workflows.WorkflowError(
+            f"--timeout-seconds cannot exceed the {ceiling:g}-second limit for an "
+            "unreviewed run; a longer limit must be declared as "
+            "limits.timeout_seconds in a trusted workflow manifest "
+            "(see `agw workflow trust --help`)"
+        )
+    return value, "explicit"
+
+
 def cmd_run(args):
     command = list(args.command)
     if command and command[0] == "--":
@@ -1000,6 +1035,9 @@ def cmd_run(args):
             expected_hashes = args.expected_hash
             output_roots = args.output_root
             output_patterns = args.output_pattern
+        timeout_seconds, timeout_source = _run_timeout(
+            getattr(args, "timeout_seconds", None), workflow,
+        )
         data = file_ops.run_declared(
             command, outputs, expected_hashes=expected_hashes,
             cwd=args.cwd, dry_run=args.dry_run,
@@ -1007,10 +1045,11 @@ def cmd_run(args):
             output_patterns=output_patterns,
             optional_outputs=(workflow or {}).get("optional_outputs", []),
             allow_missing_output_parents=bool(workflow),
-            timeout_seconds=getattr(args, "timeout_seconds", 300.0),
+            timeout_seconds=timeout_seconds,
             isolation_mode=getattr(args, "isolation", "observed"),
             network_policy=getattr(args, "network", "inherit"),
         )
+        data.setdefault("execution_policy", {})["timeout_source"] = timeout_source
         if workflow:
             data["workflow"] = workflow["workflow"]
             data["workflow_manifest_sha256"] = workflow["manifest_sha256"]
@@ -1036,7 +1075,16 @@ def cmd_run(args):
             f"{len(data.get('unclaimed_observed_changes', []))} unclaimed"
         )
     if data.get("timed_out"):
-        human_parts.append("command exceeded its bounded timeout and its process tree was terminated")
+        policy = data.get("execution_policy") or {}
+        limit = policy.get("timeout_seconds")
+        human_parts.append(
+            "command exceeded its bounded timeout"
+            + (f" of {float(limit):g} seconds ({policy.get('timeout_source', 'default')})"
+               if limit else "")
+            + " and its process tree was terminated"
+            + ("; a reviewed workflow can declare a longer limits.timeout_seconds"
+               if policy.get("timeout_source") == "default" else "")
+        )
     _out(args, "\n".join(part for part in human_parts if part), data)
     if data.get("executed") and data.get("exit_code"):
         raise SystemExit(data["exit_code"])
@@ -1276,6 +1324,8 @@ def cmd_workflow(args):
             human = (
                 ("trusted" if data["changed"] else "already trusted")
                 + f" workflow {data['workflow']}"
+                + (f"; run time limit {data['timeout_seconds']} seconds"
+                   if data.get("timeout_seconds") else "")
             )
         elif args.workflow_op == "list":
             items = workflows.list_trusted()
@@ -1346,6 +1396,7 @@ def cmd_workflow(args):
                 command, args.cwd or os.getcwd(), workflow_id=args.workflow_id,
                 outputs=args.output, allowed_roots=args.allowed_root,
                 expected_states=args.expected, description=args.description,
+                timeout_seconds=args.timeout_seconds,
             )
             human = json.dumps(data, ensure_ascii=True, indent=2)
         elif args.workflow_op == "info":
@@ -1358,12 +1409,18 @@ def cmd_workflow(args):
                 "outputs": manifest["outputs"],
                 "observed_roots": manifest.get("observed_roots", []),
                 "parameters": manifest.get("parameters", {}),
+                "limits": manifest.get("limits", {}),
+                "timeout_seconds": workflows.workflow_timeout_seconds(manifest)
+                or execution.DEFAULT_TIMEOUT_SECONDS,
                 "manifest_sha256": record["manifest_sha256"],
                 "trusted_at": record["trusted_at"], "verified": True,
                 "record_schema": record["schema"],
                 "provenance": record.get("provenance"),
             }
-            human = f"trusted workflow {manifest['id']} ({manifest['command']['runtime']})"
+            human = (
+                f"trusted workflow {manifest['id']} ({manifest['command']['runtime']}); "
+                f"run time limit {data['timeout_seconds']:g} seconds"
+            )
         elif args.workflow_op == "export":
             data = workflows.export_trusted(args.workflow_id)
             if args.output:
@@ -1415,7 +1472,10 @@ def cmd_workflow(args):
             human = (
                 f"valid workflow {data['workflow']} ({data['schema']}); "
                 f"{data['outputs']} exact output(s), "
-                f"{data.get('parameter_count', 0)} parameter(s)"
+                f"{data.get('parameter_count', 0)} parameter(s), "
+                + (f"run time limit {data['timeout_seconds']} seconds"
+                   if data.get("timeout_seconds") else
+                   f"default run time limit {execution.DEFAULT_TIMEOUT_SECONDS:g} seconds")
             )
         elif args.workflow_op == "status":
             data = workflows.manifest_status(args.manifest)
@@ -1425,7 +1485,7 @@ def cmd_workflow(args):
                 args.script, args.manifest, workflow_id=args.workflow_id,
                 runtime=args.runtime, args=args.arg, outputs=args.output,
                 expected=args.expected, allowed_roots=args.allowed_root,
-                description=args.description,
+                description=args.description, timeout_seconds=args.timeout_seconds,
             )
             serialized = json.dumps(
                 built["manifest"], ensure_ascii=True, indent=2,
@@ -2313,7 +2373,9 @@ def main(argv=None):
                                "help": "hash/absent per output"}),
         (["--cwd"], {"default": "", "metavar": "DIR", "help": "working dir"}),
         (["--timeout-seconds"], {
-            "type": float, "default": 300.0, "metavar": "SECONDS",
+            "type": float, "default": None, "metavar": "SECONDS",
+            # Documented in references/trusted-workflows.md; `agw run --help`
+            # has a fixed size budget. It can only shorten the bound.
             "help": argparse.SUPPRESS,
         }),
         (["--isolation"], {
@@ -2489,6 +2551,10 @@ def main(argv=None):
                                   help="permitted output root; repeat")
     workflow_propose.add_argument("--description", default="", help="short reviewed purpose")
     workflow_propose.add_argument(
+        "--timeout-seconds", type=int, default=None, metavar="SECONDS",
+        help="reviewed run time limit (limits.timeout_seconds, at most 14400)",
+    )
+    workflow_propose.add_argument(
         "command", nargs=argparse.REMAINDER, metavar="...", help="command after --",
     )
     workflow_propose.set_defaults(fn=cmd_workflow)
@@ -2577,6 +2643,10 @@ def main(argv=None):
     workflow_init.add_argument("--allowed-root", action="append", default=[], required=True,
                                help="permitted output-root template; repeat")
     workflow_init.add_argument("--description", default="", help="short reviewed purpose")
+    workflow_init.add_argument(
+        "--timeout-seconds", type=int, default=None, metavar="SECONDS",
+        help="reviewed run time limit (limits.timeout_seconds, at most 14400)",
+    )
     workflow_init.add_argument("--expected-manifest-hash", default="absent",
                                help="expected existing manifest SHA-256, or absent")
     workflow_init.set_defaults(fn=cmd_workflow)

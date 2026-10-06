@@ -134,14 +134,35 @@ def test_bash_string_rewrite_is_unchanged(tmp_path, project):
 # --- the wall still stands ----------------------------------------------------
 
 @pytest.mark.parametrize("tool", ["shell", "local_shell"])
-def test_native_argv_impostor_launcher_is_still_denied(
+def test_native_argv_later_literal_launcher_never_reaches_path(
         tool, tmp_path, project, impostor_path):
-    # Only a literal *leading* launcher token is rewritten. A later `agw`
-    # resolves through PATH, finds the impostor, and is denied - exactly what
-    # the Bash path does today. Widening the gate must not widen the trust.
+    # A later literal `agw` in a plain command position is rewritten to the
+    # exact packaged launcher, so the impostor first on PATH is never run.
     out = run_hook({"tool_name": tool,
                     "tool_input": {"command":
                                    ["bash", "-lc", "true && agw archive foo.txt"]},
+                    "session_id": f"native-later-{tool}"},
+                   tmp_path, project, path_prefix=impostor_path)
+    assert _decision(out) == "allow", _reason(out)
+    argv = _specific(out)["updatedInput"]["command"]
+    assert argv[:2] == ["bash", "-lc"]
+    assert argv[2] == "true && " + EXPECTED_LAUNCHER + " archive foo.txt"
+    assert str(impostor_path) not in argv[2]
+
+
+@pytest.mark.parametrize("command", [
+    "alias agw=true\nagw archive foo.txt",
+    "PATH=/tmp/fakebin:$PATH agw archive foo.txt",
+    "export PATH=/tmp/fakebin:$PATH; agw archive foo.txt",
+    "agw() { true; }; agw archive foo.txt",
+])
+@pytest.mark.parametrize("tool", ["shell", "local_shell"])
+def test_native_argv_impostor_launcher_is_still_denied(
+        tool, command, tmp_path, project, impostor_path):
+    # When the same command line can redefine `agw` or the environment it runs
+    # in, the later word is not rewritten and its PATH lookup is not trusted.
+    out = run_hook({"tool_name": tool,
+                    "tool_input": {"command": ["bash", "-lc", command]},
                     "session_id": f"native-impostor-{tool}"},
                    tmp_path, project, path_prefix=impostor_path)
     assert _decision(out) == "deny"

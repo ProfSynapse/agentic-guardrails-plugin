@@ -367,3 +367,64 @@ def test_powershell_crlf_line_continuation_is_collapsed():
 def test_unpaired_backticks_elsewhere_stay_uncertain(script):
     with pytest.raises(ParseUncertain):
         extract_commands(script, dialect=DIALECT_POWERSHELL)
+
+
+# --- POSIX statement boundaries ---------------------------------------------
+# shlex reads a newline as whitespace, so these used to collapse into a single
+# harmless-looking command and the second statement was never evaluated.
+
+def test_unquoted_newline_separates_statements():
+    assert names("echo hi\nrm -rf /tmp/x") == ["echo", "rm"]
+    assert names("echo hi\r\nrm -rf /tmp/x") == ["echo", "rm"]
+
+
+def test_quoted_newline_is_data_not_a_separator():
+    assert names("python3 -c 'import os\nprint(1)'") == ["python3"]
+    assert names('git commit -m "line one\nrm -rf /tmp/x"') == ["git"]
+    assert names("printf $'a\\nb\nrm x'") == ["printf"]
+
+
+def test_comment_ends_at_its_newline():
+    assert names("echo a # a comment; rm nothing\nrm -rf /tmp/x") == ["echo", "rm"]
+    assert names("# only a comment\nls") == ["ls"]
+    assert names("echo a#b") == ["echo"]
+
+
+def test_backslash_newline_is_a_continuation():
+    parsed = extract_commands("rm \\\n  -rf /tmp/x")
+    assert [c.argv for c in parsed.commands] == [["rm", "-rf", "/tmp/x"]]
+
+
+def test_loop_and_conditional_bodies_are_commands():
+    assert "rm" in names("for f in a b; do rm -rf $f; done")
+    assert "rm" in names("for f in a b\ndo\n  rm -rf $f\ndone")
+    assert "rm" in names("if true; then rm x; else rm y; fi")
+    assert "rm" in names("while read -r f; do rm \"$f\"; done < list.txt")
+    assert "rm" in names("! rm x")
+
+
+def test_reserved_words_are_not_stripped_in_powershell():
+    parsed = extract_commands("if ($x) { Remove-Item a }", dialect=DIALECT_POWERSHELL)
+    assert parsed.commands
+
+
+def test_heredoc_with_trailing_redirect_body_is_not_parsed_as_commands():
+    # (The delimiter word after `<<` has always surfaced as its own inert
+    # segment; what matters is that body lines are not commands.)
+    command = "cat <<EOF > notes.txt\nrm -rf /tmp/x\nEOF\nls"
+    assert names(command) == ["cat", "eof", "ls"]
+    tabbed = "cat <<-EOF > notes.txt\n\trm -rf /tmp/x\n\tEOF\nls"
+    assert names(tabbed) == ["cat", "-eof", "ls"]
+
+
+def test_matched_heredoc_still_feeds_payloads():
+    command = "python3 - <<'EOF'\nopen('x', 'w')\nEOF\nls"
+    assert names(command) == ["python3", "eof", "ls"]
+    assert "open('x', 'w')" in extract_payloads(command)
+
+
+def test_prefix_and_standalone_assignments_are_recorded():
+    parsed = extract_commands("A=1\nPATH=/tmp/evil:$PATH agw list .")
+    assert parsed.commands[-1].name == "agw"
+    assert parsed.commands[-1].assignments == ["PATH=/tmp/evil:$PATH"]
+    assert parsed.assignments == ["A=1", "PATH=/tmp/evil:$PATH"]
