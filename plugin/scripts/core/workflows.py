@@ -304,7 +304,7 @@ def _validate_parameters(value, manifest_path: str) -> dict:
                 "type": "integer", "minimum": minimum, "maximum": maximum,
             }
         elif kind == "path":
-            _exact_keys(spec, {"type", "root", "must_exist", "kind"}, label)
+            _exact_keys(spec, {"type", "root", "must_exist", "kind", "pattern"}, label)
             root = _validate_template(
                 spec.get("root"), f"{label}.root", allow_args=False,
                 allow_parameters=False,
@@ -320,6 +320,13 @@ def _validate_parameters(value, manifest_path: str) -> dict:
                 "type": "path", "root": root, "must_exist": must_exist,
                 "kind": path_kind,
             }
+            if "pattern" in spec:
+                # Optional narrowing: the value's path relative to its root,
+                # with '/' separators, must fully match (e.g. one project's
+                # `renders/*.mp4`). Absent stays absent for existing records.
+                normalized[name]["pattern"] = _safe_regex(
+                    spec.get("pattern"), f"{label}.pattern"
+                )
         else:
             raise WorkflowError(
                 f"{label}.type must be enum, enum-file, regex, integer, or path"
@@ -1810,6 +1817,14 @@ def _validate_runtime_parameter(name: str, value, spec: dict, context: dict) -> 
                 f"{label} resolves outside its reviewed root",
                 {"parameter": name, "path": candidate, "root": root},
             )
+        if spec.get("pattern"):
+            relative = os.path.relpath(candidate, root).replace("\\", "/")
+            if re.fullmatch(spec["pattern"], relative) is None:
+                raise WorkflowTrustError(
+                    f"{label} does not match its reviewed path pattern",
+                    {"parameter": name, "relative_path": relative,
+                     "pattern": spec["pattern"]},
+                )
         if spec["must_exist"] and not os.path.lexists(candidate):
             raise WorkflowTrustError(
                 f"{label} does not exist", {"parameter": name, "path": candidate},
@@ -2065,6 +2080,7 @@ def _parameter_constraint_metadata(spec: dict) -> dict:
     return {
         "type": kind, "root": spec["root"],
         "must_exist": spec["must_exist"], "kind": spec["kind"],
+        **({"pattern": spec["pattern"]} if spec.get("pattern") else {}),
     }
 
 

@@ -29,7 +29,7 @@ GENERATOR = (
 
 
 def _manifest(tmp_path, *, observed_path="{param:renders}", renders_spec=None,
-              allowed=None, schema="agw.workflow/v3"):
+              allowed=None, schema="agw.workflow/v3", output_spec=None):
     script = tmp_path / "generator.py"
     script.write_text(GENERATOR, encoding="utf-8")
     manifest = {
@@ -43,8 +43,8 @@ def _manifest(tmp_path, *, observed_path="{param:renders}", renders_spec=None,
                      {"parameter": "extra"}],
         },
         "parameters": {
-            "output": {"type": "path", "root": "{cwd}/projects", "must_exist": False,
-                       "kind": "file"},
+            "output": output_spec or {"type": "path", "root": "{cwd}/projects",
+                                      "must_exist": False, "kind": "file"},
             "renders": renders_spec or {"type": "path", "root": "{cwd}/projects",
                                         "must_exist": True, "kind": "directory"},
             "extra": {"type": "regex", "pattern": "[a-z.]+"},
@@ -134,6 +134,45 @@ def test_only_unmodified_directory_path_parameters_may_name_a_root(
     path, digest = _manifest(tmp_path, observed_path=observed_path,
                              renders_spec=renders_spec)
     with pytest.raises(workflows.WorkflowError, match=match):
+        workflows.validate_manifest_file(str(path), digest)
+
+
+RENDER_PATTERN = "[a-z0-9][a-z0-9-]*/renders/[A-Za-z0-9][A-Za-z0-9._-]*[.]mp4"
+
+
+def test_path_pattern_confines_an_output_to_one_kind_of_file(tmp_path):
+    renders = _project(tmp_path)
+    (tmp_path / "projects" / "alpha" / "source.json").write_text("{}")
+    path, digest = _manifest(tmp_path, output_spec={
+        "type": "path", "root": "{cwd}/projects", "must_exist": False,
+        "kind": "file", "pattern": RENDER_PATTERN,
+    })
+    validated = workflows.validate_manifest_file(str(path), digest)
+    assert validated["manifest"]["parameters"]["output"]["pattern"] == RENDER_PATTERN
+    workflows.trust_manifest(str(path), digest)
+
+    _, result = _run(tmp_path, renders, renders / "short-v2.mp4")
+    assert result["ok"] is True
+    for bad in (tmp_path / "projects" / "alpha" / "source.json",
+                renders / "short.mov",
+                renders / "nested" / "short.mp4",
+                renders / ".." / ".." / "beta" / "renders" / "x.txt"):
+        with pytest.raises(workflows.WorkflowTrustError, match="path pattern"):
+            _run(tmp_path, renders, bad)
+
+
+def test_path_pattern_absent_keeps_existing_normalization(tmp_path):
+    path, digest = _manifest(tmp_path)
+    validated = workflows.validate_manifest_file(str(path), digest)
+    assert "pattern" not in validated["manifest"]["parameters"]["output"]
+
+
+def test_path_pattern_uses_the_safe_regex_rules(tmp_path):
+    path, digest = _manifest(tmp_path, output_spec={
+        "type": "path", "root": "{cwd}/projects", "must_exist": False,
+        "kind": "file", "pattern": "(a|b)/renders/.*",
+    })
+    with pytest.raises(workflows.WorkflowError, match="grouping"):
         workflows.validate_manifest_file(str(path), digest)
 
 
