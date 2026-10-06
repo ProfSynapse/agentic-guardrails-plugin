@@ -528,8 +528,23 @@ def validate_manifest(value: dict, manifest_path: str) -> dict:
         _exact_keys(item, {"path", "patterns"}, f"observed_roots[{index}]")
         root = _validate_template(
             item.get("path"), f"observed_roots[{index}].path", allow_args=False,
-            allow_parameters=False,
+            allow_parameters=schema == PARAMETERIZED_SCHEMA,
         )
+        # A per-run observed root (`.../{param:project}/renders`) may only come
+        # from a reviewed `path` parameter, whose value is already confined to
+        # its own root; the resolved root must still lie inside allowed_roots.
+        for match in _PLACEHOLDER_RE.finditer(root):
+            token = match.group(1)
+            if not token.startswith("param:"):
+                continue
+            pieces = token.split(":")
+            spec = parameters.get(pieces[1], {})
+            if len(pieces) != 2 or spec.get("type") != "path" \
+                    or spec.get("kind") == "file":
+                raise WorkflowError(
+                    f"observed_roots[{index}].path may only use an unmodified "
+                    "directory-or-any `path` parameter"
+                )
         root = _compile_machine_template(root)
         patterns = item.get("patterns", [])
         if not isinstance(patterns, list):
