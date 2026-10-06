@@ -2374,7 +2374,9 @@ def main(argv=None):
         (["--cwd"], {"default": "", "metavar": "DIR", "help": "working dir"}),
         (["--timeout-seconds"], {
             "type": float, "default": None, "metavar": "SECONDS",
-            "help": "shorter limit (max 300, or workflow's)",
+            # Documented in references/trusted-workflows.md; `agw run --help`
+            # has a fixed size budget. It can only shorten the bound.
+            "help": argparse.SUPPRESS,
         }),
         (["--isolation"], {
             "choices": ["observed", "read-only", "strict"], "default": "observed",

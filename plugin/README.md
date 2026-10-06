@@ -197,7 +197,11 @@ output has been hash-checked and snapshotted. Exact outputs do not enumerate
 their parent folders and need not be inside an observed root, so unrelated app
 or sync-client updates are ignored. A recoverable state file can therefore be
 paired with a separate, narrowly patterned cache root.
-Runs have a bounded timeout and bounded output capture. The default `observed`
+Runs have a bounded timeout (300 seconds; `--timeout-seconds` can only shorten
+it) and bounded output capture. A trusted workflow may declare a longer,
+reviewed `limits.timeout_seconds` of up to four hours inside its hashed
+manifest, so raising it always requires a new explicit trust (see
+`docs/LONG_RUN_WORKFLOWS.md` in the source repository). The default `observed`
 mode does not claim filesystem or network isolation; requests for read-only,
 strict, or network-denied execution fail closed unless an OS isolation provider
 is installed, and are never silently downgraded.
