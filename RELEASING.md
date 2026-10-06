@@ -25,12 +25,12 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.5.0`
+## Release gate for `0.6.0`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.5.0` before that tag exists.
+   `v0.6.0` before that tag exists.
 
-2. Confirm all three version fields and the README banner read `0.5.0` and both
+2. Confirm all three version fields and the README banner read `0.6.0` and both
    refs are `main`, then run:
 
    ```bash
@@ -77,17 +77,16 @@ release must bump the version.
    the documented literal `tool_input.command` normalization contract; do not
    describe it as a live-host probe.
 
-   **Hook definition changed in this release.** `plugin/hooks/hooks-codex.json`
-   gained `shell`, `local_shell`, `exec_command`, and `write_stdin` in the
-   PreToolUse and PostToolUse matchers, so builds that emit Codex's native tool
-   names are guarded instead of running unmatched. Codex pins the exact hook
-   definition hash, and a *matcher* change moves that hash just as a command
-   change does: **every existing install must re-trust the hooks** (`/hooks` in
-   Codex CLI, or the desktop trust dialog) or Codex silently skips them and the
-   session runs unguarded. Say so at the top of the release notes, not in a
-   changelog tail - an install that quietly stops enforcing looks identical to
-   one that has nothing to enforce. Enterprise fleets shipping managed hooks via
-   `requirements.toml` must roll the updated definition out at the same time.
+   **Hook definitions in this release.** `plugin/hooks/hooks-codex.json` is
+   unchanged from 0.5.0, so Codex installs that already trusted the 0.5.0 hooks
+   do not need to re-trust them. Codex pins the exact hook definition hash, so
+   any future matcher or command change there forces every install to re-trust
+   (`/hooks` in Codex CLI, or the desktop trust dialog) or Codex silently skips
+   the hooks and the session runs unguarded; say so at the top of the release
+   notes when that happens. The Claude `plugin/hooks/hooks.json` PreToolUse
+   timeout rose from 15 to 120 seconds to cover the opt-in Linux owner-review
+   window. Enterprise fleets shipping managed hooks must roll the updated
+   definition out at the same time.
 
    Approval-copy tests must cover the maintained prompt families using only
    closed rule/context mappings and safe category/count labels. Raw commands,
@@ -126,19 +125,19 @@ release must bump the version.
    git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json \
      .claude-plugin/marketplace.json .agents/plugins/marketplace.json \
      tests/test_packaging.py RELEASING.md
-   git commit -m "Release Agentic Guardrails 0.5.0"
+   git commit -m "Release Agentic Guardrails 0.6.0"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.5.0 --target <verified-main-commit-sha> \
-     --title "v0.5.0" --notes "..."
+   gh release create v0.6.0 --target <verified-main-commit-sha> \
+     --title "v0.6.0" --notes "..."
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.5.0` in both marketplace catalogs, rerun JSON and artifact
+   `main` to `v0.6.0` in both marketplace catalogs, rerun JSON and artifact
    conformance, and merge the catalog pointer update through a follow-up pull
    request. This tag-exists gate is mandatory.
 
