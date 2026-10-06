@@ -2002,7 +2002,8 @@ def _eval_simple_command(cmd: SimpleCommand, policy: Policy, plugin_root: str,
                      if refreshing else
                      "Installing or replacing a trusted workflow grants a specific, "
                      "hash-bound script permission to write its declared outputs. "
-                     "Review the manifest, script identity, output paths, and observed roots."),
+                     "Review the manifest, script identity, output paths, observed roots, "
+                     "and any run time limit (limits.timeout_seconds)."),
                     ("builtin:agw-workflow-refresh" if refreshing
                      else "builtin:agw-workflow-trust"),
                     enforcement_class=NON_WAIVABLE_INVARIANT,
