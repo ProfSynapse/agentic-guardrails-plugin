@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -420,6 +421,240 @@ def redirect_targets(command: str) -> list:
                 and tok != "SUBST_OUT":
             out.append(tok)
     return out
+
+
+# `$null` is PowerShell's null sink; to Bash it is a parameter expansion that
+# may name any file. `NUL` is the null device only to a Windows PowerShell or
+# cmd process; to Bash, or to pwsh on Linux/macOS, it is an ordinary file in
+# the working folder. Read at call time so tests can pin either platform.
+WINDOWS_NUL_DEVICE = os.name == "nt"
+_NUL_DIALECTS = {DIALECT_POWERSHELL, DIALECT_CMD}
+# Stands in for a `$(...)`/backtick substitution removed before the scan. It
+# cannot occur in a real command, so a word carrying it is never a literal.
+_SUBST_SENTINEL = "\x00"
+_REDIRECT_WORD_END = set(" \t\r\n;|&<>()")
+_WIN_SEPARATOR_NEXT = re.compile(r"[A-Za-z0-9._~-]")
+
+
+def null_sink_words(dialect: str = None) -> set:
+    """Lowercased redirect words that name the null device in `dialect`.
+
+    `dialect` is the dialect the host pinned for the event (the PowerShell
+    tool), not a guess from the text: a `tool=Bash` line is run by Bash even
+    when `_detect_dialect` would parse it with PowerShell rules.
+    """
+    sinks = {"/dev/null"}
+    if dialect == DIALECT_POWERSHELL:
+        sinks.add("$null")
+    if dialect in _NUL_DIALECTS and WINDOWS_NUL_DEVICE:
+        sinks.update({"nul", "nul:"})
+    return sinks
+
+
+def _read_redirect_word(s: str, start: int, powershell: bool):
+    """Read one shell word; return (literal, static, tilde, end).
+
+    `static` is False when the shell would expand the word before opening it
+    (parameter, command or arithmetic expansion, a glob, brace expansion, or
+    `~user`), so the literal text is not the file that gets written. `tilde`
+    is True for an unquoted leading `~` or `~/` the hook can expand the same
+    way the shell does (from HOME). Quoted text is literal: `'a$b'` names
+    the file `a$b`, and `'~/x'` a folder called `~` in the working folder.
+    """
+    out = []
+    static = True
+    quote = ""
+    i = start
+    n = len(s)
+    unquoted_prefix = []  # the leading unquoted characters, for `~user`
+    leading = True
+    while i < n:
+        c = s[i]
+        if c == _SUBST_SENTINEL:
+            static = False
+            leading = False
+            out.append(c)
+            i += 1
+            continue
+        if quote == "'":
+            if c == "'":
+                if powershell and i + 1 < n and s[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                quote = ""
+            else:
+                out.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                if powershell and i + 1 < n and s[i + 1] == '"':
+                    out.append('"')
+                    i += 2
+                    continue
+                quote = ""
+                i += 1
+                continue
+            if c in "$`":
+                static = False
+                out.append(c)
+                i += 1
+                continue
+            if not powershell and c == "\\" and i + 1 < n and s[i + 1] in '$`"\\\n':
+                out.append(s[i + 1])
+                i += 2
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c in _REDIRECT_WORD_END:
+            break
+        if c in "'\"":
+            quote = c
+            leading = False
+            i += 1
+            continue
+        if leading:
+            unquoted_prefix.append(c)
+        if c in "$`*?[" or (not powershell and c in "{}"):
+            static = False
+        if not powershell and c == "\\" and i + 1 < n:
+            # A backslash before a path character is a Windows separator, the
+            # same convention extract_commands applies; otherwise it escapes.
+            if _WIN_SEPARATOR_NEXT.match(s[i + 1]):
+                out.append(c)
+                i += 1
+                continue
+            out.append(s[i + 1])
+            leading = False
+            i += 2
+            continue
+        if leading and c in "/\\":
+            leading = False
+        out.append(c)
+        i += 1
+    if quote:
+        static = False
+    tilde = False
+    prefix = "".join(unquoted_prefix)
+    if prefix.startswith("~"):
+        user = re.split(r"[/\\]", prefix, maxsplit=1)[0]
+        if user == "~":
+            tilde = True
+        else:
+            # `~user`, `~+`, `~-`: resolved from the password database or the
+            # shell's own PWD/OLDPWD, which the hook cannot reproduce.
+            static = False
+    return "".join(out), static, tilde, i
+
+
+def _single_quoted_positions(s: str, powershell: bool) -> list:
+    """Per-character flag: True inside a single-quoted (literal) span."""
+    flags = [False] * len(s)
+    quote = ""
+    escape = "`" if powershell else "\\"
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if quote == "'":
+            flags[i] = True
+            if c == "'":
+                quote = ""
+        elif quote == '"':
+            if c == escape:
+                i += 1
+            elif c == '"':
+                quote = ""
+        elif c == escape:
+            i += 1
+        elif c in "'\"":
+            quote = c
+            flags[i] = c == "'"
+        i += 1
+    return flags
+
+
+def _replace_live_substitutions(s: str, powershell: bool) -> str:
+    """Swap each substitution the shell would run for the sentinel.
+
+    A `$(...)` inside single quotes is literal text and is left alone, so
+    `> 'out $(date).txt'` still names that exact file.
+    """
+    literal = _single_quoted_positions(s, powershell)
+    pattern = _PWSH_SUBEXPRESSION_RE if powershell else _SUBST_RE
+    return pattern.sub(
+        lambda m: m.group(0) if literal[m.start()] else _SUBST_SENTINEL, s
+    )
+
+
+def redirect_writes(command: str, dialect: str = None):
+    """Truncating redirect targets: (literal paths, unresolvable words).
+
+    Appends (`>>`), stream duplication (`2>&1`), and the dialect's null sinks
+    name no clobbered file and are left out. A target the shell expands at run
+    time (`"$OUT"`, `$(cmd)`, `*.txt`, `~user/x`) is returned as unresolvable
+    rather than as a path: recording its literal text would snapshot a file
+    that is never written and leave the real one without a pre-image. Paths
+    keep a leading `~` only where the shell would expand it from HOME.
+    """
+    powershell = dialect == DIALECT_POWERSHELL
+    sinks = null_sink_words(dialect)
+    s = _HEREDOC_RE.sub(" ", str(command or ""))
+    s = _replace_live_substitutions(s, powershell)
+    paths, unresolved = [], []
+    quote = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif quote == '"' and c in ("`" if powershell else "\\") and i + 1 < n:
+                i += 1
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == ("`" if powershell else "\\"):
+            i += 2
+            continue
+        if c != ">":
+            i += 1
+            continue
+        if i + 1 < n and s[i + 1] == ">":
+            i += 2  # append: destroys nothing
+            continue
+        j = i + 1
+        if j < n and s[j] == "|":
+            j += 1
+        while j < n and s[j] in " \t":
+            j += 1
+        if j >= n or s[j] == "&" or s[j] in _REDIRECT_WORD_END:
+            # `>&1`/`>&-` duplicate a stream; `>& file`, `> >(...)` and a
+            # dangling `>` are left to the caller's overwrite scan.
+            i = j if j > i + 1 else i + 1
+            continue
+        literal, static, tilde, end = _read_redirect_word(s, j, powershell)
+        i = max(end, j + 1)
+        raw = s[j:end]
+        # `/dev/null` only in exact lowercase; `$null` only as the bare
+        # variable (a quoted "$null" is an empty-string path); NUL by name.
+        if raw == "/dev/null" or (raw.casefold() == "$null" and "$null" in sinks) \
+                or (static and literal.casefold() in sinks - {"/dev/null", "$null"}):
+            continue
+        if not static:
+            unresolved.append(raw.replace(_SUBST_SENTINEL, "$(...)"))
+            continue
+        if not literal or literal.startswith("/dev/"):
+            continue
+        if literal.startswith("~") and not tilde:
+            literal = "." + os.sep + literal
+        paths.append(literal)
+    return paths, unresolved
 
 
 def posix_statement_surface(text: str) -> str:

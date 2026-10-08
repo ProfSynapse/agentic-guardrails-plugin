@@ -28,7 +28,8 @@ from .shellparse import DIALECT_POSIX, DIALECT_POWERSHELL, FLAG_DECODE_PIPE, \
     FLAG_DOWNLOAD_PIPE, \
     FLAG_EVAL, FLAG_INDIRECT, FLAG_INNER_UNCERTAIN, FLAG_UNINSPECTED_SCRIPT, \
     ParseUncertain, SimpleCommand, \
-    _HEREDOC_RE, extract_commands, extract_payloads, redirect_targets
+    _HEREDOC_RE, extract_commands, extract_payloads, redirect_targets, \
+    redirect_writes
 
 ARCHIVE_REDIRECT = ("Deletion is disabled by agentic-guardrails. Use `agw archive <path>` "
                     "instead — it moves files to the archive store and is fully reversible "
@@ -654,8 +655,35 @@ class TargetList(list):
 
 
 def _static_shell_path(token: str) -> bool:
-    """Whether a shell path can be resolved without runtime expansion."""
-    return bool(token) and not any(char in token for char in "$`*?[]{}()")
+    """Whether a shell path can be resolved without runtime expansion.
+
+    The parser has already removed quoting, so a literal `'a$b'` reads the
+    same as `$b` and is conservatively unresolved. `SUBST_OUT` is the parser's
+    stand-in for a `$(...)` or backtick substitution it lifted out.
+    """
+    return bool(token) and "SUBST_OUT" not in token \
+        and not any(char in token for char in "$`*?[]{}()")
+
+
+def _truncate_operands(args: list) -> list:
+    """The files `truncate` resizes: its operands, not its `-s`/`-r` values."""
+    operands = []
+    options = True
+    skip_value = False
+    for token in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if options and token == "--":
+            options = False
+            continue
+        if options and token in {"-s", "--size", "-r", "--reference"}:
+            skip_value = True
+            continue
+        if options and token.startswith("-") and token != "-":
+            continue
+        operands.append(token)
+    return operands
 
 
 def _absent_creation_root(path: str) -> str:
@@ -844,11 +872,26 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
     incomplete_kind = ""
     covered = False
     skipped = []
+    # `dialect` is the one the host pinned (the PowerShell tool), and it alone
+    # decides whether `$null`/`NUL` are the null device: under Bash they are a
+    # variable and an ordinary file. Redirect words are taken verbatim, so a
+    # literal `'a$b'` stays exact while `"$OUT"` or `*.txt` stays unresolved.
     try:
-        for t in redirect_targets(command):
-            targets.add(_abs(t))
+        redirect_paths, unresolved_redirects = redirect_writes(command, dialect)
     except Exception:
-        pass
+        redirect_paths, unresolved_redirects = [], ["(unreadable redirect)"]
+    for literal in redirect_paths:
+        path = os.path.expanduser(literal) if literal.startswith("~") else literal
+        if not os.path.isabs(path):
+            path = os.path.join(cwd or os.getcwd(), path)
+        targets.add(os.path.normpath(path))
+    if unresolved_redirects:
+        complete = False
+        incomplete_reason = (
+            "a redirect target is expanded only when the command runs (a "
+            "variable, command substitution, wildcard, or ~user), so the file it "
+            "would overwrite could not be identified; write to a literal path"
+        )
     try:
         parsed = extract_commands(command, dialect=dialect)
     except Exception:
@@ -988,13 +1031,29 @@ def clobber_targets(command: str, cwd: str = "", include_absent: bool = False,
                 if name == "mv":
                     targets.update(_abs(source) for source in sources)
             elif name == "tee" and "-a" not in cmd.argv and "--append" not in cmd.argv:
+                if any(not _static_shell_path(o) for o in ops):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        "tee target uses runtime expansion or a wildcard"
+                    continue
                 targets.update(_abs(o) for o in ops)
             elif name == "dd":
                 for a in cmd.argv[1:]:
                     if a.startswith("of=") and not a.startswith("of=/dev/"):
+                        if not _static_shell_path(a[3:]):
+                            complete = False
+                            incomplete_reason = incomplete_reason or \
+                                "dd of= target uses runtime expansion or a wildcard"
+                            continue
                         targets.add(_abs(a[3:]))
             elif name == "truncate":
-                targets.update(_abs(o) for o in ops)
+                truncated = _truncate_operands(cmd.argv[1:])
+                if any(not _static_shell_path(o) for o in truncated):
+                    complete = False
+                    incomplete_reason = incomplete_reason or \
+                        "truncate target uses runtime expansion or a wildcard"
+                    continue
+                targets.update(_abs(o) for o in truncated)
             elif name in ("copy", "move", "ren", "rename"):
                 pos = [a for a in cmd.argv[1:]
                        if not a.startswith("-") and not _CMD_SWITCH_RE.fullmatch(a)]
