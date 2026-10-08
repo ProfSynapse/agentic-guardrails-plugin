@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 from dataclasses import dataclass, field
 import hashlib
 import os
@@ -10,6 +11,7 @@ import re
 from . import events, gitargs, powershell_bind, workflows
 from .shellparse import (
     _HEREDOC_RE, _normalized_head, ParseUncertain, extract_commands,
+    null_sink_words,
 )
 
 # Re-exported so an adapter can recognize the one incomplete plan that is a
@@ -33,10 +35,26 @@ _OVERWRITE_REDIRECT = re.compile(r"(?<!>)>(?!>)")
 # a lone `>` that the overwrite scan read as a target-less truncation. Only
 # the exact lowercase `/dev/null`, ended by a shell word boundary (including
 # the `)` closing a subshell or `$(...)`), is the sink; `/dev/nullx`,
-# `/dev/null/..`, and `/DEV/NULL` stay ordinary targets.
-_NULL_REDIRECT = re.compile(
-    r"(?:\d*|&)?(?:>>|>\|?)\s*(?:(?i:\$null|nul:?)|/dev/null)(?=$|[\s;&|)])"
-)
+# `/dev/null/..`, and `/DEV/NULL` stay ordinary targets. `$null` and `NUL`
+# are sinks only in the dialects that define them (see null_sink_words): to
+# Bash `> $null` is a variable expansion and `> nul` a file named `nul`.
+def _null_redirect(dialect: str = None):
+    return _null_redirect_for(frozenset(null_sink_words(dialect)))
+
+
+@functools.lru_cache(maxsize=8)
+def _null_redirect_for(sinks: frozenset):
+    words = []
+    for word in sorted(sinks):
+        if word == "/dev/null":
+            words.append("/dev/null")
+        else:
+            words.append("(?i:" + re.escape(word) + ")")
+    return re.compile(
+        r"(?:\d*|&)?(?:>>|>\|?)\s*(?:" + "|".join(words) + r")(?=$|[\s;&|)])"
+    )
+
+
 # `2>&1`, `>&2`, `>&-`, and PowerShell's `*>&1` duplicate or close a stream.
 # They never name a file, so they are not overwrite evidence; left in the
 # surface, their `>` made every `cmd 2>&1 | tail` an unenumerable mutation.
@@ -66,11 +84,13 @@ def _blank_data_heredocs(command: str) -> str:
     return _HEREDOC_RE.sub(replace, command)
 
 
-def _redirect_surface(command: str) -> str:
+def _redirect_surface(command: str, dialect: str = None) -> str:
     """The command with quoted data, data heredocs, and non-file redirects
-    blanked, so a remaining `>` really is a truncating file redirect."""
+    blanked, so a remaining `>` really is a truncating file redirect.
+
+    `dialect` must be the host-pinned one, never a guess from the text."""
     surface = _unquoted_surface(_blank_data_heredocs(str(command or "")))
-    return _FD_DUP_REDIRECT.sub("", _NULL_REDIRECT.sub("", surface))
+    return _FD_DUP_REDIRECT.sub("", _null_redirect(dialect).sub("", surface))
 
 
 _MUTATION_WORDS = {
@@ -831,6 +851,10 @@ def plan(evlist, clobber_resolver, plugin_root: str = "",
                 add_paths(ev.paths, ev.cwd)
                 continue
             if ev.kind == events.EXEC:
+                # The host pins PowerShell by tool name. Anything else runs
+                # in a POSIX shell (Claude's Bash, Codex's argv/exec surfaces
+                # unwrap any pwsh/cmd interpreter into an explicit wrapper),
+                # so `$null`/`NUL` stay ordinary targets unless pinned here.
                 dialect = "powershell" if ev.tool.lower() in {"powershell", "pwsh"} else None
                 targets = clobber_resolver(
                     ev.command, ev.cwd, include_absent=True, dialect=dialect,
@@ -884,7 +908,7 @@ def plan(evlist, clobber_resolver, plugin_root: str = "",
                 for entry in getattr(targets, "skipped", ()) or ():
                     if entry not in result.skipped:
                         result.skipped.append(entry)
-                surface = _redirect_surface(ev.command)
+                surface = _redirect_surface(ev.command, dialect)
                 looks_mutating = bool(targets) or bool(_OVERWRITE_REDIRECT.search(surface)) \
                     or _looks_locally_mutating(ev.command, dialect=dialect, cwd=ev.cwd)
                 if not getattr(targets, "complete", True):

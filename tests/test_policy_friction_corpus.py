@@ -415,6 +415,258 @@ def test_uppercase_null_path_is_an_ordinary_target(tmp_path):
         == [os.path.normcase(os.path.realpath("/DEV/NULL"))]
 
 
+# --- H1c: `$null` and NUL are null sinks only where the shell says so ---------
+# PowerShell's `$null` is its null sink. To Bash, `$null` is a variable that may
+# hold any path (or nothing: an ambiguous redirect), and `nul` is a file in the
+# working folder; NUL is a device only to PowerShell or cmd on Windows. The
+# dialect is the one the host pins by tool name, never a guess from the text.
+
+@pytest.fixture()
+def windows_nul(monkeypatch):
+    from core import shellparse
+
+    def pin(value):
+        monkeypatch.setattr(shellparse, "WINDOWS_NUL_DEVICE", value)
+    return pin
+
+
+POSIX_DOLLAR_NULL = [
+    "echo x > $null",
+    "echo x >$null",
+    "echo x >| $null",
+    "ls 2>$null",
+    "ls 2>$NULL",
+    "ls &> $null",
+]
+
+
+@pytest.mark.parametrize("command", POSIX_DOLLAR_NULL)
+def test_bash_dollar_null_is_an_unresolved_target(hook, tmp_path, command):
+    project = _project(tmp_path)
+    plan = _plan("Bash", command, project)
+    assert plan.mutating and not plan.complete, plan
+    assert "redirect target is expanded" in plan.reason
+    decision, reason = hook("Bash", command, project)
+    assert decision == "deny", f"{command!r} was {decision}: {reason}"
+    assert "invariant:prestate-unavailable" in reason
+
+
+# Windows path APIs resolve a name like `nul` to the device, so the exact
+# target spelling is only checkable off Windows. The decision that matters,
+# a planned write rather than a sink, is checked everywhere.
+_DEVICE_NAMES_ARE_FILES = pytest.mark.skipif(
+    os.name == "nt", reason="reserved device names resolve to devices on Windows")
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize("command,target", [
+    ("echo x > nul", "nul"),
+    ("echo x >NUL", "NUL"),
+    ("echo x > NUL:", "NUL:"),
+    ("ls 2>nul", "nul"),
+    ("echo x > 'nul'", "nul"),
+])
+def test_bash_nul_is_an_ordinary_file(tmp_path, windows_nul, windows, command,
+                                      target):
+    windows_nul(windows)
+    plan = _plan("Bash", command, _project(tmp_path))
+    assert plan.mutating, plan
+    if os.name != "nt":
+        assert plan.complete, plan
+        assert [os.path.basename(path) for path in plan.targets] == [target]
+
+
+@pytest.mark.parametrize("command", [
+    "Get-ChildItem > $null",
+    "Get-ChildItem >$null",
+    "Get-ChildItem 2>$null",
+    "Get-ChildItem 2> $NULL",
+    "rg -n 'version' plugin README.md 2>$null",
+])
+def test_powershell_dollar_null_is_the_null_sink(hook, tmp_path, command):
+    project = _project(tmp_path)
+    plan = _plan("PowerShell", command, project)
+    assert not plan.mutating and plan.complete and not plan.targets, plan
+    decision, reason = hook("PowerShell", command, project)
+    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
+
+
+@pytest.mark.parametrize("command", [
+    "Get-ChildItem > nul",
+    "Get-ChildItem 2>NUL",
+    "Get-ChildItem > NUL:",
+    "Get-ChildItem >> nul",
+])
+def test_powershell_nul_is_the_null_sink_on_windows(tmp_path, windows_nul,
+                                                    command):
+    windows_nul(True)
+    plan = _plan("PowerShell", command, _project(tmp_path))
+    assert not plan.mutating and plan.complete and not plan.targets, plan
+
+
+@_DEVICE_NAMES_ARE_FILES
+def test_powershell_nul_is_an_ordinary_file_off_windows(tmp_path, windows_nul):
+    windows_nul(False)
+    plan = _plan("PowerShell", "Get-ChildItem > nul", _project(tmp_path))
+    assert plan.mutating and plan.complete, plan
+    assert [os.path.basename(path) for path in plan.targets] == ["nul"]
+
+
+def test_quoted_dollar_null_is_not_the_sink_even_in_powershell(tmp_path):
+    # "$null" in double quotes is an empty-string path, not the null sink.
+    plan = _plan("PowerShell", 'Get-ChildItem > "$null"', _project(tmp_path))
+    assert plan.mutating and not plan.complete, plan
+
+
+# --- H1d: a runtime-expanded redirect target is never recorded literally ------
+# `> "$OUT"` used to plan a pre-image of a file literally named `$OUT` while the
+# shell wrote wherever $OUT pointed. Any target the shell expands before opening
+# it is unidentifiable before the command runs and takes the same fail-closed
+# path as any other target that could not be identified.
+
+UNRESOLVED_BASH_REDIRECTS = [
+    'echo x > "$OUT"',
+    "echo x > $OUT",
+    "echo x > ${OUT}",
+    'echo x > "${OUT}.txt"',
+    'echo x > "$HOME/x"',
+    "echo x > $HOME/x",
+    "echo x > $(mktemp)",
+    'echo x > "$(mktemp)"',
+    "echo x > `mktemp`",
+    "echo x > $((1 + 2)).txt",
+    "echo x > ~root/x",
+    "echo x > ~+/x",
+    "echo x > *.txt",
+    "echo x > out?.txt",
+    "echo x > [ab].txt",
+    "echo x > {a,b}.txt",
+    "echo x > $'a\\tb'",
+    "printf x 2> $LOG",
+    "printf x &> $LOG",
+    "printf x >| $LOG",
+    "printf x 2>/dev/null > $OUT",
+    "echo x > out.txt; echo y > $OUT",
+]
+
+
+@pytest.mark.parametrize("command", UNRESOLVED_BASH_REDIRECTS)
+def test_bash_expanded_redirect_target_is_unresolved(hook, tmp_path, command):
+    project = _project(tmp_path)
+    _tree(project, "out.txt", "a.txt")
+    plan = _plan("Bash", command, project)
+    assert plan.mutating and not plan.complete, plan
+    assert "redirect target is expanded" in plan.reason
+    decision, reason = hook("Bash", command, project)
+    assert decision == "deny", f"{command!r} was {decision}: {reason}"
+    assert "invariant:prestate-unavailable" in reason
+
+
+UNRESOLVED_POWERSHELL_REDIRECTS = [
+    "Get-Date > $OUT",
+    'Get-Date > "$OUT"',
+    "Get-Date > ${OUT}",
+    'Get-Date > "$env:TEMP\\x.txt"',
+    "Get-Date > $(Get-Name)",
+    'Get-Date > "$(Get-Name).txt"',
+    "Get-Date > *.txt",
+    "Get-Date > ~root\\x",
+    "Get-Date 2> $LOG",
+    "Get-Date *> $LOG",
+]
+
+
+@pytest.mark.parametrize("command", UNRESOLVED_POWERSHELL_REDIRECTS)
+def test_powershell_expanded_redirect_target_is_unresolved(tmp_path, command):
+    plan = _plan("PowerShell", command, _project(tmp_path))
+    assert plan.mutating and not plan.complete, plan
+    assert "redirect target is expanded" in plan.reason
+
+
+def test_powershell_expanded_redirect_target_denies_through_the_hook(hook,
+                                                                    tmp_path):
+    decision, reason = hook("PowerShell", 'Get-Date > "$OUT"', _project(tmp_path))
+    assert decision == "deny", reason
+    assert "invariant:prestate-unavailable" in reason
+
+
+# Quoted text without an expansion is a literal file name and stays exact. So
+# does an expansion in the command's data, as long as the target is literal.
+LITERAL_REDIRECT_TARGETS = [
+    ("Bash", "echo x > 'a$b'", "a$b"),
+    ("Bash", "echo x > 'out $(date).txt'", "out $(date).txt"),
+    ("Bash", "echo x > '`x`.txt'", "`x`.txt"),
+    ("Bash", 'echo x > "a\\$b"', "a$b"),
+    ("Bash", "echo x > a\\$b", "a$b"),
+    ("Bash", "echo x > 'my file.txt'", "my file.txt"),
+    ("Bash", 'echo "$HOME" > out.txt', "out.txt"),
+    ("Bash", "echo $(date) > out.txt", "out.txt"),
+    ("PowerShell", "Get-Date > 'a$b'", "a$b"),
+    ("PowerShell", "Get-Date > 'it''s.txt'", "it's.txt"),
+    ("PowerShell", 'Get-Date "$env:USERNAME" > out.txt', "out.txt"),
+]
+
+
+@pytest.mark.parametrize("tool,command,target", LITERAL_REDIRECT_TARGETS)
+def test_single_quoted_literal_target_stays_exact(tmp_path, tool, command, target):
+    project = _project(tmp_path)
+    plan = _plan(tool, command, project)
+    assert plan.mutating and plan.complete, plan
+    assert [os.path.basename(path) for path in plan.targets] == [target]
+
+
+def test_quoted_tilde_is_a_literal_folder_not_home(tmp_path):
+    project = _project(tmp_path)
+    plan = _plan("Bash", "echo x > '~/notes.txt'", project)
+    assert plan.complete, plan
+    assert plan.targets == [os.path.normcase(os.path.realpath(
+        os.path.join(str(project), "~", "notes.txt")))]
+
+
+def test_unquoted_home_tilde_resolves_like_the_shell(tmp_path):
+    plan = _plan("Bash", "echo x > ~/notes.txt", _project(tmp_path))
+    assert plan.complete, plan
+    assert plan.targets == [os.path.normcase(os.path.realpath(
+        os.path.expanduser(os.path.join("~", "notes.txt"))))]
+
+
+# The argv-based writers had the same flaw: `tee "$OUT"` planned `./$OUT`.
+UNRESOLVED_ARGV_WRITERS = [
+    'echo x | tee "$OUT"',
+    "echo x | tee out.txt $(mktemp)",
+    "dd if=/dev/zero of=$OUT bs=1 count=1",
+    'truncate -s 0 "$F"',
+    'cp notes.txt "$(pick)"',
+    "cp notes.txt `pick`",
+    "mv notes.txt $(pick)",
+    "install notes.txt $(pick)",
+]
+
+
+@pytest.mark.parametrize("command", UNRESOLVED_ARGV_WRITERS)
+def test_expanded_argv_write_target_is_unresolved(tmp_path, command):
+    project = _project(tmp_path)
+    _tree(project, "notes.txt", "out.txt")
+    plan = _plan("Bash", command, project)
+    assert plan.mutating and not plan.complete, plan
+    assert "runtime expansion" in plan.reason
+
+
+@pytest.mark.parametrize("command,targets", [
+    ("echo x | tee out.txt", ["out.txt"]),
+    ("dd if=/dev/zero of=out.txt bs=1 count=1", ["out.txt"]),
+    ("truncate -s 0 out.txt", ["out.txt"]),
+    ('truncate -s "$N" out.txt', ["out.txt"]),
+    ("truncate --size=0 -c out.txt", ["out.txt"]),
+])
+def test_literal_argv_write_target_stays_exact(tmp_path, command, targets):
+    project = _project(tmp_path)
+    _tree(project, "out.txt")
+    plan = _plan("Bash", command, project)
+    assert plan.mutating and plan.complete, plan
+    assert sorted(os.path.basename(path) for path in plan.targets) == targets
+
+
 # --- H2: a heredoc fed to a data consumer is data ----------------------------
 # A commit message containing `->` is not a redirect. A heredoc bash itself
 # executes still is inspected.
