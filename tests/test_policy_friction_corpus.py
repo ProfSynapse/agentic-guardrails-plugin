@@ -310,6 +310,111 @@ def test_a_real_truncating_redirect_beside_a_duplication_still_plans(hook, tmp_p
     assert "could not be identified" not in reason
 
 
+# --- H1b: the null device and input redirects name no written file ------------
+# `cmd >>/dev/null` was denied as a target-less write: the null-sink scan took
+# only the second `>` of `>>` and left a lone `>` for the overwrite scan. A
+# null redirect closed by `)` (a subshell or `$(...)`) was missed the same way.
+# Every row here creates or modifies nothing, so the planner must see no
+# mutation at all, not merely a complete plan.
+
+NON_WRITING_REDIRECTS = [
+    ("Bash", "nexus --help 2>&1 | head -1"),
+    ("Bash", "uv run pytest -q 2>&1 | tail -3"),
+    ("Bash", "ls src 2>/dev/null"),
+    ("Bash", "ls 2>&-"),
+    ("Bash", "ls >&-"),
+    ("Bash", "exec 3>&-"),
+    ("Bash", "cmd 3>&1 1>&2 2>&3"),
+    ("Bash", "ls > /dev/null"),
+    ("Bash", "ls &>/dev/null"),
+    ("Bash", "ls >>/dev/null"),
+    ("Bash", "ls 1>>/dev/null"),
+    ("Bash", "ls 2>>/dev/null"),
+    ("Bash", "ls &>>/dev/null"),
+    ("Bash", "ls >> /dev/null 2>&1"),
+    ("Bash", "ls >>/dev/null; ls"),
+    ("Bash", "(ls >/dev/null)"),
+    ("Bash", "x=$(ls 2>/dev/null)"),
+    ("Bash", "wc -l < in.txt"),
+    ("Bash", "sort <in.txt | head"),
+    ("Bash", "diff <(sort in.txt) <(sort in.txt)"),
+    ("Bash", "echo '2>&1' | cat"),
+    ("PowerShell", "Get-ChildItem 2>>$null"),
+    ("PowerShell", "Get-ChildItem >> $null"),
+    ("PowerShell", "Get-ChildItem 2>$NULL"),
+]
+
+
+def _plan(tool, command, cwd):
+    from core import engine, mutations
+    from core.events import EXEC, ToolEvent
+    event = ToolEvent(kind=EXEC, tool=tool, command=command, cwd=str(cwd))
+    return mutations.plan([event], engine.clobber_targets, plugin_root=REPO)
+
+
+@pytest.mark.parametrize("tool,command", NON_WRITING_REDIRECTS)
+def test_non_writing_redirect_is_not_a_mutation(hook, tmp_path, tool, command):
+    project = _project(tmp_path)
+    _tree(project, "in.txt")
+    plan = _plan(tool, command, project)
+    assert not plan.mutating and plan.complete and not plan.targets, plan
+    decision, reason = hook(tool, command, project)
+    assert decision in ("allow", "defer"), f"{command!r} was {decision}: {reason}"
+
+
+def test_agw_launcher_with_stream_duplication_and_pipe_is_allowed(hook, tmp_path):
+    decision, reason = hook("Bash", "agw --json doctor 2>&1 | head -80",
+                            _project(tmp_path))
+    assert decision == "allow", reason
+    assert "agw-impostor" not in reason
+
+
+# A redirect into a real file must still plan a pre-image of exactly that file,
+# including when it sits beside a harmless null or duplication redirect.
+FILE_REDIRECT_TARGETS = [
+    ("echo hi > out.txt", "out.txt"),
+    ("ls 2> err.log", "err.log"),
+    ("ls &> f", "f"),
+    ("ls >| f", "f"),
+    ("ls 3> out.txt", "out.txt"),
+    ("ls >>/dev/null > out.txt", "out.txt"),
+    ("ls 2>/dev/null >f", "f"),
+]
+
+
+@pytest.mark.parametrize("command,target", FILE_REDIRECT_TARGETS)
+def test_file_redirect_plans_its_exact_target(tmp_path, command, target):
+    project = _project(tmp_path)
+    _tree(project, "out.txt", "err.log", "f")
+    plan = _plan("Bash", command, project)
+    assert plan.mutating and plan.complete, plan
+    assert [os.path.basename(path) for path in plan.targets] == [target]
+
+
+# Only the exact `/dev/null` is the sink. A lookalike is an ordinary target the
+# planner cannot snapshot (or, for `/DEV/NULL`, a real file it must snapshot);
+# `>& file` writes both streams to a file and is not a stream duplication.
+@pytest.mark.parametrize("command", [
+    "ls >/dev/nullx",
+    "ls > /dev/null/../etc/x",
+    "ls >/dev/null2 2>&1",
+    "ls >& f",
+])
+def test_null_device_lookalikes_still_deny(hook, tmp_path, command):
+    project = _project(tmp_path)
+    _tree(project, "f")
+    decision, reason = hook("Bash", command, project)
+    assert decision == "deny", f"{command!r} was {decision}: {reason}"
+    assert "invariant:prestate-unavailable" in reason
+
+
+def test_uppercase_null_path_is_an_ordinary_target(tmp_path):
+    plan = _plan("Bash", "ls > /DEV/NULL", _project(tmp_path))
+    assert plan.mutating
+    assert [os.path.normcase(path) for path in plan.targets] \
+        == [os.path.normcase(os.path.realpath("/DEV/NULL"))]
+
+
 # --- H2: a heredoc fed to a data consumer is data ----------------------------
 # A commit message containing `->` is not a redirect. A heredoc bash itself
 # executes still is inspected.

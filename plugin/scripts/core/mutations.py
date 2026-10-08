@@ -28,8 +28,14 @@ _LOCAL_MUTATION = re.compile(
     r"cp|mv|install|tee|dd|truncate)\b"
 )
 _OVERWRITE_REDIRECT = re.compile(r"(?<!>)>(?!>)")
+# A redirect into the null device, truncating or appending, names no file.
+# The whole operator goes: matching only the second `>` of `>>/dev/null` left
+# a lone `>` that the overwrite scan read as a target-less truncation. Only
+# the exact lowercase `/dev/null`, ended by a shell word boundary (including
+# the `)` closing a subshell or `$(...)`), is the sink; `/dev/nullx`,
+# `/dev/null/..`, and `/DEV/NULL` stay ordinary targets.
 _NULL_REDIRECT = re.compile(
-    r"(?i)(?:\d*|&)?>\|?\s*(?:\$null|nul:?|/dev/null)(?=$|[\s;&|])"
+    r"(?:\d*|&)?(?:>>|>\|?)\s*(?:(?i:\$null|nul:?)|/dev/null)(?=$|[\s;&|)])"
 )
 # `2>&1`, `>&2`, `>&-`, and PowerShell's `*>&1` duplicate or close a stream.
 # They never name a file, so they are not overwrite evidence; left in the
