@@ -826,7 +826,7 @@ def _newest_available_by_source(records) -> dict:
 
 
 def _newer_copy_verified(item: dict, newest_by_source: dict, cache: dict) -> bool:
-    """Under pressure a record may yield only behind a verified newer copy.
+    """A record may yield only behind a verified newer copy.
 
     The newest usable copy of the same source must exist, be a different
     record, and pass its artifact fingerprint check right now.
@@ -932,9 +932,12 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
         max_candidates = policy.max_candidates
         max_reclaim_bytes = policy.max_reclaim_bytes
     protected = protection_map(snapshot, now_ns=now_ns, policy=policy)
+    newest_by_source = _newest_available_by_source(snapshot["records"])
+    verified = {}
     eligible = [
         item for item in snapshot["records"]
         if not protected[item["transaction_id"]]
+        and _newer_copy_verified(item, newest_by_source, verified)
     ]
     # Eligibility already encodes recency/activity guarantees. Within that
     # safe set, reclaim larger artifacts first so the bounded candidate count
@@ -948,8 +951,6 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
             snapshot, now_ns=now_ns, policy=policy, capacity_pressure=True
         )
         chosen = {item["transaction_id"] for item in eligible}
-        newest_by_source = _newest_available_by_source(snapshot["records"])
-        verified = {}
         pressure_eligible = [
             item for item in snapshot["records"]
             if item["transaction_id"] not in chosen
@@ -1334,7 +1335,7 @@ def apply_plan(home: str, plan: dict, *, expected_plan_hash: str,
             if current is None:
                 raise StalePlanError(f"planned candidate changed: {transaction_id}")
             reasons = list(protected[transaction_id])
-            if pressure and not reasons and not _newer_copy_verified(
+            if not reasons and not _newer_copy_verified(
                     current, newest_by_source, newer_verified):
                 # Re-checked at apply time: the newer copy this record yields
                 # behind must still exist and verify right now.

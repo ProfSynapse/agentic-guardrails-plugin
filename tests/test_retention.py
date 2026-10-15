@@ -258,6 +258,25 @@ def test_oversized_batch_cannot_smuggle_multiple_artifacts(tmp_path, agw_home):
         )
 
 
+def test_expired_history_survives_corruption_of_the_newest_copy(tmp_path, agw_home):
+    source = tmp_path / "original.pdf"
+    old = _archive(agw_home, source, 1, 60)
+    newest = _archive(agw_home, source, 2, 59)
+    _source_mtime(source, 50)
+    plan = _pressured_plan(agw_home)
+    assert _candidate_ids(plan) == {old["transaction_id"]}
+    Path(newest["dest"]).write_bytes(b"corrupt newest copy")
+    # Both fresh selection and application of an earlier plan must keep the
+    # last verified bytes, including normal expired-history cleanup.
+    assert not _pressured_plan(agw_home)["candidates"]
+    result = retention.apply_plan(
+        agw_home, plan, expected_plan_hash=plan["plan_sha256"],
+        now_ns=NOW, activity_records=[],
+    )
+    assert result["reclaimed_bytes"] == 0
+    assert os.path.isfile(old["dest"])
+
+
 def test_plan_binds_policy_store_inventory_and_expires(tmp_path, agw_home):
     source = tmp_path / "bound.txt"
     _archive(agw_home, source, 1, 60)
