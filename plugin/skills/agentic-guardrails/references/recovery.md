@@ -9,6 +9,7 @@ refuses ordinary files/directories; use `--expected-target` when known.
 
 Declare exact outputs separately from observed roots. Roots detect undeclared
 sidecars after execution; they neither prevent writes nor recover unknown files.
+Exact outputs do not enumerate siblings. `run --dry-run` is contract-only.
 
 A run plan is hash-bound and revalidated before its durable claim. It is then
 consumed even on failure. `stdout-read-only` requires true filesystem enforcement.
