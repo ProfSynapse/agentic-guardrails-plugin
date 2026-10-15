@@ -329,6 +329,56 @@ def test_crash_after_claim_cannot_replay(tmp_path, monkeypatch):
     assert target.read_bytes() == b"irreplaceable original"
 
 
+@pytest.mark.parametrize("exit_after_publication", [False, True])
+def test_process_exit_retains_claim_and_prevents_duplicate_publication(
+    tmp_path, exit_after_publication,
+):
+    target, plan = prepared(tmp_path)
+    finish_stage(plan)
+    # Exit without unwinding Python context managers, on either side of the
+    # filesystem effect but before the completed operation record is written.
+    script = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+import media_ops
+publish = media_ops._save_separately
+def interrupted(*args, **kwargs):
+    if sys.argv[4] == 'published':
+        publish(*args, **kwargs)
+    os._exit(73)
+media_ops._save_separately = interrupted
+media_ops.continue_operation(sys.argv[3], 'save-separately')
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(PLUGIN / "scripts"),
+         str(PLUGIN / "scripts/agw"), plan["id"],
+         "published" if exit_after_publication else "claimed"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert crashed.returncode == 73, crashed.stderr
+    assert review.read(plan["id"])["state"] == "claimed"
+    assert target.read_bytes() == b"irreplaceable original"
+    output = Path(plan["separate_path"])
+    stage = Path(plan["staged_path"])
+    if exit_after_publication:
+        assert output.read_bytes() == b"finished replacement"
+        assert not stage.exists()
+    else:
+        assert not output.exists()
+        assert stage.read_bytes() == b"finished replacement"
+    # A new process must acquire the abandoned lock and refuse replay. A hung
+    # lock or a second publication is a failure, even if bytes look correct.
+    retry = cli("media", "continue", plan["id"], "--action", "save-separately")
+    assert retry.returncode != 0
+    failure = json.loads(retry.stderr)["error"]
+    assert failure["code"] == "media_operation_blocked"
+    assert "already used" in failure["message"]
+    assert target.read_bytes() == b"irreplaceable original"
+    assert output.exists() is exit_after_publication
+    assert review.read(plan["id"])["state"] == "claimed"
+
+
 def test_metadata_limit_and_expiration_are_bounded(tmp_path, monkeypatch):
     monkeypatch.setattr(review, "MAX_RECORDS", 2)
     first = media_ops.prepare(str(original(tmp_path, "one.mp4")))

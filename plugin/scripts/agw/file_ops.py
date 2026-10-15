@@ -30,7 +30,8 @@ DEFAULT_READ_BYTES = 32 * 1024
 MAX_READ_OUTPUT_BYTES = 256 * 1024
 MAX_CAPTURE_BYTES = execution.MAX_CAPTURE_BYTES
 OUTPUT_OBSERVATION_SECONDS = 5.0
-PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Use the same configured policy pack as status, archive, restore and Office.
+PLUGIN_ROOT = retention_config.PLUGIN_ROOT
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _HUNK_RE = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"

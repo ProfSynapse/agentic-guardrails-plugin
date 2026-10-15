@@ -1,5 +1,57 @@
 # Linux validation and deployment boundaries
 
+## Extended workflow and interruption testing 2026-10-15
+
+Ten additional uncoached conversations on installed runtime `6fa9590` exercised
+24 turns across the same two authenticated hosts. Two later follow-ups finished
+the changed-original cases. At most two host processes ran concurrently.
+
+| Workflow | Observed result in both hosts |
+| --- | --- |
+| Three successive text edits | Exact requested changes, no user clarification, media untouched |
+| Replace, undo, replace again | Correct bytes at each step; original recoverable; supplied revision retained |
+| Original changed externally while waiting | Stale write refused; intervening version preserved |
+| Explicit follow-up after that conflict | Fresh replacement succeeded; intervening version archived exactly |
+| Fresh session after a paused request | Completed explicit replacement with original recovery, without a second approval |
+| Full media budget, then ordinary text edit | Media replacement refused; document edit still completed; covers untouched |
+
+The session-handoff cases started a new conversation without the previous chat
+history. They did not kill a running model or interrupt a partially published
+file. In the changed-original case, the fixture driver simulated an external
+edit; Guardrails cannot recover the version overwritten by that external writer.
+Claude explained the conflict and offered choices. Codex safely stopped but
+required another user turn to inspect and continue. Some Claude replies exposed
+unnecessary implementation details or unrelated connector authorization notices.
+No evidence here attributes those unrelated connector notices to Guardrails.
+
+Separate subprocess regressions terminate the Python process with `os._exit`
+after its durable claim, both before and after publishing a separate output.
+Original bytes survive, any published output remains intact, and a new CLI
+process acquires the released lock and refuses replay. These test process exit
+on a functioning filesystem, not power loss or an uncooperative external writer.
+
+A new CLI storage soak reproduced a configuration defect: `status` honored
+`CLAUDE_PLUGIN_ROOT`, while ordinary file mutations used the source-relative
+policy root. A 512 KiB policy cap was reported but an edit grew recovery beyond
+it. File operations now share the policy-root resolver already used by other
+CLI paths. Regression checks cover both refusal at a 64-byte configured cap and
+24 successive 64 KiB document edits across multiple automatic-cleanup cycles
+under 512 KiB, followed by an exact restore. No manual prune or fixture aging is
+used. This issue concerns differing policy roots, not every default installation
+or environment-variable budget.
+
+Full regression suite after the policy-root correction: **2,080 passed,
+58 skipped** (including the two process-exit cases and both new policy/capacity
+regressions). Existing platform/optional skips remain; these are not extra
+live-host coverage claims.
+
+Evidence index: `/var/tmp/agw-worker-20261015-sksj7w0_/stress-index.json`.
+Changed-original follow-ups:
+`/var/tmp/agw-stale-followup-i6v3gmnv/results.json`. Raw host logs remain in the
+worker's `~/.local/share/agw-pilot/natural-tests` and `stress-batch-20261015`.
+The runtime fix and new regressions follow these live-host observations; later
+validation must name the tested revision rather than relabel the earlier runs.
+
 ## Natural-workflow friction assessment 2026-10-15
 
 The same authenticated worker ran ordinary user requests without supplied CLI
