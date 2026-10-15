@@ -109,7 +109,8 @@ def capacity_instruction(details=None) -> str:
                 f"and this change needs {required:,} more. Automatic cleanup has already run "
                 "within the affected storage class; document history and the newest usable "
                 "recovery copies remain protected. Inspect `agw status` for per-class usage. "
-                + guidance + " Manual pruning is not required.")
+                + guidance + " Manual pruning uses the same protections; it cannot remove "
+                "protected copies to make room. It is not required.")
     sizing = ""
     if maximum > 0:
         sizing = f" The cap is {maximum:,} bytes"

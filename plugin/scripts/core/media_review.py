@@ -134,7 +134,9 @@ def describe(record):
                     "No permanent-delete option. No automatic expiration of the sole recovery copy.",
         "instruction": "A user choice is required, not a second confirmation. If the user already "
                        "explicitly chose this exact target, action and recovery behavior, use that "
-                       "choice now. Otherwise ask and wait; never infer consent from this ID. "
+                       "choice now. Replacement intent alone is not a recovery choice: 'use the new "
+                       "cover' still needs clarification; 'replace it and keep a recovery copy' does not. "
+                       "Otherwise ask and wait; never infer consent from this ID. "
                        "Do not retry the original overwrite. For replacement or separate output, "
                        "create the finished replacement at staged_path if no "
                        "supplied_stage is recorded (otherwise preserve that exact staged version), then "
@@ -243,8 +245,9 @@ def require_review(targets, policy_revision, *, operation="replace", staged=""):
         pending = prepare(target, policy_revision, operation=operation, staged=staged)
         raise MediaReviewRequired(
             "Media operation paused; nothing was changed. Continue using an already-explicit "
-            "user choice for this exact target, action and recovery behavior; otherwise ask "
-            "the user to choose. Do not retry the original operation. "
+            "user choice for this exact target, action and recovery behavior. A generic request "
+            "to update or replace a file does not choose recovery versus keeping both. "
+            "If that choice is missing, ask the user. Do not retry the original operation. "
             + json.dumps(pending, ensure_ascii=False, separators=(",", ":")),
             pending,
         )

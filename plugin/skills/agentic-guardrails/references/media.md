@@ -3,6 +3,7 @@
 On `media_review_required` / `clarify-media-operation`, reuse an explicit user
 choice for this exact target, action and recovery behavior without asking again.
 "Replace cover.png and keep a recovery copy" already chooses replace.
+"Use the new cover" does not choose what happens to the old one: ask.
 Otherwise ask once and wait. An ID alone never authorizes continuation.
 
 - Replacement: replace with recovery, save separately, or cancel.
@@ -25,8 +26,7 @@ replace permanently or overwrite a separate destination. Expired/changed
 operations need preparation again. Claimed operations cannot replay: use
 `agw media status ID --json`, inspect files and follow transaction recovery.
 
-Cancellation/expiry leave staged media intact. Success retires only verified
-owned stages; supplied stages remain. Sole recovery copies and removal archives
-do not expire automatically. Only eligible redundant history is auto-pruned;
-a full protected store blocks growth. No seven-day deletion promise or render
-size limit is implemented. PDFs/documents keep normal automatic recovery.
+Cancel/expiry retain stages. Success retires verified owned stages; supplied
+files remain. Sole recovery copies and removal archives never auto-expire.
+Only eligible redundant history is auto-pruned; protected copies block growth.
+No seven-day bin or render size cap. PDFs/documents keep automatic recovery.

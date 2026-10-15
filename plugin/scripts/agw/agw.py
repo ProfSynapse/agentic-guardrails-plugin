@@ -2915,7 +2915,7 @@ def main(argv=None):
         example="agw office patch report.docx --ops-file patch.json --expected-file-hash SHA256",
     )
     add("prune", cmd_prune, (["--yes-i-am-a-human"], {"action": "store_true"}),
-        help="human-only permanent archive cleanup")
+        help="repeat safe automatic cleanup")
 
     contract_problem = agw_contract.registration_problem(sub.choices)
     if contract_problem:
