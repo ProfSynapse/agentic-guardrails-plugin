@@ -1,8 +1,10 @@
 # Native Windows candidate validation — 2026-10-15
 
-Release remains gated on a fresh Codex hook review and live enforcement rerun.
-The tests found a real Windows bootstrap defect; installed/trusted metadata alone
-was insufficient evidence of protection.
+The user completed the corrected Codex hook review; all three hashes are
+verified trusted. Live Windows validation runs in the logged-in desktop session
+with the Codex workspace-write sandbox enabled. The tests found a real Windows
+bootstrap defect; installed/trusted metadata alone was insufficient evidence
+of protection.
 
 ## Environment and scope
 
@@ -91,11 +93,54 @@ identity instead of requiring identical parent-path casing. These changes do
 not weaken the content or recovery assertions.
 
 The corrected Codex pilot is installed as local `0.7.0-rc.2`; all 85 runtime,
-hook, policy, skill and launcher files match the staged source. The hook definitions
-changed, so the user's prior trust hashes no longer authorize them. Review the
-new definitions with `/hooks`, start a fresh task and rerun text recovery,
-media replacement/restore, full-budget keep-both and cancellation. Until then,
-Codex live Windows parity remains unverified and the release stays draft.
+hook, policy, skill and launcher files match the staged source. The user reviewed
+the modified definitions; `hooks/list` confirms all three current hashes trusted.
+An app-server probe recorded SessionStart completing with Guardrails context,
+and live PreToolUse calls rewrote the short launcher to the installed package.
+
+The first post-review sessions still could not execute the launcher inside the
+Windows sandbox over SSH: process exit `-1073741502`. A standalone `codex sandbox`
+PowerShell probe reproduced the same error without a Guardrails operation.
+The identical sandbox probes succeeded from a temporary non-admin scheduled task
+using the existing interactive logon. Live workflow tests therefore use that
+session with the workspace-write sandbox still enabled. No sandbox, hook trust,
+ACL or execution-policy setting was weakened; no account password was captured.
+The SSH failures are excluded from workflow passes, and further hook review
+would not fix that environment-specific process-start problem.
+
+## Codex live workflows after hook review
+
+All four fresh conversations (eight turns) passed in the interactive Windows
+session with the normal workspace-write sandbox. Recovery files were inspected,
+and text restoration was checked byte-for-byte including CRLF line endings.
+
+| Workflow | Observed outcome | Tool calls by turn | Seconds by turn |
+| --- | --- | --- | --- |
+| Text date change, then undo | Original and edited preimages archived; exact original restored | 10, 5 | 71.7, 45.5 |
+| Explicit image replacement, then restore | Original archive verified; original restored and revised source preserved | 6, 4 | 66.7, 39.8 |
+| Full protected media budget, then keep both | Same operation ID; original unchanged; supplied revised file reused, zero extra copies | 5, 1 | 48.3, 19.4 |
+| Request to wait, then cancel | Prepared operation cancelled; both images unchanged, no new media file | 4, 1 | 39.8, 20.7 |
+
+No repeat authorization was requested for the explicitly authorized replacement.
+The capacity response offered only keep-both/cancel and no cleanup or settings
+workaround, although it repeated the question and quoted a skill instruction.
+The preserving follow-up needed one tool call. Ordinary text editing remained
+verbose internally: ten calls versus Claude's two in its observed run. These
+are single-run timings, not controlled latency benchmarks; further help-lookup
+and wording polish remains worthwhile without changing the preservation rules.
+
+Evidence: `interactive-matrix-done.json` and `interactive-results.json` under the
+Windows test root. Case suffixes: `1792093879485912100` (text),
+`1792094071100977000` (replace/restore), `1792094177747391900` (capacity),
+`1792094245688038700` (cancel). Local evidence mirror:
+`/var/tmp/agw-windows-release/interactive-results.json`. The harness initially
+mistook an archive directory ending in `.md` for a file; filtering regular files
+fixed verification without repeating the successful text conversation. Both
+temporary scheduled tasks were removed after completion. CI on `a6c6665` passed
+on all three platforms; this follow-up changes evidence documentation only.
+
+The tested native Windows recovery gate is complete. PR62 remains draft; no
+release version, tag, merge or publication was performed.
 
 These checks do not establish a render/output quota, off-machine backup,
 cloud-placeholder parity, every host/tool surface, or arbitrary host-failure
