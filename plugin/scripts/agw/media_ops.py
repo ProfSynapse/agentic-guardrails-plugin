@@ -125,7 +125,14 @@ def _block_capacity(record, details, stage_identity=None, stage_hash=""):
                + " Automatic cleanup cannot remove protected recovery copies.")
     return review.MediaCapacityBlocked(message, {
         **review.describe(record), "cause_code": "archive_capacity_exceeded",
-        "capacity": details, "target_mutation_started": False,
+        # Keep configuration advice and internal retention journals in status,
+        # not in the normal choice prompt. They are not executable alternatives
+        # for this operation and encourage agents to invent a settings workflow.
+        "capacity": {key: details[key] for key in (
+            "storage_budget", "maximum_bytes", "required_free_bytes",
+            "original_bytes", "reason",
+        ) if key in details},
+        "target_mutation_started": False,
     })
 
 

@@ -252,6 +252,10 @@ def test_full_capacity_offers_same_operation_preserving_continuation(
     assert details["state"] == "capacity-blocked"
     assert details["target_mutation_started"] is False
     assert details["choices"] == ["save-separately", "cancel"]
+    assert details["capacity"]["storage_budget"] == "media"
+    assert "remediation" not in details["capacity"]
+    assert "policy" not in details["capacity"]
+    assert "remediation" in review.read(plan["id"])["failure_details"]
     assert details["continue_argv"][action][3] == plan["id"]
     assert target.read_bytes() == b"o" * 100_000
     assert retained.read_bytes() == b"r" * 330_000
