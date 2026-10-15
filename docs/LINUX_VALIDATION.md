@@ -1,5 +1,48 @@
 # Linux validation and deployment boundaries
 
+## Router clarity follow-up 2026-10-15
+
+The `af337af` Claude trace loaded the main skill but did not read the media
+reference. It did not query detailed media status either; its unsupported cleanup
+advice was not evidence that status diagnostics had contradicted the refusal.
+The main skill now requires reading the matching reference, reusing explicit
+user choices, running routine commands, and offering only returned alternatives
+on refusal without inventing cleanup/configuration workarounds. Detailed
+transaction rules live in references; this also removes a stale root-level claim
+that crash-resumable rollback was not implemented.
+
+Initial router revision `becd622` passed eight live conversations, including four
+capacity refusals without unsupported clearing advice. Codex still sometimes
+selected generic publishing for a staged image. Revision `d24588c` explicitly
+gives existing-media routing precedence, including staged replacements. The root
+remains 3,125 characters, within its existing budget; no runtime safeguards or
+retention policy changed. All **12 context checks** passed. The generic skill
+validator and packaged-source verifier reported zero errors/warnings (nine files,
+8,919 bytes; `INTACT`).
+
+Both worker host installations matched all 82 source files at `d24588c`. Eight
+fresh conversations (12 turns, at most two host processes concurrently) verified:
+
+- All six media conversations read the media reference before acting.
+- Four full-budget cases offered only keep-both/cancel, with no suggestion to
+  clear/restore protected history or change settings. Each keep-both follow-up
+  used the same ID in one tool call; both original and revision remained intact,
+  with zero additional media copies.
+- Both explicit replacements completed without another confirmation, preserved
+  the supplied revision and saved an exact recoverable original.
+- Both ordinary text edits produced the requested bytes and left media intact.
+
+These are observed runs, not a guarantee of model wording. One Claude capacity
+reply still added that storage would need room before replacement; it supplied
+no unsupported cleanup procedure or third choice. Explanations vary in verbosity.
+The deterministic refusal/continuation checks remain the enforcement boundary.
+
+Evidence: `/var/tmp/agw-router-index-lmb8s5sw/index.json` (initial router),
+`/var/tmp/agw-router-index-x2kzoj6o/index.json` (final routing). Raw worker logs:
+`~/.local/share/agw-pilot/router-tests` and `router-priority-tests`. Prior findings
+below remain revision-specific. Both pilots are installed at `d24588c`; PR62
+remains draft with no release performed.
+
 ## Keep-both and capacity-continuation fixes 2026-10-15
 
 Runtime `e552ec6` fixes the duplicate-copy and consumed-operation friction found
