@@ -49,8 +49,25 @@ Evidence index: `/var/tmp/agw-worker-20261015-sksj7w0_/stress-index.json`.
 Changed-original follow-ups:
 `/var/tmp/agw-stale-followup-i6v3gmnv/results.json`. Raw host logs remain in the
 worker's `~/.local/share/agw-pilot/natural-tests` and `stress-batch-20261015`.
-The runtime fix and new regressions follow these live-host observations; later
-validation must name the tested revision rather than relabel the earlier runs.
+The runtime fix and new regressions follow these live-host observations.
+
+Corrected runtime `8d1faf8` was then installed in both hosts, with all 82 packaged
+runtime/hook/policy/skill files verified against source. Each installed CLI
+passed the 64-byte policy refusal and 24-edit storage soak, with peak archive
+usage 466,977 bytes (Codex package) and 467,005 bytes (Claude package), below
+the 524,288-byte cap. Both restored revision 23 exactly. These are CLI tests,
+separate from host interception. Report:
+`/var/tmp/agw-installed-soak-_tru1swp/results.json`.
+
+Four further fresh host conversations on `8d1faf8` completed a text edit and
+explicit recoverable media replacement in each host. Recovery bytes were
+independently checked for all four. Claude's text path used native Read then Edit
+(12.3 seconds, two tool calls); the hook captured the original automatically.
+Codex's text path took 40.8 seconds and nine calls. Media replacements completed
+without another question in 21.0 seconds / seven calls (Claude) and 19.8 seconds /
+seven calls (Codex). These individual timings vary with host/model behavior and
+do not isolate plugin overhead. Reports: `post-root-index.json` alongside the
+stress index and `/var/tmp/agw-post-root-verified-twoxrveh/results.json`.
 
 ## Natural-workflow friction assessment 2026-10-15
 
