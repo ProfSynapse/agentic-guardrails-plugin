@@ -1,5 +1,54 @@
 # Linux validation and deployment boundaries
 
+## Worker pilot validation 2026-10-15
+
+Ubuntu 26.04, Python 3.14, Codex CLI 0.162.1 and Claude Code 2.1.285.
+Candidate runtime: `c0a949717d57db9d425a3440dafe45df18e81126` (PR #62).
+The isolated worker has its own authenticated host sessions and `agw-pilot`
+marketplace. The package still reports version 0.6.0; the pilot is pinned to
+the candidate source, not the released `v0.6.0` tag.
+
+Codex's hooks were trusted through `/hooks`, without bypass flags or synthesized
+trust records. The previous user-level Guardrails hook registrations were backed
+up and removed, so the candidate is the sole active Guardrails registration.
+Both installed copies matched 82 source files covering runtime, hooks, policies
+and skills. Codex requires its complete standalone package, including resources
+and package metadata; copying only the executables does not support normal
+interactive startup. Its final installation health check reported no failures.
+
+Actual authenticated host sessions used disposable plaintext `.mp4` fixtures to
+test extension-based protection. Native transcripts and independently checked
+fixture bytes established these results:
+
+| Scenario | Claude Code | Codex CLI |
+| --- | --- | --- |
+| Native shell media overwrite | Hook denied; asked for a choice | Hook denied; asked for a choice |
+| Save separately in resumed conversation | Original preserved; timestamped output verified | Same |
+| Replace in resumed conversation | Recovery saved; replacement verified | Same |
+| Restore through the host | Original restored byte-for-byte | Same |
+| Cancel in resumed conversation | Zero media changes; no output created | Same |
+| Ordinary native shell read | Succeeded | Succeeded |
+| Native shell deletion | Hook denied; original retained | Model declined before invoking tool |
+| Native `apply_patch` media update | Not applicable | Hook denied; original retained |
+| Native `apply_patch` deletion | Not applicable | Model declined before invoking tool |
+
+This verifies 14 live-host scenarios. The two Codex deletion-hook scenarios
+remain inconclusive: repeating each with explicit synthetic-test authorization
+still produced no tool invocation. Those four model refusals are not evidence
+of hook interception. No hook or instruction source was disabled to force them.
+
+Separately, 12 installed-CLI smoke cases passed (six per host package):
+replacement/restore with replay refusal, separate output, cancellation,
+archive refusal followed by reversible archive/restore, oversized-original
+refusal, and changed-original refusal. The oversized case used a sparse 20 GiB
+file with less than 1 MiB allocated and confirmed no recovery archive was
+created. It does not establish a limit on newly rendered output size.
+
+These results establish the tested pilot paths, not hardened policy deployment,
+all host tool surfaces, failure/timeout behavior, or Windows/macOS live-host
+parity. The pilot packages and configuration remain worker-writable. Content
+decoding and actual video rendering were not part of these fixtures.
+
 ## Validation performed 2026-10-04
 
 Ubuntu 26.04, Python 3.14, Codex CLI 0.160.0 and Claude Code 2.1.285.

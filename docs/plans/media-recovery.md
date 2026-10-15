@@ -2,7 +2,10 @@
 
 Status: automatic capacity fixes, storage-budget separation and conversational
 media continuations implemented on
-`fix/automatic-backup-capacity` (PR #62). Not yet released or installed.
+`fix/automatic-backup-capacity` (PR #62). Not yet released. Revision `c0a9497`
+is installed in an isolated Linux worker pilot for Codex and Claude Code;
+[live-host validation](../LINUX_VALIDATION.md#worker-pilot-validation-2026-10-15)
+verified the conversational media flow in both hosts.
 Content-addressed objects and resumable large-file capture remain future work.
 
 ## Current behavior
