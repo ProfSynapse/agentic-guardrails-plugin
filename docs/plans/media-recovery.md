@@ -2,11 +2,61 @@
 
 Status: automatic capacity fixes, storage-budget separation and conversational
 media continuations implemented on
-`fix/automatic-backup-capacity` (PR #62). Not yet released. Revision `c0a9497`
+`fix/automatic-backup-capacity` (PR #62). Not yet released. Revision `6fa9590`
 is installed in an isolated Linux worker pilot for Codex and Claude Code;
 [live-host validation](../LINUX_VALIDATION.md#worker-pilot-validation-2026-10-15)
 verified the conversational media flow in both hosts.
 Content-addressed objects and resumable large-file capture remain future work.
+
+## Reducing dependence on agent instructions
+
+Natural-language pilot tests found that correct storage enforcement alone does
+not produce a consistent user experience. Both hosts originally asked again
+after an explicit replace-with-recovery request. Relaxing that wording then led
+Claude to treat a generic update request as a recovery choice. A full protected
+store correctly refused replacement, but Claude offered manual pruning that
+could not remove the protected copies. Clarified instructions and corrected CLI
+help address immediate confusion; they do not turn conversation into a reliable
+consent channel. See the dated natural-workflow results in Linux validation.
+
+Proposed next work, not implemented policy:
+
+1. Give the publication API a configured preservation default. An ambiguous
+   media write would deliver a separate output and report its actual path;
+   explicit replacement would remain a distinct operation requiring verified
+   recovery. Apply this to typed publication operations, not blind rewriting of
+   arbitrary shell commands or implicit changes to downstream file references.
+   The default needs a product decision: an extra file may not satisfy a request
+   to update an existing path, and accumulating outputs also consumes disk.
+2. Have preparation compute feasible actions and their storage costs. Return
+   structured reasons when replacement is unavailable and the exact supported
+   next operations, rather than expecting the agent to invent remediation.
+   Recheck admission under the recovery lock at execution time; a preview is
+   not a disk reservation. Keep durable claims and ambiguous-failure inspection.
+   After a proven no-write capacity refusal, a typed recovery operation could
+   inspect and prepare the alternative itself. Do not make the model replay a
+   consumed ID or guess how to create a fresh one; never auto-retry an uncertain
+   partial publication.
+3. Add an explicit keep-existing-output result when the finished revision
+   already exists separately. Verify both identities and report that path without
+   making a third copy, moving someone else's input, or creating writable
+   hardlink aliases. Reserve timestamped publication for an actual new output.
+4. Bound generated output independently of recovery. A staging wrapper can own
+   new output and reject publication over a limit, but a post-render size check
+   does not stop a 20 GiB render from filling disk. A hard growth limit needs
+   filesystem quotas or enforcement in a controlled writer/worker. Free-space
+   checks and polling are useful early warnings, not hard guarantees.
+5. Keep automatic retention in code, with deterministic eligibility and receipt
+   validation. If sole-copy expiration is ever added, require a separately agreed
+   policy and a real review surface; never infer permission from file type, an
+   operation ID, or an agent-supplied approval flag. Give users a storage summary
+   and selectable eligible cleanup instead of requiring terminal maintenance.
+
+The release criterion should include uncoached workflows with wrong or missing
+agent explanations: originals stay recoverable, no unsupported deletion option
+exists, normal edits require no user intervention, and capacity failures have a
+short usable route forward. Test typed APIs independently of prompts, then test
+both real hosts repeatedly to measure questions, retries, copies and latency.
 
 ## Current behavior
 
