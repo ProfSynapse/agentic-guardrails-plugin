@@ -240,11 +240,12 @@ def _capture_present(targets, present, receipts, label, policy_revision,
 
     first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
-        if required_bytes:
+        if any(path not in reused for path, _ in present):
             store.maintain_retention(
                 policy=retention_config, incoming_bytes=required_bytes,
                 lock_context=nullcontext(),
             )
+        if required_bytes:
             capacity_root = _nearest_existing_parent(
                 os.path.join(store.agw_home(), "archive", "probe")
             )

@@ -573,6 +573,21 @@ def test_corrupt_media_copy_cannot_bypass_capacity(tmp_path):
     assert target.read_bytes() == b"v" * 30_000
 
 
+def test_new_empty_file_still_checks_capacity_for_metadata(tmp_path):
+    existing = tmp_path / "existing.pdf"
+    existing.write_bytes(b"x" * 30_000)
+    assert _prepare(existing).ok
+    empty = tmp_path / "empty.txt"
+    empty.touch()
+    result = preimages.prepare(
+        [str(empty)], "Edit", 1 << 20, policy_revision="rev-1",
+        retention_config=_capped(1),
+    )
+    assert not result.ok
+    assert result.error_code == "archive_capacity_exceeded"
+    assert store.list_versions(str(empty)) == []
+
+
 def test_pressure_cleanup_starts_before_hard_cap(tmp_path):
     from core import archive_transactions as archive_tx
 
