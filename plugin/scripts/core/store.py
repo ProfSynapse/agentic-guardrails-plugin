@@ -22,6 +22,7 @@ import tempfile
 import time
 import uuid
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime
 
 from . import archive_transactions as archive_tx
@@ -29,6 +30,7 @@ from . import outcomes
 from . import recovery_contracts
 from . import retention
 from . import retention_policy
+from . import recovery_storage
 
 SCHEMA_VERSION = 1
 # Hosts kill a PreToolUse hook at roughly 15 s and then run the tool call
@@ -673,6 +675,10 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     Move operations must always capture and remove the source, never dedupe.
     """
     src = os.path.abspath(src)
+    retention_config = retention_config or resolved_retention_policy()
+    storage_class = recovery_storage.classify(
+        src, is_directory=os.path.isdir(src), rules=retention_config.storage_rules,
+    )
     if not os.path.lexists(src):
         raise FileNotFoundError(src)
     link = archive_tx.link_metadata(src)
@@ -715,9 +721,10 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                     return {**last, "deduped": True}
             if _reuse_only:
                 return None
-            if not _admission_checked:
+            if not _admission_checked or retention_config.separated:
                 maintain_retention(
                     policy=retention_config, incoming_bytes=incoming_bytes,
+                    incoming_by_class={storage_class: incoming_bytes},
                     lock_context=nullcontext(),
                 )
             size_base = _archive_size_bytes_locked()
@@ -735,12 +742,13 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                 capture_group_id=capture_group_id,
                 transaction_id=_transaction_id,
                 recovery_source_identity=_recovery_source_identity,
-                source_sha256=digest,
+                source_sha256=digest, storage_class=storage_class,
             )
         _materialize_committed_transaction(entry["transaction_id"], _crash_after)
         _account_archive_growth_locked(
             size_base,
             int(entry.get("size") or 0) + _size_or_zero(index_path) - index_before,
+            storage_class=storage_class, artifact_bytes=int(entry.get("size") or 0),
         )
         return entry
 
@@ -1878,11 +1886,16 @@ def _archive_size_bytes_locked() -> int:
     return cached if cached is not None else _refresh_archive_size_locked()
 
 
-def _account_archive_growth_locked(base_bytes: int, delta_bytes: int):
-    """Advance the counter after one archive write under the store lock."""
-    _write_archive_size_state(
-        max(0, int(base_bytes) + int(delta_bytes)), _transaction_manifest_count()
-    )
+def _account_archive_growth_locked(base_bytes: int, delta_bytes: int, *,
+                                  storage_class="unclassified", artifact_bytes=0):
+    """Advance both advisory counters after one committed archive write."""
+    count = _transaction_manifest_count()
+    usage = recovery_storage.read_cache(agw_home(), base_bytes, count - 1)
+    _write_archive_size_state(max(0, int(base_bytes) + int(delta_bytes)), count)
+    if usage is not None and 0 <= artifact_bytes <= delta_bytes:
+        usage[storage_class] += artifact_bytes
+        usage["unclassified"] += delta_bytes - artifact_bytes
+        recovery_storage.write_cache(agw_home(), usage, count)
 
 
 def archive_size_bytes() -> int:
@@ -2113,13 +2126,14 @@ def _raise_if_over_capacity(policy: retention_policy.RetentionPolicy,
 
 
 def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None,
-                       incoming_bytes: int = 0, lock_context=None) -> dict:
+                       incoming_bytes: int = 0, lock_context=None,
+                       incoming_by_class: dict | None = None) -> dict:
     """Automatically reclaim redundant, classified cache preimages.
 
-    The size check runs without the global lock. The lock (``lock_context``
-    when given, otherwise the CLI default; a caller that already holds it
-    passes ``nullcontext()``) is taken only when a prune may be applied or an
-    interrupted prune must be recovered. Unknown, manual, move, evidence,
+    Shared-budget legacy policies can use a lock-free size check. Separated
+    budgets hold the global lock across class accounting and admission, using
+    advisory counters on routine calls. A caller already holding the lock
+    passes ``nullcontext()``. Unknown, manual, move, evidence,
     and corrupt records are never candidates; redundant recent preimages may
     yield under pressure behind a newer verified copy. If those protections
     leave insufficient room, the new store-growing operation is refused
@@ -2127,7 +2141,7 @@ def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None
     """
     policy = policy or resolved_retention_policy()
     incoming = max(0, int(incoming_bytes or 0))
-    if not _retention_journals_pending():
+    if not policy.separated and not _retention_journals_pending():
         before = archive_size_bytes()
         state = retention_policy.classify_retention_state(policy, before + incoming)
         if not state.prune_recommended:
@@ -2138,15 +2152,17 @@ def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None
     context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
         return _maintain_retention_locked(
-            policy=policy, incoming_bytes=incoming
+            policy=policy, incoming_bytes=incoming, incoming_by_class=incoming_by_class,
         )
 
 
 def _maintain_retention_locked(*,
         policy: retention_policy.RetentionPolicy | None = None,
-        incoming_bytes: int = 0) -> dict:
+        incoming_bytes: int = 0, incoming_by_class: dict | None = None) -> dict:
     """Implementation requiring the recovery-store mutation lock."""
     policy = policy or resolved_retention_policy()
+    if policy.separated:
+        return _maintain_separated_retention_locked(policy, incoming_bytes, incoming_by_class)
     incoming = max(0, int(incoming_bytes or 0))
     journal_recovery = _recover_retention_journals_locked()
     if journal_recovery["recovered"]:
@@ -2206,6 +2222,167 @@ def _maintain_retention_locked(*,
     result["final_projected_bytes"] = after + incoming
     _raise_if_over_capacity(policy, result)
     return result
+
+
+def _storage_usage_from_snapshot(snapshot: dict, total: int) -> dict:
+    usage = {bucket: 0 for bucket in recovery_storage.CLASSES}
+    for item in snapshot["records"]:
+        if item["available"]:
+            usage[item["storage_class"]] += item["logical_bytes"]
+    if sum(usage.values()) > total:
+        raise OSError("recovery storage accounting exceeds measured archive size")
+    # Indexes, orphan bytes and artifacts from incomplete records cannot be
+    # silently treated as free space or granted document-reserve privileges.
+    usage["unclassified"] += total - sum(usage.values())
+    return usage
+
+
+def _storage_usage_locked(total: int) -> dict:
+    count = _transaction_manifest_count()
+    cached = recovery_storage.read_cache(agw_home(), total, count)
+    if cached is not None:
+        return cached
+    snapshot = retention.inventory(agw_home())
+    if not snapshot["complete"]:
+        raise OSError("recovery storage inventory is incomplete; capacity cannot be verified")
+    usage = _storage_usage_from_snapshot(snapshot, total)
+    recovery_storage.write_cache(agw_home(), usage, count)
+    return usage
+
+
+def _storage_constraints(policy, usage, incoming, *, maintenance=False):
+    touched = tuple(bucket for bucket, size in incoming.items() if size > 0)
+    # Empty new captures still check global metadata capacity.
+    scope = touched or (() if maintenance else ("documents",))
+    for bucket, maximum in (("media", policy.media_max_bytes),
+                            ("derived", policy.derived_max_bytes)):
+        if maintenance or bucket in touched:
+            yield (bucket, maximum, usage[bucket] + incoming.get(bucket, 0), (bucket,))
+    non_document = ("media", "derived", "unclassified")
+    if maintenance or any(bucket in non_document for bucket in touched):
+        yield ("document_reserve", policy.max_bytes - policy.document_reserve_bytes,
+               sum(usage[b] + incoming.get(b, 0) for b in non_document),
+               tuple(b for b in (scope or non_document) if b in non_document))
+    yield ("total", policy.max_bytes, sum(usage.values()) + sum(incoming.values()), scope)
+
+
+def _maintain_separated_retention_locked(policy, incoming_bytes, incoming_by_class):
+    incoming = dict(incoming_by_class if incoming_by_class is not None
+                    else {"documents": max(0, int(incoming_bytes))})
+    if any(bucket not in recovery_storage.CLASSES or type(size) is not int or size < 0
+           for bucket, size in incoming.items()) or sum(incoming.values()) != incoming_bytes:
+        raise ValueError("incoming storage classes must match the aggregate byte count")
+    maintenance = incoming_by_class is None and incoming_bytes == 0
+    recovered = _recover_retention_journals_locked()
+    if recovered["recovered"]:
+        _refresh_archive_size_locked()
+    before = _archive_size_bytes_locked()
+    usage = _storage_usage_locked(before)
+    state = retention_policy.classify_retention_state(policy, before + incoming_bytes)
+    result = _capacity_result(policy, before, incoming_bytes, state, lock_taken=True,
+                              journal_recovery=recovered)
+    result["maintenance_passes"] = []
+    exhausted, pressure = set(), set()
+    migrated = False
+    for _ in range(4):
+        constraints = list(_storage_constraints(policy, usage, incoming, maintenance=maintenance))
+        # First repair a hard refusal, then create headroom in any pressured
+        # bucket. Each plan binds its bucket scope; no cross-bucket eviction.
+        constraints.sort(key=lambda c: c[2] <= c[1])
+        selected = None
+        for name, maximum, projected, scope in constraints:
+            high = maximum * policy.high_water_bytes // policy.max_bytes
+            if name not in exhausted and projected > 0 and projected >= high:
+                selected = (name, maximum, projected, scope)
+                break
+        if selected is None:
+            break
+        name, maximum, projected, scope = selected
+        if maximum == 0:
+            exhausted.add(name)
+            continue
+        if not migrated:
+            result["legacy_migration"] = retention.migrate_legacy_cache_records(
+                agw_home(), protected_days=policy.min_protected_age_days)
+            migrated = True
+        scoped_policy = replace(
+            policy, max_bytes=maximum,
+            high_water_bytes=maximum * policy.high_water_bytes // policy.max_bytes,
+            low_water_bytes=maximum * policy.low_water_bytes // policy.max_bytes,
+            document_reserve_bytes=0, media_max_bytes=None, derived_max_bytes=None,
+        )
+        plan = retention.build_plan(
+            agw_home(), policy=scoped_policy, current_bytes=projected,
+            capacity_pressure=name in pressure, storage_classes=scope,
+        )
+        result["plan"] = plan
+        if not plan["applicable"]:
+            raise retention.InventoryIncompleteError("recovery storage inventory is incomplete")
+        if not plan["candidates"]:
+            if name in pressure:
+                exhausted.add(name)
+            else:
+                pressure.add(name)
+            continue
+        applied = retention.apply_plan(
+            agw_home(), plan, expected_plan_hash=plan["plan_sha256"],
+            policy=scoped_policy, lock_context=nullcontext(),
+        )
+        result["maintenance_passes"].append({"storage_budget": name, **applied})
+        result["applied"] = True
+        result["reclaimed_bytes"] += int(applied.get("reclaimed_bytes") or 0)
+        after = _refresh_archive_size_locked()
+        usage = _storage_usage_locked(after)
+        if not applied.get("reclaimed_bytes"):
+            exhausted.add(name)
+    after = _archive_size_bytes_locked()
+    result.update(after_bytes=after, final_projected_bytes=after + incoming_bytes,
+                  storage_usage=usage, incoming_by_class=incoming)
+    for name, maximum, projected, scope in _storage_constraints(
+            policy, usage, incoming, maintenance=maintenance):
+        if projected > maximum:
+            from . import remediation
+            details = {**result, "storage_budget": name, "maximum_bytes": maximum,
+                       "budget_projected_bytes": projected,
+                       "required_free_bytes": projected - maximum,
+                       "error_code": ArchiveCapacityError.error_code}
+            details["remediation"] = remediation.capacity_instruction(details)
+            raise ArchiveCapacityError(details["remediation"], details)
+    return result
+
+
+def storage_report(policy: retention_policy.RetentionPolicy) -> dict:
+    """Read-only, bounded class inventory; never prunes or rewrites old records."""
+    snapshot = retention.inventory(agw_home())
+    total = archive_size_bytes()
+    usage = _storage_usage_from_snapshot(snapshot, total)
+    reasons = retention.protection_map(snapshot, policy=policy, capacity_pressure=True)
+    rows = {}
+    limits = {"documents": policy.max_bytes or None,
+              "media": policy.media_max_bytes, "derived": policy.derived_max_bytes,
+              "unclassified": None}
+    for bucket in recovery_storage.CLASSES:
+        items = [item for item in snapshot["records"]
+                 if item["storage_class"] == bucket and item["available"]]
+        potential = sum(item["logical_bytes"] for item in items
+                        if not reasons[item["transaction_id"]])
+        rows[bucket] = {
+            "used_bytes": usage[bucket], "max_bytes": limits[bucket],
+            "over_capacity_bytes": (max(0, usage[bucket] - limits[bucket])
+                                    if limits[bucket] is not None else 0),
+            "potentially_reclaimable_bytes": potential,
+            "protected_or_unclassified_bytes": max(0, usage[bucket] - potential),
+            "largest": [{"source": item["source"], "bytes": item["logical_bytes"],
+                         "transaction_id": item["transaction_id"]}
+                        for item in sorted(items, key=lambda i: -i["logical_bytes"])[:5]],
+        }
+    return {"schema": "agw.recovery-storage/v1", "separated": policy.separated,
+            "total_bytes": total, "document_reserve_bytes": policy.document_reserve_bytes,
+            "non_document_used_bytes": total - usage["documents"],
+            "non_document_max_bytes": (policy.max_bytes - policy.document_reserve_bytes
+                                       if policy.separated else None),
+            "inventory_complete": snapshot["complete"], "errors": snapshot["errors"],
+            "reclaim_requires_verification": True, "classes": rows}
 
 
 # --- session approval memory --------------------------------------------------

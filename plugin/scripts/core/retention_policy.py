@@ -50,6 +50,14 @@ class RetentionPolicy:
     max_candidates: int
     max_reclaim_bytes: int
     sources: tuple[tuple[str, str], ...] = ()
+    document_reserve_bytes: int = 0
+    media_max_bytes: int | None = None
+    derived_max_bytes: int | None = None
+    storage_rules: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def separated(self) -> bool:
+        return self.media_max_bytes is not None and self.derived_max_bytes is not None
 
     @property
     def unlimited(self) -> bool:
@@ -67,6 +75,10 @@ class RetentionPolicy:
             "max_reclaim_bytes": self.max_reclaim_bytes,
             "unlimited": self.unlimited,
             "sources": dict(self.sources),
+            "document_reserve_bytes": self.document_reserve_bytes,
+            "media_max_bytes": self.media_max_bytes,
+            "derived_max_bytes": self.derived_max_bytes,
+            "storage_rules": [dict(pattern=p, storage_class=c) for p, c in self.storage_rules],
         }
 
 
@@ -272,6 +284,48 @@ def resolve_retention_policy(
                          "maximum": maximum},
             )
 
+    storage_values = {}
+    for field in ("document_reserve_bytes", "media_max_bytes", "derived_max_bytes"):
+        available = max_bytes - storage_values.get("document_reserve_bytes", 0)
+        default = {
+            "document_reserve_bytes": max_bytes // 2,
+            "media_max_bytes": available * 3 // 4,
+            "derived_max_bytes": available - available * 3 // 4,
+        }[field]
+        value, source, _present = _pick(
+            settings, environ, "archive_" + field, "AGW_ARCHIVE_" + field.upper(), default,
+        )
+        if (max_bytes == 0 and value != 0) or value > max_bytes:
+            raise RetentionPolicyError(
+                "Storage bucket limits must fit within the total archive budget.",
+                error_code="storage_budget_invalid", details={"field": field, "value": value},
+            )
+        storage_values[field] = value
+        sources[field] = source
+    if storage_values["media_max_bytes"] + storage_values["derived_max_bytes"] \
+            > max_bytes - storage_values["document_reserve_bytes"]:
+        raise RetentionPolicyError(
+            "Media and derived budgets must leave the document reserve available.",
+            error_code="storage_budget_invalid", details=storage_values,
+        )
+    rules = settings.get("archive_storage_rules", [])
+    if not isinstance(rules, list) or len(rules) > 64:
+        raise RetentionPolicyError("Storage rules must be a list of at most 64 rules.",
+                                   error_code="storage_rules_invalid", details={})
+    parsed_rules = []
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"pattern", "storage_class"} \
+                or not isinstance(rule["pattern"], str) or not rule["pattern"].strip() \
+                or len(rule["pattern"]) > 1024 \
+                or not isinstance(rule["storage_class"], str) \
+                or rule["storage_class"] not in {"documents", "media", "derived"}:
+            raise RetentionPolicyError("Each storage rule needs a pattern and storage_class.",
+                                       error_code="storage_rules_invalid", details={})
+        parsed_rules.append((rule["pattern"], rule["storage_class"]))
+    if max_bytes == 0:
+        storage_values["media_max_bytes"] = None
+        storage_values["derived_max_bytes"] = None
+
     return RetentionPolicy(
         max_bytes=max_bytes,
         high_water_bytes=high,
@@ -281,6 +335,8 @@ def resolve_retention_policy(
         max_candidates=values["max_candidates"],
         max_reclaim_bytes=values["max_reclaim_bytes"],
         sources=tuple(sorted(sources.items())),
+        **storage_values,
+        storage_rules=tuple(parsed_rules),
     )
 
 

@@ -51,3 +51,9 @@ settings:
   archive_inactive_collapse_age_days: 30
   archive_max_candidates: 256
   archive_max_reclaim_bytes: 1073741824
+  # Defaults reserve half the total for documents; media gets 3/4 of the
+  # remainder and explicit derived outputs get 1/4. Documents may borrow
+  # otherwise-unused space. Optional archive_document_reserve_bytes,
+  # archive_media_max_bytes and archive_derived_max_bytes override these.
+  # First matching rule wins; derived classification never weakens recovery.
+  archive_storage_rules: []

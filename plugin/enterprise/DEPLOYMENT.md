@@ -127,7 +127,27 @@ same bounded maintenance policy; it is not required after a capacity refusal.
 A hard refusal reports the byte shortfall and budget setting. PDFs and media
 receive byte-exact recovery; file extensions never make originals disposable.
 Native hooks retain their separate per-file capture size limit. See
-[media recovery design](../../docs/plans/media-recovery.md) for planned media tiers.
+[recovery storage classes](../../docs/plans/media-recovery.md) for configuration
+and the remaining object-storage roadmap.
+
+The default 4 GiB total reserves 2 GiB for documents, caps media at 1.5 GiB and
+explicit derived outputs at 0.5 GiB. Documents can borrow unused space. The
+optional `archive_document_reserve_bytes`, `archive_media_max_bytes` and
+`archive_derived_max_bytes` settings (or matching `AGW_ARCHIVE_*` environment
+variables) override these amounts. Class limits together must preserve the
+document reserve; zero class cap forbids positive payload growth. An unlimited
+total disables class budgets too. Cleanup for a media/derived capture cannot
+evict document history. Protected existing copies survive a lower cap.
+
+`archive_storage_rules` is an ordered list of `{pattern, storage_class}` mappings.
+Classes are `documents`, `media`, `derived`; patterns match normalized absolute
+paths. Derived output is never inferred from a filename and never loses the
+newest-copy protection. For example, `pattern: '**/renders/**'` with
+`storage_class: derived` accounts future captures under the derived budget.
+Missing classes on old records use built-in file-type accounting; policy changes
+do not rewrite old manifests or reclassify reused copies. Directory snapshots
+count as media unless explicitly declared otherwise. Reports include metadata
+and orphan bytes as unclassified shared usage.
 
 ## 5. Requirements per machine
 

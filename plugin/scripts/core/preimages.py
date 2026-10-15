@@ -14,6 +14,7 @@ from . import recovery_contracts
 from . import remediation
 from . import retention_policy
 from . import store
+from . import recovery_storage
 
 
 @dataclass(frozen=True)
@@ -223,12 +224,14 @@ def _capture_present(targets, present, receipts, label, policy_revision,
     """Reuse verified copies before admitting aggregate growth, under one lock."""
     reused = {}
     required_bytes = 0
+    incoming_by_class = {bucket: 0 for bucket in recovery_storage.CLASSES}
     for path, before_identity in present:
         entry = store.archive_file(
             path, mode="copy", dedupe=True, _reuse_only=True,
             retention_class="mutation_preimage",
             protected_until_ns=protected_until_ns,
             policy_revision=policy_revision, lock_context=nullcontext(),
+            retention_config=retention_config,
         )
         st = os.stat(path, follow_symlinks=False)
         if _identity(st) != before_identity:
@@ -236,14 +239,17 @@ def _capture_present(targets, present, receipts, label, policy_revision,
         if entry is not None:
             reused[path] = entry
         else:
-            required_bytes += max(int(st.st_size), allocated_size(path, st))
+            amount = max(int(st.st_size), allocated_size(path, st))
+            required_bytes += amount
+            bucket = recovery_storage.classify(path, rules=retention_config.storage_rules)
+            incoming_by_class[bucket] += amount
 
     first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
         if any(path not in reused for path, _ in present):
             store.maintain_retention(
                 policy=retention_config, incoming_bytes=required_bytes,
-                lock_context=nullcontext(),
+                incoming_by_class=incoming_by_class, lock_context=nullcontext(),
             )
         if required_bytes:
             capacity_root = _nearest_existing_parent(

@@ -445,8 +445,16 @@ uses the same protections. If automatic cleanup cannot admit a change, the
 message reports the shortfall and budget setting instead of requiring a manual
 prune command.
 
-See [media recovery design](docs/plans/media-recovery.md) for the current behavior
-and proposed separation of document history, media originals, and derived files.
+The 4 GiB default now reserves 2 GiB for document recovery, caps media at 1.5 GiB,
+and caps explicitly declared derived outputs at 0.5 GiB. Documents may borrow
+unused space; media cannot consume their reserve. PDFs remain documents; video,
+audio, images and mixed directory snapshots count as media. Derived outputs
+require an explicit policy rule and retain the newest-copy recovery protections.
+Cleanup stays within the class being admitted. `status` and `doctor` report
+per-class usage, limits, protected bytes and potential reclaim.
+
+See [recovery storage classes](docs/plans/media-recovery.md) for configuration,
+legacy handling, and the future media object-storage design.
 
 ### Activity history and recovery metadata
 

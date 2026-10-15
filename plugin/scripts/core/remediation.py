@@ -95,6 +95,20 @@ def capacity_instruction(details=None) -> str:
         required = int(details.get("required_free_bytes") or 0)
     except (TypeError, ValueError):
         required = 0
+    budget = details.get("storage_budget", "total")
+    if budget in {"media", "derived", "document_reserve"}:
+        label = {"media": "media recovery", "derived": "derived-output recovery",
+                 "document_reserve": "shared non-document recovery"}[budget]
+        setting = ("archive_" + budget + "_max_bytes" if budget != "document_reserve"
+                   else "archive_document_reserve_bytes")
+        guidance = (f"Adjust `{setting}` together with `archive_max_bytes` while preserving "
+                    "the configured document reserve." if budget != "document_reserve" else
+                    "Increase `archive_max_bytes` or explicitly reduce `archive_document_reserve_bytes`.")
+        return (f"The {label} budget cannot admit this capture. Its cap is {maximum:,} bytes "
+                f"and this change needs {required:,} more. Automatic cleanup has already run "
+                "within the affected storage class; document history and the newest usable "
+                "recovery copies remain protected. Inspect `agw status` for per-class usage. "
+                + guidance + " Manual pruning is not required.")
     sizing = ""
     if maximum > 0:
         sizing = f" The cap is {maximum:,} bytes"

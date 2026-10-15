@@ -62,6 +62,7 @@ scripts/core/profiles.py
 scripts/core/readfast.py
 scripts/core/readscan.py
 scripts/core/recovery_contracts.py
+scripts/core/recovery_storage.py
 scripts/core/remediation.py
 scripts/core/retention.py
 scripts/core/retention_policy.py

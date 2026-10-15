@@ -22,6 +22,7 @@ import uuid
 from . import archive_transactions as archive_tx
 from . import recovery_contracts
 from . import retention_policy
+from . import recovery_storage
 
 
 SCHEMA_VERSION = 1
@@ -718,6 +719,7 @@ def inventory(home: str, *, activity_records: list[dict] | None = None,
             "mode": str(record.get("mode") or ""),
             "state": state,
             "retention_class": classification or "unclassified",
+            "storage_class": recovery_storage.record_class(record),
             "created_at_ns": int(record.get("created_at_ns") or 0),
             "last_referenced_at_ns": int(record.get("last_referenced_at_ns") or 0),
             "protected_until_ns": int(record.get("protected_until_ns") or 0),
@@ -731,6 +733,8 @@ def inventory(home: str, *, activity_records: list[dict] | None = None,
             "lstat_identity": {},
             "protection_reasons": [],
         }
+        if candidate["storage_class"] == "unclassified":
+            candidate["protection_reasons"].append("unknown_storage_class")
         if state != archive_tx.COMMITTED:
             candidate["protection_reasons"].append("noncommitted")
             records.append(candidate)
@@ -914,7 +918,8 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
                       max_candidates: int = MAX_CANDIDATES,
                       max_reclaim_bytes: int = MAX_RECLAIM_BYTES,
                       policy: retention_policy.RetentionPolicy | None = None,
-                      capacity_pressure: bool = False
+                      capacity_pressure: bool = False,
+                      storage_classes: tuple[str, ...] = (),
                       ) -> list[dict]:
     """Select a bounded, deterministic subset only from explicit preimages.
 
@@ -937,6 +942,7 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
     eligible = [
         item for item in snapshot["records"]
         if not protected[item["transaction_id"]]
+        and (not storage_classes or item["storage_class"] in storage_classes)
         and _newer_copy_verified(item, newest_by_source, verified)
     ]
     # Eligibility already encodes recency/activity guarantees. Within that
@@ -955,6 +961,7 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
             item for item in snapshot["records"]
             if item["transaction_id"] not in chosen
             and not relaxed[item["transaction_id"]]
+            and (not storage_classes or item["storage_class"] in storage_classes)
             and _newer_copy_verified(item, newest_by_source, verified)
         ]
         pressure_eligible.sort(key=lambda item: (
@@ -979,7 +986,7 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
         selected.append({
             field: item[field] for field in (
                 "transaction_id", "source", "source_identity", "artifact",
-                "retention_class", "created_at_ns", "last_referenced_at_ns",
+                "retention_class", "storage_class", "created_at_ns", "last_referenced_at_ns",
                 "protected_until_ns", "version", "artifact_kind", "sha256",
                 "logical_bytes", "allocated_bytes", "manifest_sha256",
                 "lstat_identity",
@@ -1002,12 +1009,15 @@ def build_plan(home: str, max_bytes: int | None = None, *,
                max_reclaim_bytes: int = MAX_RECLAIM_BYTES,
                max_records: int = MAX_INVENTORY_RECORDS,
                max_walk_nodes: int = MAX_WALK_NODES,
-               capacity_pressure: bool = False) -> dict:
+               capacity_pressure: bool = False,
+               storage_classes: tuple[str, ...] = ()) -> dict:
     """Create a 15-minute, hash-bound plan.  This function never mutates data.
 
     ``capacity_pressure`` is recorded in the plan (and so in its hash) and
     lets non-newest same-source pre-images yield regardless of age.
     """
+    if any(bucket not in recovery_storage.CLASSES for bucket in storage_classes):
+        raise ValueError("unknown recovery storage class")
     now_ns = int(now_ns or time.time_ns())
     if policy is None:
         maximum = int(max_bytes or 0)
@@ -1037,7 +1047,9 @@ def build_plan(home: str, max_bytes: int | None = None, *,
         raise ValueError("current_bytes cannot be negative")
     # A logical byte count can sit below the allocated inventory (small files
     # occupy whole blocks); the inventory is the conservative floor.
-    current = max(current, int(snapshot["known_allocated_bytes"]))
+    scoped_allocated = sum(item["allocated_bytes"] for item in snapshot["records"]
+                           if not storage_classes or item["storage_class"] in storage_classes)
+    current = max(current, scoped_allocated)
     state = retention_policy.classify_retention_state(policy, current)
     high_bytes = policy.high_water_bytes
     target_bytes = policy.low_water_bytes
@@ -1050,7 +1062,7 @@ def build_plan(home: str, max_bytes: int | None = None, *,
     candidates = select_candidates(
         snapshot, required, now_ns=now_ns, max_candidates=max_candidates,
         max_reclaim_bytes=max_reclaim_bytes, policy=policy,
-        capacity_pressure=capacity_pressure,
+        capacity_pressure=capacity_pressure, storage_classes=storage_classes,
     ) if applicable else []
     planned = sum(item["allocated_bytes"] for item in candidates)
     plan = {
@@ -1060,6 +1072,7 @@ def build_plan(home: str, max_bytes: int | None = None, *,
         "created_at_ns": now_ns,
         "expires_at_ns": now_ns + PLAN_TTL_NS,
         "capacity_pressure": bool(capacity_pressure),
+        "storage_classes": list(storage_classes),
         "store_identity": snapshot["store_identity"],
         "inventory_sha256": snapshot["inventory_sha256"],
         "inventory_complete": snapshot["complete"],
@@ -1190,6 +1203,13 @@ def _validate_plan(plan: dict, expected_plan_hash: str, home: str, now_ns: int):
         raise InvalidPlanError("retention plan candidate identity is invalid")
     if any(item.get("retention_class") != ELIGIBLE_CLASS for item in candidates):
         raise InvalidPlanError("retention plan contains a protected class")
+    storage_classes = plan.get("storage_classes") or []
+    if not isinstance(storage_classes, list) or any(
+            bucket not in recovery_storage.CLASSES for bucket in storage_classes):
+        raise InvalidPlanError("invalid recovery storage scope")
+    if storage_classes and any(item.get("storage_class") not in storage_classes
+                               for item in candidates):
+        raise InvalidPlanError("retention candidate is outside its storage scope")
     raw_policy = plan.get("policy") or {}
     batch_limit = min(int(raw_policy.get("max_reclaim_bytes") or 0), MAX_RECLAIM_BYTES)
     candidate_limit = min(int(raw_policy.get("max_candidates") or 0), MAX_CANDIDATES)
@@ -1204,7 +1224,7 @@ def _validate_plan(plan: dict, expected_plan_hash: str, home: str, now_ns: int):
 def _candidate_metadata_equal(planned: dict, current: dict) -> bool:
     fields = (
         "transaction_id", "source", "source_identity", "artifact",
-        "retention_class", "created_at_ns", "last_referenced_at_ns",
+        "retention_class", "storage_class", "created_at_ns", "last_referenced_at_ns",
         "protected_until_ns", "version", "artifact_kind", "sha256",
         "logical_bytes", "allocated_bytes", "manifest_sha256", "lstat_identity",
     )
@@ -1215,7 +1235,7 @@ def _candidate_artifact_identity_equal(planned: dict, current: dict) -> bool:
     """Fields that may not change even when a new activity hold is added."""
     fields = (
         "transaction_id", "source", "source_identity", "artifact",
-        "retention_class", "created_at_ns", "version", "artifact_kind",
+        "retention_class", "storage_class", "created_at_ns", "version", "artifact_kind",
         "sha256", "logical_bytes", "allocated_bytes", "lstat_identity",
     )
     return all(planned.get(field) == current.get(field) for field in fields)

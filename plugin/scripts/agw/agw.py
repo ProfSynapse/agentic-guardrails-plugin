@@ -1662,6 +1662,10 @@ def cmd_status(args):
         ).as_dict()
     except (retention_policy.RetentionPolicyError, OSError) as exc:
         _file_err(args, exc, default_code=4)
+    try:
+        storage_report = store.storage_report(resolved_retention)
+    except (OSError, ValueError) as exc:
+        _file_err(args, exc, default_code=4)
     all_checkouts = state.get("checkouts", {})
     cwd_filter = os.path.realpath(os.path.abspath(os.path.expanduser(args.cwd))) \
         if getattr(args, "cwd", "") else ""
@@ -1701,6 +1705,12 @@ def cmd_status(args):
               + f"max {retention_state['max_bytes'] / 1e9:.2f} GB)"),
              f"open checkouts: {len(checkouts)}"
              + (f" (filtered from {len(all_checkouts)})" if cwd_filter else "")]
+    lines.append(f"document reserve: {storage_report['document_reserve_bytes']:,} bytes")
+    for bucket, row in storage_report["classes"].items():
+        cap = row["max_bytes"]
+        lines.append(f"  {bucket}: {row['used_bytes']:,} bytes / "
+                     + (f"{cap:,}" if cap is not None else "shared/unlimited")
+                     + f"; potentially reclaimable {row['potentially_reclaimable_bytes']:,}")
     for src, entry in list(checkouts.items())[:20]:
         suffix = ("  [" + ", ".join(entry["stale_reasons"]) + "]") \
             if entry["stale_reasons"] else ""
@@ -1713,7 +1723,7 @@ def cmd_status(args):
             f"{item.get('operation', '')}"
         )
     _out(args, "\n".join(lines),
-         {"archive_bytes": size, "retention": retention_state,
+         {"archive_bytes": size, "retention": retention_state, "storage": storage_report,
           "checkouts": checkouts,
           "checkout_count_total": len(all_checkouts),
           "checkout_filter_cwd": cwd_filter,
@@ -1793,6 +1803,13 @@ def cmd_doctor(args):
             "preimages can be reclaimed automatically."
         )
     checks["retention"] = retention
+    try:
+        checks["storage"] = store.storage_report(resolved_retention)
+    except (OSError, ValueError) as exc:
+        _file_err(args, exc, default_code=4)
+    for bucket, row in checks["storage"]["classes"].items():
+        lines.append(f"storage {bucket}: {row['used_bytes']:,} bytes; "
+                     f"over class cap {row['over_capacity_bytes']:,}")
     _out(args, "\n".join(lines), checks)
 
 
