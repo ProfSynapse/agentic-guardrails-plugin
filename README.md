@@ -458,12 +458,17 @@ legacy handling, and the future media object-storage design.
 
 Existing video, audio and raster-image writes now stop for conversational
 clarification before automatic capture. The agent receives an expiring `agw
-media` operation and asks whether to replace with recovery, save separately, or
-cancel. Removal offers reversible archive or cancellation. The CLI checks the
+media` operation and reuses an explicit recovery choice or asks whether to replace
+with recovery, keep both, or cancel. Removal offers reversible archive or
+cancellation. The CLI checks the
 original state again, enforces recovery budgets and refuses permanent fallback.
 An owned staging file can become a timestamped output without duplicating its
-bytes; existing destination names are never overwritten. Cancellation changes
-no files. An operation ID is not proof of approval. This flow adds neither a
+bytes; a finished revision already beside the original is retained in place
+instead of making a third copy. Existing destination names are never overwritten.
+If recovery capacity blocks replacement before publication, the same operation
+can keep both or cancel; no manual prune or new operation is needed. Uncertain
+or interrupted writes still require inspection. Cancellation changes no files.
+An operation ID is not proof of approval. This flow adds neither a
 render-size quota nor automatic expiration of sole recovery copies.
 
 ### Activity history and recovery metadata

@@ -2274,10 +2274,10 @@ def main(argv=None):
                                         help="record an existing media file without copying it")
     media_prepare.add_argument("path")
     media_prepare.add_argument("--operation", choices=["replace", "archive"], default="replace")
-    media_prepare.add_argument("--staged", default="", help="optional existing finished replacement")
+    media_prepare.add_argument("--staged", default="", help="finished replacement; keep-both reuses it when beside the target")
     media_prepare.set_defaults(fn=cmd_media)
     media_continue = media_sub.add_parser("continue", parents=[common],
-                                         help="resume after conversational clarification")
+                                         help="apply a listed protected choice")
     media_continue.add_argument("id")
     media_continue.add_argument("--action", required=True,
                                 choices=["replace", "save-separately", "archive", "cancel"])

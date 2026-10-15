@@ -187,8 +187,10 @@ def test_native_capture_limit_does_not_limit_explicit_cli_capture(tmp_path, monk
     assert target.read_bytes() == b"irreplaceable original"
 
 
-def test_supplied_stage_is_bound_and_not_consumed(tmp_path):
-    stage = tmp_path / "finished.mp4"
+def test_external_supplied_stage_is_copied_independently_and_not_consumed(tmp_path):
+    external = tmp_path / "build"
+    external.mkdir()
+    stage = external / "finished.mp4"
     stage.write_bytes(b"finished replacement")
     target, plan = prepared(tmp_path, staged=str(stage))
     result = media_ops.continue_operation(plan["id"], "save-separately")
@@ -198,13 +200,166 @@ def test_supplied_stage_is_bound_and_not_consumed(tmp_path):
     assert Path(result["path"]).read_bytes() == b"finished replacement"
 
 
-def test_changed_supplied_stage_cannot_replace(tmp_path):
+def test_keep_both_reuses_finished_file_beside_original_without_copy(tmp_path, monkeypatch):
+    stage = tmp_path / "finished.mp4"
+    stage.write_bytes(b"finished replacement")
+    target, plan = prepared(tmp_path, staged=str(stage))
+    before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in (target, stage)}
+    assert plan["separate_result"] == {"path": str(stage), "reuses_existing_file": True}
+    def no_copy(*args, **kwargs):
+        raise AssertionError("keeping existing files must not copy bytes")
+    monkeypatch.setattr(media_ops.shutil, "copyfileobj", no_copy)
+    result = media_ops.continue_operation(plan["id"], "save-separately")
+    assert result["changed"] == 0 and result["reused_existing_file"]
+    assert result["path"] == str(stage)
+    assert {p.name: (p.stat().st_ino, p.read_bytes()) for p in tmp_path.glob("*.mp4")} == before
+    assert not os.path.samefile(target, stage)
+    assert not (Path(store.agw_home()) / "archive").exists()
+    assert review.describe(review.read(plan["id"]))["choices"] == []
+
+
+def capacity_fixture(tmp_path, monkeypatch, *, supplied=True, operation="replace"):
+    for name, value in {"MAX_BYTES": 1_000_000, "DOCUMENT_RESERVE_BYTES": 500_000,
+                        "MEDIA_MAX_BYTES": 375_000, "DERIVED_MAX_BYTES": 125_000}.items():
+        monkeypatch.setenv("AGW_ARCHIVE_" + name, str(value))
+    retained = tmp_path / "retained.wav"
+    retained.write_bytes(b"r" * 330_000)
+    entry = store.archive_file(
+        str(retained), mode="copy", retention_class="safety_archive",
+        retention_config=media_ops.retention_config.load(),
+    )
+    target = tmp_path / "original.mp4"
+    target.write_bytes(b"o" * 100_000)
+    stage = tmp_path / "finished.mp4"
+    if supplied and operation == "replace":
+        stage.write_bytes(b"finished replacement")
+    plan = media_ops.prepare(str(target), operation=operation,
+                             staged=str(stage) if supplied and operation == "replace" else "")
+    if not supplied and operation == "replace":
+        finish_stage(plan)
+    return target, plan, Path(entry["dest"])
+
+
+@pytest.mark.parametrize("supplied,action", [(True, "save-separately"),
+                                          (False, "save-separately"), (True, "cancel")])
+def test_full_capacity_offers_same_operation_preserving_continuation(
+    tmp_path, monkeypatch, supplied, action,
+):
+    target, plan, retained = capacity_fixture(tmp_path, monkeypatch, supplied=supplied)
+    with pytest.raises(review.MediaCapacityBlocked) as failure:
+        media_ops.continue_operation(plan["id"], "replace")
+    details = failure.value.details
+    assert details["state"] == "capacity-blocked"
+    assert details["target_mutation_started"] is False
+    assert details["choices"] == ["save-separately", "cancel"]
+    assert details["continue_argv"][action][3] == plan["id"]
+    assert target.read_bytes() == b"o" * 100_000
+    assert retained.read_bytes() == b"r" * 330_000
+    # Replacement cannot retry under the restricted state, even if requested.
+    with pytest.raises(review.MediaCapacityBlocked):
+        media_ops.continue_operation(plan["id"], "replace")
+    result = json.loads(cli("media", "continue", plan["id"], "--action", action).stdout)
+    assert result["state"] == ("cancelled" if action == "cancel" else "completed")
+    if action == "save-separately":
+        assert Path(result["path"]).read_bytes() == b"finished replacement"
+        assert result["changed"] == (0 if supplied else 1)
+    assert target.read_bytes() == b"o" * 100_000
+    assert retained.read_bytes() == b"r" * 330_000
+    with pytest.raises(review.MediaReviewError, match="already used"):
+        media_ops.continue_operation(plan["id"], action)
+
+
+def test_capacity_blocked_archive_offers_only_cancel(tmp_path, monkeypatch):
+    target, plan, retained = capacity_fixture(tmp_path, monkeypatch, operation="archive")
+    with pytest.raises(review.MediaCapacityBlocked) as failure:
+        media_ops.continue_operation(plan["id"], "archive")
+    assert failure.value.details["choices"] == ["cancel"]
+    assert target.read_bytes() == b"o" * 100_000
+    assert media_ops.continue_operation(plan["id"], "cancel")["changed"] == 0
+    assert retained.exists()
+
+
+@pytest.mark.parametrize("changed", ["target", "stage", "policy", "expiry"])
+def test_capacity_continuation_revalidates_original_stage_policy_and_expiry(
+    tmp_path, monkeypatch, changed,
+):
+    target, plan, _ = capacity_fixture(tmp_path, monkeypatch, supplied=False)
+    with pytest.raises(review.MediaCapacityBlocked):
+        media_ops.continue_operation(plan["id"], "replace")
+    if changed == "target":
+        target.write_bytes(b"external edit")
+    elif changed == "stage":
+        Path(plan["staged_path"]).write_bytes(b"different replacement")
+    elif changed == "policy":
+        monkeypatch.setattr(media_ops.engine, "load_policy", lambda _: type("Policy", (), {"revision": "changed"})())
+    else:
+        monkeypatch.setattr(media_ops.time, "time", lambda: plan["expires_at"] + 1)
+    with pytest.raises(review.MediaReviewError):
+        media_ops.continue_operation(plan["id"], "save-separately")
+    assert not Path(plan["separate_path"]).exists()
+    assert target.read_bytes() == (b"external edit" if changed == "target" else b"o" * 100_000)
+
+
+def test_error_code_alone_never_enables_capacity_continuation(tmp_path, monkeypatch):
+    target, plan = prepared(tmp_path)
+    finish_stage(plan)
+    def ambiguous(*args, **kwargs):
+        error = file_ops.FileOperationError("unclassified failure")
+        error.error_code = "archive_capacity_exceeded"
+        raise error
+    monkeypatch.setattr(media_ops.publication, "publish_staged_batch", ambiguous)
+    with pytest.raises(review.MediaReviewError, match="consumed"):
+        media_ops.continue_operation(plan["id"], "replace")
+    assert review.read(plan["id"])["state"] == "needs-inspection"
+    assert review.describe(review.read(plan["id"]))["choices"] == []
+    with pytest.raises(review.MediaReviewError, match="already used"):
+        media_ops.continue_operation(plan["id"], "save-separately")
+    assert target.read_bytes() == b"irreplaceable original"
+
+
+def test_failure_after_publication_never_offers_capacity_shortcut(tmp_path, monkeypatch):
+    target, plan = prepared(tmp_path)
+    finish_stage(plan)
+    terminal = media_ops.publication._terminal_record
+    def fail_after_commit(*args, **kwargs):
+        terminal(*args, **kwargs)
+        raise store.ArchiveCapacityError("late failure with capacity code", {})
+    monkeypatch.setattr(media_ops.publication, "_terminal_record", fail_after_commit)
+    with pytest.raises(review.MediaReviewError, match="consumed"):
+        media_ops.continue_operation(plan["id"], "replace")
+    assert review.read(plan["id"])["state"] == "needs-inspection"
+    assert target.read_bytes() == b"finished replacement"
+    assert any(Path(v["dest"]).read_bytes() == b"irreplaceable original"
+               for v in store.list_versions(str(target)))
+    with pytest.raises(review.MediaReviewError, match="already used"):
+        media_ops.continue_operation(plan["id"], "save-separately")
+
+
+def test_concurrent_capacity_alternatives_claim_only_once(tmp_path, monkeypatch):
+    _, plan, _ = capacity_fixture(tmp_path, monkeypatch, supplied=False)
+    with pytest.raises(review.MediaCapacityBlocked):
+        media_ops.continue_operation(plan["id"], "replace")
+    barrier = Barrier(2)
+    def run():
+        barrier.wait(timeout=5)
+        try:
+            return media_ops.continue_operation(plan["id"], "save-separately")["state"]
+        except review.MediaReviewError as exc:
+            assert "already used" in str(exc)
+            return "refused"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(lambda _: run(), range(2))) == ["completed", "refused"]
+    assert Path(plan["separate_path"]).read_bytes() == b"finished replacement"
+
+
+@pytest.mark.parametrize("action", ["replace", "save-separately"])
+def test_changed_supplied_stage_cannot_continue(tmp_path, action):
     stage = tmp_path / "finished.mp4"
     stage.write_bytes(b"first")
     target, plan = prepared(tmp_path, staged=str(stage))
     stage.write_bytes(b"second")
     with pytest.raises(review.MediaReviewError, match="Replacement changed"):
-        media_ops.continue_operation(plan["id"], "replace")
+        media_ops.continue_operation(plan["id"], action)
     assert target.read_bytes() == b"irreplaceable original"
 
 
@@ -308,9 +463,9 @@ def test_twenty_gib_original_is_not_hashed_or_copied_when_it_cannot_fit(tmp_path
         raise AssertionError("oversized original must be refused without reading its bytes")
     monkeypatch.setattr(store, "file_sha256", no_hash)
     plan = media_ops.prepare(str(target))
-    with pytest.raises(review.MediaReviewError, match="exceeds its recovery allowance"):
+    with pytest.raises(review.MediaCapacityBlocked):
         media_ops.continue_operation(plan["id"], "replace")
-    assert review.read(plan["id"])["state"] == "pending"
+    assert review.read(plan["id"])["state"] == "capacity-blocked"
     assert not (Path(store.agw_home()) / "archive").exists()
     assert media_ops.continue_operation(plan["id"], "cancel")["changed"] == 0
 

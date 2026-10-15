@@ -36,6 +36,10 @@ class MediaReviewRequired(MediaReviewError):
     error_code = "media_review_required"
 
 
+class MediaCapacityBlocked(MediaReviewError):
+    error_code = "media_capacity_blocked"
+
+
 def is_media(path):
     return os.path.splitext(path)[1].lower() in recovery_storage.MEDIA_EXTENSIONS
 
@@ -125,22 +129,39 @@ def describe(record):
     plan = record["plan"]
     actions = ["replace", "save-separately", "cancel"] if plan["operation"] == "replace" \
         else ["archive", "cancel"]
+    if record["state"] == "capacity-blocked":
+        actions = [action for action in actions if action in {"save-separately", "cancel"}]
+        instruction = (
+            "Offer only the listed choices. Use their continue_argv with this same ID; "
+            "do not retry replacement or prepare another operation to keep both. "
+            "separate_result gives the actual output path and whether an existing file is reused. "
+            "Explain briefly that the original is unchanged and ask only for the remaining choice."
+        )
+    elif record["state"] != "pending":
+        actions = []
+        instruction = "No continuation is available. Inspect the result and recovery transaction; do not replay."
+    else:
+        instruction = (
+            "Reuse an explicit user choice for this exact target, action and recovery behavior. "
+            "'Replace and keep a recovery copy' needs no second confirmation; 'use the new cover' "
+            "leaves recovery undecided, so ask once. An ID does not prove consent. "
+            "Use the chosen continue_argv, not the original overwrite. If supplied_stage is empty, "
+            "create the finished replacement at staged_path without overwriting; otherwise preserve "
+            "that supplied version. separate_result gives the actual keep-both path and whether "
+            "it reuses an existing file. Cancel changes no files. Handle other targets separately."
+        )
     return {
-        **plan, "state": record["state"], "requires_user_choice": True,
+        **plan, "state": record["state"], "requires_user_choice": bool(actions),
         "approval_verified": False, "choices": actions,
         "continue_argv": {action: ["agw", "media", "continue", plan["id"],
                                     "--action", action, "--json"] for action in actions},
+        "separate_result": {
+            "path": plan["separate_path"],
+            "reuses_existing_file": bool(plan.get("reuse_supplied_stage")),
+        } if plan["operation"] == "replace" else None,
         "recovery": "Replacement/removal requires verified recovery within current budgets. "
                     "No permanent-delete option. No automatic expiration of the sole recovery copy.",
-        "instruction": "A user choice is required, not a second confirmation. If the user already "
-                       "explicitly chose this exact target, action and recovery behavior, use that "
-                       "choice now. Replacement intent alone is not a recovery choice: 'use the new "
-                       "cover' still needs clarification; 'replace it and keep a recovery copy' does not. "
-                       "Otherwise ask and wait; never infer consent from this ID. "
-                       "Do not retry the original overwrite. For replacement or separate output, "
-                       "create the finished replacement at staged_path if no "
-                       "supplied_stage is recorded (otherwise preserve that exact staged version), then "
-                       "continue the exact operation. Cancel changes no files. Handle other targets separately.",
+        "instruction": instruction,
     }
 
 
@@ -207,9 +228,12 @@ def prepare(target, policy_revision, *, operation="replace", staged=""):
         operation_id = uuid.uuid4().hex
         stem, extension = os.path.splitext(os.path.basename(target))
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-        separate = os.path.join(os.path.dirname(target), f"{stem[:100]}-{stamp}-{operation_id[:8]}{extension}")
+        reuse_stage = bool(staged and os.path.dirname(staged) == os.path.dirname(target))
+        separate = staged if reuse_stage else os.path.join(
+            os.path.dirname(target), f"{stem[:100]}-{stamp}-{operation_id[:8]}{extension}")
         candidate = staged or os.path.join(os.path.dirname(target), f".agw-media-{operation_id}{extension}")
-        if os.path.lexists(separate) or (not staged and os.path.lexists(candidate)):
+        if (not reuse_stage and os.path.lexists(separate)) \
+                or (not staged and os.path.lexists(candidate)):
             raise MediaReviewError("Proposed output already exists; prepare again.")
         plan = {
             "schema": SCHEMA, "id": operation_id, "operation": operation,
@@ -219,6 +243,7 @@ def prepare(target, policy_revision, *, operation="replace", staged=""):
             "supplied_stage": staged, "stage_identity": staged_state,
             "stage_sha256": staged_hash,
             "stage_parents": parent_binding(candidate),
+            "reuse_supplied_stage": reuse_stage,
         }
         record = {"plan": plan, "plan_sha256": _digest(plan), "state": "pending"}
         write(record)

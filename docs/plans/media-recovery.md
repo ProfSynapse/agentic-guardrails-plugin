@@ -19,6 +19,14 @@ could not remove the protected copies. Clarified instructions and corrected CLI
 help address immediate confusion; they do not turn conversation into a reliable
 consent channel. See the dated natural-workflow results in Linux validation.
 
+Implemented follow-up: keep-both reuses a supplied finished file already beside
+the original, and a proven pre-publication capacity refusal exposes preserving
+alternatives on the same operation ID. The code chooses the output path and
+restricts available actions. The model no longer needs to create a new operation
+or decide whether another copy is necessary in those paths. Ambiguous failures
+retain inspection requirements; conversational choice is still not authenticated
+approval.
+
 Proposed next work, not implemented policy:
 
 1. Give the publication API a configured preservation default. An ambiguous
@@ -33,20 +41,14 @@ Proposed next work, not implemented policy:
    next operations, rather than expecting the agent to invent remediation.
    Recheck admission under the recovery lock at execution time; a preview is
    not a disk reservation. Keep durable claims and ambiguous-failure inspection.
-   After a proven no-write capacity refusal, a typed recovery operation could
-   inspect and prepare the alternative itself. Do not make the model replay a
-   consumed ID or guess how to create a fresh one; never auto-retry an uncertain
-   partial publication.
-3. Add an explicit keep-existing-output result when the finished revision
-   already exists separately. Verify both identities and report that path without
-   making a third copy, moving someone else's input, or creating writable
-   hardlink aliases. Reserve timestamped publication for an actual new output.
-4. Bound generated output independently of recovery. A staging wrapper can own
+   The implemented same-ID capacity alternative does not precompute all storage
+   costs or reserve physical disk space.
+3. Bound generated output independently of recovery. A staging wrapper can own
    new output and reject publication over a limit, but a post-render size check
    does not stop a 20 GiB render from filling disk. A hard growth limit needs
    filesystem quotas or enforcement in a controlled writer/worker. Free-space
    checks and polling are useful early warnings, not hard guarantees.
-5. Keep automatic retention in code, with deterministic eligibility and receipt
+4. Keep automatic retention in code, with deterministic eligibility and receipt
    validation. If sole-copy expiration is ever added, require a separately agreed
    policy and a real review surface; never infer permission from file type, an
    operation ID, or an agent-supplied approval flag. Give users a storage summary
@@ -199,13 +201,28 @@ parents, policies or supplied stages fail closed. IDs do not authenticate human
 approval; agent-supplied consent flags are deliberately absent. The safety
 guarantee is recoverability/preservation, not independent proof of consent.
 
+Only a typed capacity refusal from the pre-publication snapshot boundary (or
+archive admission before removal) can enter `capacity-blocked`, after target,
+policy and staged version are revalidated. An individually oversized original
+can enter that state before any original-byte read. `media_capacity_blocked`
+returns only `save-separately`/`cancel` for replacement or `cancel` for removal,
+with exact continuation commands using the same ID. Replacement cannot replay
+from that state. The preserving alternative is freshly claimed and revalidated;
+owned stage versions observed at the refusal are bound too. Generic error codes,
+rolled-back writes, crashes and uncertain failures do not qualify. To attempt
+replacement after an authorized budget change, prepare a new operation.
+
 Replacement reuses verified publication snapshots and transaction recovery.
 Explicit CLI capture can exceed the short native-hook 100 MiB ceiling, but
 never bypasses total or class budgets. A file individually too large for its
 recovery allowance is refused before reading its original bytes. There is no
-permanent-delete fallback. Separate output uses atomic no-clobber creation:
-an owned same-directory stage is promoted with link/unlink without duplicating
-its bytes; a supplied stage is copied independently and retained. Filesystems
+permanent-delete fallback. For newly prepared operations, keep-both reuses a
+supplied finished file in the target directory after identity/hash validation,
+returns that actual path with `changed: 0`, and creates neither a copy nor a
+hardlink alias. An owned same-directory stage is promoted with no-clobber
+link/unlink without duplicating its bytes. A supplied stage outside the target
+directory is copied independently to the planned destination and retained.
+Previously prepared plans keep their bound output paths. Filesystems
 without the required link operation refuse owned-stage promotion. Cancellation
 does not create output or discard an already-created stage.
 
