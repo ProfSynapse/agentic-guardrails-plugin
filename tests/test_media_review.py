@@ -1,4 +1,5 @@
 """Media choices must preserve bytes independently of conversational consent."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from threading import Barrier
 
 import pytest
 
+from core import archive_transactions as archive_tx
 from core import engine, media_review as review, preimages, store
 import file_ops
 import media_ops
@@ -337,6 +339,59 @@ def test_failure_after_publication_never_offers_capacity_shortcut(tmp_path, monk
                for v in store.list_versions(str(target)))
     with pytest.raises(review.MediaReviewError, match="already used"):
         media_ops.continue_operation(plan["id"], "save-separately")
+
+
+@pytest.mark.parametrize("boundary", ["candidate", "backup", "publication"])
+def test_disk_full_preserves_media_and_requires_inspection(tmp_path, monkeypatch, boundary):
+    """OS write failures are not the proven budget-refusal continuation path."""
+    target, plan = prepared(tmp_path)
+    finish_stage(plan)
+    stage = Path(plan["staged_path"])
+    failed_destinations = []
+
+    def partial_copy(source, destination, *args, **kwargs):
+        Path(destination).write_bytes(b"partial")
+        failed_destinations.append(Path(destination))
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def failed_publish(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        if boundary == "candidate":
+            patch.setattr(media_ops.publication.shutil, "copy2", partial_copy)
+        elif boundary == "backup":
+            patch.setattr(archive_tx, "_copy_file_hashed", partial_copy)
+        else:
+            patch.setattr(file_ops, "replace_with_retry", failed_publish)
+        with pytest.raises(review.MediaReviewError, match="consumed") as failure:
+            media_ops.continue_operation(plan["id"], "replace")
+
+    assert "No space left" in str(failure.value) or "No space left" in str(failure.value.details)
+    assert target.read_bytes() == b"irreplaceable original"
+    assert stage.read_bytes() == b"finished replacement"
+    assert not list(tmp_path.glob(".agw-publish-*"))
+    record = review.read(plan["id"])
+    assert record["state"] == "needs-inspection"
+    assert review.describe(record)["choices"] == []
+    with pytest.raises(review.MediaReviewError, match="already used"):
+        media_ops.continue_operation(plan["id"], "save-separately")
+
+    if boundary == "candidate":
+        assert failed_destinations and not any(p.exists() for p in failed_destinations)
+        assert not store.list_versions(str(target))
+    elif boundary == "backup":
+        records = [item["record"] for item in store.discover_archive_transactions()
+                   if item.get("record") and item["record"].get("src") == str(target)]
+        assert len(records) == 1 and records[0]["state"] == archive_tx.PREPARING
+        assert not Path(records[0]["dest"]).exists()
+        recovered = archive_tx.recover_record(store.agw_home(), records[0])
+        assert Path(recovered["quarantine"]).read_bytes() == b"partial"
+        assert not any(p.exists() for p in failed_destinations)
+        assert target.read_bytes() == b"irreplaceable original"
+    else:
+        assert any(Path(v["dest"]).read_bytes() == b"irreplaceable original"
+                   for v in store.list_versions(str(target)))
 
 
 def test_concurrent_capacity_alternatives_claim_only_once(tmp_path, monkeypatch):

@@ -60,6 +60,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 8
         run: python -m pytest -q tests/test_store_agw.py tests/test_policy_health.py tests/test_levels.py tests/test_archive_transactions.py tests/test_office.py tests/test_office_structured.py
+      - name: Run Windows media, retention, and publication shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_media_review.py tests/test_retention.py tests/test_retention_policy.py tests/test_retention_policy_propagation.py tests/test_retention_integration.py tests/test_store_retention_audit.py tests/test_file_ops.py tests/test_staged_batch_publication.py tests/test_publication_recovery_core.py tests/test_publish_validation_integration.py
       - name: Run source and packed-artifact conformance on Unix
         if: runner.os != 'Windows'
         run: python -m pytest -q
