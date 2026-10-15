@@ -83,7 +83,8 @@ cmd and PowerShell, all three lifecycle events, Python-only PATH, Python
 Launcher, missing Python, spaced Unicode/ampersand paths, and failed adapters
 that must not be retried. Focused Linux artifact/host/dispatcher checks passed
 **135 tests, 56 skipped**; Windows-only cases account for the additional skips.
-The broader checks also exposed two fixture assumptions: ancestor project
+The broader native Windows artifact/host/dispatcher run passed **181 tests,
+10 skipped**. These checks also exposed two fixture assumptions: ancestor project
 markers and exact casing of Windows parent paths. The diagnostic fixture now
 marks its own project; Unicode path tests verify the exact leaf name and file
 identity instead of requiring identical parent-path casing. These changes do
