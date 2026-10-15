@@ -16,7 +16,9 @@ Never use a cache path or change PATH.
 
 ## Workflow
 
-1. Match the intent below and read its reference before operating.
+1. Match the intent below and read its reference before operating. Existing
+   video, audio and raster images always use the media route, including staged
+   replacements.
 2. Reuse an explicit user choice for this target, action and recovery behavior;
    ask only when that choice is missing or ambiguous.
 3. Run routine commands for the user. Retain and apply exact plan hashes.
@@ -39,7 +41,7 @@ Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 | Single-use script plan | `run-plan create`, then `apply` | [recovery](references/recovery.md) |
 | Office work | Exact `office <operation> --help` | [Office](references/office.md) |
 | Large Office rewrite | Checkout/publish help | [Office](references/office.md) |
-| Staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
+| Other staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
 | Existing video, audio, raster image | `media prepare`, then `media continue` | [media](references/media.md) |
 | Folder discovery | Scan/list/search help | [synced](references/synced-folders.md) |
 | Google stub | Connector/export | [Google stubs](references/google-stubs.md) |
