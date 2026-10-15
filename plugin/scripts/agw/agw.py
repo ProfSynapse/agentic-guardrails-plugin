@@ -2018,7 +2018,7 @@ def cmd_office(args):
 def cmd_prune(args):
     # Manual maintenance is still acknowledged explicitly; normal store-growing
     # operations invoke this same bounded selector automatically under pressure.
-    print("prune permanently reclaims only expired classified cache preimages.",
+    print("prune runs the same automatic cleanup of eligible redundant preimages.",
           file=sys.stderr)
     if not args.yes_i_am_a_human:
         _err("refusing: pass --yes-i-am-a-human after reviewing `agw status`", code=4)

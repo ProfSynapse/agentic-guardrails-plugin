@@ -283,20 +283,20 @@ def test_multiple_events_never_combine_recommendations():
     assert "single_event" in advice.missing_fields
 
 
-def test_capacity_instruction_names_prune_and_the_cap_override():
+def test_capacity_instruction_explains_automatic_cleanup_and_the_cap_override():
     text = remediation.capacity_instruction({
         "maximum_bytes": 20 * 1024 * 1024, "required_free_bytes": 4096,
     })
-    assert "agw prune" in text
-    assert "--yes-i-am-a-human" in text
+    assert "Cleanup has already run" in text
+    assert "--yes-i-am-a-human" not in text
     assert "agw status" in text
     assert "AGW_ARCHIVE_MAX_BYTES" in text
     assert "archive_max_bytes" in text
     assert "20,971,520" in text and "4,096" in text
     assert "Retry with one direct" not in text
     # Robust to missing or malformed details.
-    assert "agw prune" in remediation.capacity_instruction(None)
-    assert "agw prune" in remediation.capacity_instruction({"maximum_bytes": "x"})
+    assert "Cleanup has already run" in remediation.capacity_instruction(None)
+    assert "Cleanup has already run" in remediation.capacity_instruction({"maximum_bytes": "x"})
 
 
 def test_capacity_denial_gets_reclaim_advice_not_direct_retry():
@@ -329,7 +329,7 @@ def test_a_capacity_denial_renders_the_reclaim_instruction_not_the_fallback():
     """The generic sentence cannot be acted on when the cache is full.
 
     Every remaining rollback point is protected, so "propose something
-    narrower" can never succeed; the safe-next text has to name the prune.
+    narrower" can never succeed; the safe-next text has to explain the remaining capacity constraint.
     """
     from core import presentation
 
@@ -340,19 +340,19 @@ def test_a_capacity_denial_renders_the_reclaim_instruction_not_the_fallback():
     text = presentation.render_safe_next(
         advice, {"maximum_bytes": 20 * 1024 * 1024, "required_free_bytes": 4096},
     )
-    assert "agw prune" in text
-    assert "--yes-i-am-a-human" in text
+    assert "Cleanup has already run" in text
+    assert "--yes-i-am-a-human" not in text
     assert "20,971,520" in text
     assert "Propose a narrower, reversible operation" not in text
     # Robust without details, which is how the hook reaches it today.
-    assert "agw prune" in presentation.render_safe_next(advice)
+    assert "Cleanup has already run" in presentation.render_safe_next(advice)
 
     decision = GuardrailDecision(
         DENY, reason="the recovery cache is full",
         rule_id="invariant:prestate-unavailable", safe_next=advice,
     )
     feedback = presentation.build_denial_feedback(decision, "", [_event()])
-    assert "agw prune" in feedback
+    assert "Cleanup has already run" in feedback
     assert "Propose a narrower, reversible operation" not in feedback
 
 

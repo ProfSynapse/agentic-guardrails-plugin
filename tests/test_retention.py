@@ -215,6 +215,49 @@ def test_selection_is_deterministic_and_bounded_to_256(tmp_path, agw_home):
     }
 
 
+def test_indivisible_media_can_exceed_batch_budget_but_not_store_cap(tmp_path, agw_home):
+    source = tmp_path / "recording.mp4"
+    oldest = _archive(agw_home, source, 1, 60)
+    _archive(agw_home, source, 2, 59)
+    newest = _archive(agw_home, source, 3, 58)
+    _source_mtime(source, 50)
+    # Scale down the budget instead of allocating multi-GiB test files.
+    plan = _pressured_plan(agw_home, max_reclaim=1)
+    assert len(plan["candidates"]) == 1
+    assert plan["candidates"][0]["transaction_id"] == oldest["transaction_id"]
+    assert plan["planned_reclaim_bytes"] > plan["max_reclaim_bytes"]
+    applied = retention.apply_plan(
+        agw_home, plan, expected_plan_hash=plan["plan_sha256"],
+        now_ns=NOW, activity_records=[],
+    )
+    assert applied["reclaimed_bytes"] > 0
+    assert os.path.isfile(newest["dest"])
+
+    snapshot = retention.inventory(agw_home, activity_records=[])
+    too_small = _policy(1, max_reclaim=1)
+    assert not retention.select_candidates(
+        snapshot, 1, now_ns=NOW, policy=too_small,
+    )
+
+
+def test_oversized_batch_cannot_smuggle_multiple_artifacts(tmp_path, agw_home):
+    from core import recovery_contracts
+
+    source = tmp_path / "recording.wav"
+    for version in range(1, 4):
+        _archive(agw_home, source, version, 60 - version)
+    _source_mtime(source, 50)
+    plan = _pressured_plan(agw_home)
+    assert len(plan["candidates"]) == 2
+    plan["policy"]["max_reclaim_bytes"] = 1
+    plan = recovery_contracts.bind_plan_hash(plan)
+    with pytest.raises(retention.InvalidPlanError, match="reclaim-byte bound"):
+        retention.apply_plan(
+            agw_home, plan, expected_plan_hash=plan["plan_sha256"],
+            now_ns=NOW, activity_records=[],
+        )
+
+
 def test_plan_binds_policy_store_inventory_and_expires(tmp_path, agw_home):
     source = tmp_path / "bound.txt"
     _archive(agw_home, source, 1, 60)

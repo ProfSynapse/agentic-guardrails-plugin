@@ -102,10 +102,16 @@ the build-dir allowlist, `archive_max_bytes`).
 The store grows as it keeps pre-image snapshots. `AGW_ARCHIVE_MAX_BYTES` (or
 `settings.archive_max_bytes`) has a 4 GiB standard default; `0` explicitly means
 unlimited. Store-growing operations start automatic maintenance at 90% and
-target 80%, with each pass bounded to 256 artifacts and 1 GiB. Only authoritative
-records explicitly classified as `mutation_preimage` can expire. All points from
-the last seven days are retained; days 8–30 retain daily generations; after a
-path has been inactive for 30 days its newest usable point remains protected.
+target 80%, with up to four planning passes per operation. Each batch normally
+holds at most 256 artifacts and 1 GiB (`AGW_ARCHIVE_MAX_RECLAIM_BYTES`). One
+indivisible eligible artifact may exceed that byte budget when reclaimed alone,
+up to `AGW_ARCHIVE_MAX_BYTES`; this prevents large media from being stranded.
+Only authoritative records explicitly classified as `mutation_preimage` can
+expire. Normal retention keeps points from the last seven days; days 8–30 retain
+daily generations; after a path has been inactive for 30 days its newest usable
+point remains protected.
+At high water, if normal retention cannot restore headroom, older redundant
+preimages can yield early only behind a newer verified same-source copy.
 Move/delete archives, manual snapshots, evidence/quarantine, corrupt or
 incomplete records, and unclassified legacy records are never automatically
 pruned. If protected data prevents admission at the hard limit, the new mutation
@@ -113,11 +119,15 @@ is blocked before publication. `agw status` and `agw doctor` report the typed
 retention state and thresholds.
 
 No retention work runs at SessionStart. A store-growing mutation or preimage
-capture first performs a cheap size/admission check. Only when that projected
+capture first reuses any verified unchanged copies and admits only new bytes. Only when that projected
 size reaches the high-water mark does Guardrails run the bounded full inventory
 and pruning pass. `agw status` and `agw doctor` are read-only retention reports
 and never invoke maintenance. `agw prune` is an optional manual request for the
-same bounded maintenance policy.
+same bounded maintenance policy; it is not required after a capacity refusal.
+A hard refusal reports the byte shortfall and budget setting. PDFs and media
+receive byte-exact recovery; file extensions never make originals disposable.
+Native hooks retain their separate per-file capture size limit. See
+[media recovery design](../../docs/plans/media-recovery.md) for planned media tiers.
 
 ## 5. Requirements per machine
 

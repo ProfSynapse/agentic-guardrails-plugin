@@ -68,8 +68,8 @@ PROTECTED_CLASSES = frozenset({
 KNOWN_CLASSES = frozenset({ELIGIBLE_CLASS}) | PROTECTED_CLASSES
 
 # Protections that encode recency or generation policy rather than the
-# integrity or uniqueness of a recovery point. When the store is over its
-# hard cap and normal reclamation found nothing, they yield for every
+# integrity or uniqueness of a recovery point. When the store reaches high
+# water and normal reclamation cannot restore headroom, they yield for every
 # eligible record except the newest usable copy of its source, oldest first.
 # Everything else (class, move archives, pins, unverified, noncommitted, and
 # the newest copy itself) keeps protecting.
@@ -968,11 +968,13 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
         if len(selected) >= count_limit or reclaimed >= required:
             break
         size = int(item["allocated_bytes"])
-        if selected and reclaimed + size > byte_limit:
-            break
-        if not selected and size > byte_limit:
-            # One large artifact still cannot exceed the explicit per-pass cap.
-            continue
+        if reclaimed + size > byte_limit:
+            # A file is indivisible. Permit one oversized eligible artifact,
+            # bounded by the configured store cap, rather than making large
+            # media permanently uncollectable. Never mix it into a batch.
+            single_limit = max(byte_limit, policy.max_bytes) if policy else byte_limit
+            if selected or size > single_limit:
+                continue
         selected.append({
             field: item[field] for field in (
                 "transaction_id", "source", "source_identity", "artifact",
@@ -983,6 +985,8 @@ def select_candidates(snapshot: dict, bytes_to_free: int, *,
             )
         })
         reclaimed += size
+        if reclaimed >= byte_limit:
+            break
     return selected
 
 
@@ -1185,8 +1189,14 @@ def _validate_plan(plan: dict, expected_plan_hash: str, home: str, now_ns: int):
         raise InvalidPlanError("retention plan candidate identity is invalid")
     if any(item.get("retention_class") != ELIGIBLE_CLASS for item in candidates):
         raise InvalidPlanError("retention plan contains a protected class")
-    if sum(max(0, int(item.get("allocated_bytes") or 0)) for item in candidates) \
-            > MAX_RECLAIM_BYTES:
+    raw_policy = plan.get("policy") or {}
+    batch_limit = min(int(raw_policy.get("max_reclaim_bytes") or 0), MAX_RECLAIM_BYTES)
+    candidate_limit = min(int(raw_policy.get("max_candidates") or 0), MAX_CANDIDATES)
+    if batch_limit <= 0 or len(candidates) > candidate_limit:
+        raise InvalidPlanError("retention plan exceeds its policy bounds")
+    reclaimed = sum(max(0, int(item.get("allocated_bytes") or 0)) for item in candidates)
+    single_limit = max(batch_limit, int(raw_policy.get("max_bytes") or 0))
+    if reclaimed > batch_limit and (len(candidates) != 1 or reclaimed > single_limit):
         raise InvalidPlanError("retention plan exceeds its reclaim-byte bound")
 
 

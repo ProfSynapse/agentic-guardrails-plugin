@@ -658,7 +658,8 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                  _transaction_id: str = "",
                  _admission_checked: bool = False,
                  _recovery_source_identity=None,
-                 ) -> dict:
+                 _reuse_only: bool = False,
+                 ) -> dict | None:
     """Archive one file or directory. mode='move' (delete-replacement) or
     'copy' (pre-image snapshot, leaves the original).
 
@@ -667,6 +668,9 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
     second full copy. Only the newest version is a dedupe target, so the
     entry that stands in for the new capture is always the one retention
     protects as the newest, and its hold is extended to the new deadline.
+    Internal ``_reuse_only`` probes return None on a miss without admission
+    or capture; callers hold the global lock across aggregate admission.
+    Move operations must always capture and remove the source, never dedupe.
     """
     src = os.path.abspath(src)
     if not os.path.lexists(src):
@@ -682,16 +686,13 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
 
     context = lock_context or Lock("recovery-store", timeout=CLI_LOCK_TIMEOUT_S)
     with context:
-        if not _admission_checked:
-            maintain_retention(
-                policy=retention_config, incoming_bytes=incoming_bytes,
-                lock_context=nullcontext(),
-            )
-        with Lock(_folder_key(os.path.dirname(src))):
+        folder_lock = (nullcontext() if _reuse_only
+                       else Lock(_folder_key(os.path.dirname(src))))
+        with folder_lock:
             # Directory publication shares parents with every archive from this
             # source folder, so it belongs inside the same lock as versioning.
             file_dir = _file_dir(src)
-            if dedupe and ordinary_file:
+            if dedupe and mode == "copy" and ordinary_file:
                 newest = _newest_index_row(file_dir)
                 digest = _dedupe_digest(src, newest)
             if dedupe and digest:
@@ -712,6 +713,13 @@ def archive_file(src: str, mode: str = "move", reason: str = "", actor: str = "a
                         return {**archive_tx.entry_from_record(refreshed),
                                 "deduped": True}
                     return {**last, "deduped": True}
+            if _reuse_only:
+                return None
+            if not _admission_checked:
+                maintain_retention(
+                    policy=retention_config, incoming_bytes=incoming_bytes,
+                    lock_context=nullcontext(),
+                )
             size_base = _archive_size_bytes_locked()
             index_path = os.path.join(file_dir, "manifest.jsonl")
             index_before = _size_or_zero(index_path)
@@ -2106,13 +2114,14 @@ def _raise_if_over_capacity(policy: retention_policy.RetentionPolicy,
 
 def maintain_retention(*, policy: retention_policy.RetentionPolicy | None = None,
                        incoming_bytes: int = 0, lock_context=None) -> dict:
-    """Automatically reclaim only expired, classified cache preimages.
+    """Automatically reclaim redundant, classified cache preimages.
 
     The size check runs without the global lock. The lock (``lock_context``
     when given, otherwise the CLI default; a caller that already holds it
     passes ``nullcontext()``) is taken only when a prune may be applied or an
     interrupted prune must be recovered. Unknown, manual, move, evidence,
-    corrupt, and recent records are never candidates. If those protections
+    and corrupt records are never candidates; redundant recent preimages may
+    yield under pressure behind a newer verified copy. If those protections
     leave insufficient room, the new store-growing operation is refused
     before publication.
     """
@@ -2156,44 +2165,42 @@ def _maintain_retention_locked(*,
         journal_recovery=journal_recovery, legacy_migration=migration,
     )
     after = before
-    if state.prune_recommended and before:
+    pressure = False
+    result["maintenance_passes"] = []
+    # Bounded catch-up: a store can need more than one 1 GiB batch after a
+    # large capture or a reduced cap. Never ask the user to run prune in a loop.
+    for _ in range(4):
+        if not state.prune_recommended or not after:
+            break
+        if after + incoming <= policy.low_water_bytes:
+            break
         plan = retention.build_plan(
-            agw_home(), policy=policy, current_bytes=projected,
-        )
-        result["plan"] = plan
-        if plan.get("applicable") and plan.get("candidates"):
-            applied = retention.apply_plan(
-                agw_home(), plan, expected_plan_hash=plan["plan_sha256"],
-                policy=policy, lock_context=nullcontext(),
-            )
-            result["applied"] = True
-            result["apply"] = applied
-            result["reclaimed_bytes"] = int(applied.get("reclaimed_bytes") or 0)
-            # A prune is the one path that shrinks the archive; recount once
-            # rather than trusting allocated-vs-logical arithmetic.
-            after = _refresh_archive_size_locked()
-
-    if not policy.unlimited and after + incoming > policy.max_bytes and after:
-        # Capacity wall: normal reclamation left the store over its hard cap.
-        # Let older same-source pre-images yield behind a newer verified copy
-        # before refusing; the newest copy of every file is still never
-        # touched, and `agw prune` remains the only human-gated path beyond.
-        pressure_plan = retention.build_plan(
             agw_home(), policy=policy, current_bytes=after + incoming,
-            capacity_pressure=True,
+            capacity_pressure=pressure,
         )
-        result["capacity_pressure_plan"] = pressure_plan
-        if pressure_plan.get("applicable") and pressure_plan.get("candidates"):
-            applied = retention.apply_plan(
-                agw_home(), pressure_plan,
-                expected_plan_hash=pressure_plan["plan_sha256"],
-                policy=policy, lock_context=nullcontext(),
-            )
-            result["applied"] = True
-            result["capacity_pressure_apply"] = applied
-            result["reclaimed_bytes"] = int(result.get("reclaimed_bytes") or 0) \
-                + int(applied.get("reclaimed_bytes") or 0)
-            after = _refresh_archive_size_locked()
+        key = "capacity_pressure_plan" if pressure else "plan"
+        result[key] = plan
+        if not plan.get("applicable"):
+            break
+        if not plan.get("candidates"):
+            if pressure:
+                break
+            # Keep hard protections, but let redundant recent generations
+            # yield before the hard cap is reached.
+            pressure = True
+            continue
+        applied = retention.apply_plan(
+            agw_home(), plan, expected_plan_hash=plan["plan_sha256"],
+            policy=policy, lock_context=nullcontext(),
+        )
+        result["applied"] = True
+        result["capacity_pressure_apply" if pressure else "apply"] = applied
+        result["maintenance_passes"].append(applied)
+        result["reclaimed_bytes"] += int(applied.get("reclaimed_bytes") or 0)
+        previous = after
+        after = _refresh_archive_size_locked()
+        if after >= previous:
+            break
 
     result["after_bytes"] = after
     result["final_projected_bytes"] = after + incoming

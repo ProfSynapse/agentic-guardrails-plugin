@@ -423,17 +423,30 @@ evolve.
   full table.
 - **Recovery-cache budget:** the standard policy is 4 GiB, with automatic
   maintenance at 90% and a target of 80%. `AGW_ARCHIVE_MAX_BYTES=0` explicitly
-  selects unlimited retention. Every mutation preimage is protected for seven
-  days; days 8–30 retain daily generations, and a path inactive for more than
-  30 days retains its newest usable point. Move/delete archives, manual
-  snapshots, evidence, corrupt records, and unclassified legacy records are
-  never automatic candidates.
+  selects unlimited retention. Normal retention keeps seven days of mutation
+  preimages, then daily generations through day 30. Under storage pressure,
+  older redundant preimages may yield earlier behind a newer verified copy.
+  The newest usable copy of each path, move/delete archives, manual snapshots,
+  evidence, corrupt records, and unclassified legacy records stay protected.
 
-Retention does not run at SessionStart. Each operation that would grow the
-recovery store performs a cheap size/admission preflight; the bounded full
-inventory and pruning pass runs only after that operation reaches the
-high-water mark. `agw status` and `agw doctor` are read-only retention reports
-and never invoke maintenance; manual `agw prune` is optional.
+Unchanged files reuse their verified newest copy before capacity admission;
+only new bytes count, including for multi-file captures. Reuse works even when
+an existing store exceeds a newly lowered cap. Copy verification, aggregate
+admission and capture share the store lock.
+
+Retention does not run at SessionStart. Operations that grow the recovery store
+check projected usage and automatically run up to four bounded planning passes
+at high water. Batches normally contain at most 256 artifacts and 1 GiB. One
+eligible artifact larger than the batch budget may be reclaimed alone, up to
+the configured store cap, so old media copies do not become permanent merely
+because they are large. All eligibility and integrity checks still apply.
+`agw status` and `agw doctor` are read-only; manual `agw prune` is optional and
+uses the same protections. If automatic cleanup cannot admit a change, the
+message reports the shortfall and budget setting instead of requiring a manual
+prune command.
+
+See [media recovery design](docs/plans/media-recovery.md) for the current behavior
+and proposed separation of document history, media originals, and derived files.
 
 ### Activity history and recovery metadata
 

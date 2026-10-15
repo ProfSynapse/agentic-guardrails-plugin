@@ -481,7 +481,7 @@ def test_capacity_wall_yields_older_copies_but_never_the_newest(tmp_path):
     assert store.archive_size_bytes() <= cap
 
 
-def test_capacity_wall_refusal_names_prune_and_the_override(tmp_path):
+def test_capacity_wall_refusal_explains_automatic_cleanup_and_the_override(tmp_path):
     lone = tmp_path / "lone.bin"
     lone.write_bytes(b"L" * 30_000)
     kept = _prepare(lone)
@@ -498,9 +498,9 @@ def test_capacity_wall_refusal_names_prune_and_the_override(tmp_path):
         )
     details = failure.value.details
     assert details["error_code"] == "archive_capacity_exceeded"
-    assert "agw prune" in details["remediation"]
+    assert "Cleanup has already run" in details["remediation"]
     assert "AGW_ARCHIVE_MAX_BYTES" in details["remediation"]
-    assert "agw prune" in str(failure.value)
+    assert "Cleanup has already run" in str(failure.value)
     assert os.path.exists(kept.receipts[0].artifact)
 
     result = preimages.prepare(
@@ -509,7 +509,109 @@ def test_capacity_wall_refusal_names_prune_and_the_override(tmp_path):
     )
     assert result.ok is False
     assert result.error_code == "archive_capacity_exceeded"
-    assert "agw prune --yes-i-am-a-human" in result.reason
+    assert "Cleanup has already run" in result.reason
     assert "AGW_ARCHIVE_MAX_BYTES" in result.reason
     assert "Retry with one direct" not in result.reason
     assert store.list_versions(str(incoming)) == []
+
+
+@pytest.mark.parametrize("suffix", [".pdf", ".mp4", ".wav"])
+def test_unchanged_media_reuses_verified_copy_at_capacity(tmp_path, suffix):
+    target = tmp_path / ("source" + suffix)
+    target.write_bytes(b"original media bytes" * 2000)
+    first = _prepare(target)
+    assert first.ok, first.reason
+    size = store.archive_size_bytes()
+    # Even a lowered cap cannot make a zero-growth reuse require pruning.
+    policy = _capped(size - 1)
+    again = preimages.prepare(
+        [str(target)], "Edit", 1 << 20, policy_revision="rev-1",
+        retention_config=policy,
+    )
+    assert again.ok, again.reason
+    assert again.receipts[0].transaction_id == first.receipts[0].transaction_id
+    assert preimages.receipt_valid(again.receipts[0], "rev-1")
+    assert store.archive_size_bytes() == size
+    direct = store.archive_file(
+        str(target), mode="copy", dedupe=True,
+        retention_class="mutation_preimage", policy_revision="rev-1",
+        retention_config=policy,
+    )
+    assert direct["deduped"]
+    assert direct["transaction_id"] == first.receipts[0].transaction_id
+
+
+def test_batch_admission_counts_only_changed_files(tmp_path):
+    stable = tmp_path / "stable.pdf"
+    stable.write_bytes(b"p" * 100_000)
+    first = _prepare(stable)
+    new = tmp_path / "new.txt"
+    new.write_bytes(b"n" * 1000)
+    cap = store.archive_size_bytes() + 20_000
+    result = preimages.prepare(
+        [str(stable), str(new)], "Edit", 1 << 20,
+        policy_revision="rev-1", retention_config=_capped(cap),
+    )
+    assert result.ok, result.reason
+    assert result.receipts[0].transaction_id == first.receipts[0].transaction_id
+    assert all(preimages.receipt_valid(r, "rev-1") for r in result.receipts)
+    assert store.archive_size_bytes() <= cap
+
+
+def test_corrupt_media_copy_cannot_bypass_capacity(tmp_path):
+    target = tmp_path / "source.mp4"
+    target.write_bytes(b"v" * 30_000)
+    first = _prepare(target)
+    with open(first.receipts[0].artifact, "wb") as handle:
+        handle.write(b"x" * 30_000)
+    result = preimages.prepare(
+        [str(target)], "Edit", 1 << 20, policy_revision="rev-1",
+        retention_config=_capped(store.archive_size_bytes() + 1),
+    )
+    assert not result.ok
+    assert result.error_code == "archive_capacity_exceeded"
+    assert target.read_bytes() == b"v" * 30_000
+
+
+def test_pressure_cleanup_starts_before_hard_cap(tmp_path):
+    from core import archive_transactions as archive_tx
+
+    target = tmp_path / "draft.pdf"
+    target.write_bytes(b"a" * 40_000)
+    old = _prepare(target)
+    target.write_bytes(b"b" * 40_000)
+    newest = _prepare(target)
+    current = store.archive_size_bytes()
+    policy = _capped(current + 1000)
+    assert policy.high_water_bytes < current < policy.max_bytes
+    result = store.maintain_retention(policy=policy)
+    assert result["applied"]
+    assert archive_tx.load(store.agw_home(), old.receipts[0].transaction_id)["artifact_state"] == "PURGED"
+    assert preimages.receipt_valid(newest.receipts[0], "rev-1")
+
+
+def test_cleanup_automatically_runs_multiple_bounded_batches(tmp_path):
+    from dataclasses import replace
+
+    target = tmp_path / "many.wav"
+    for value in range(5):
+        target.write_bytes(bytes([value]) * 40_000)
+        assert _prepare(target).ok
+    size = store.archive_size_bytes()
+    policy = replace(_capped(size // 2), max_reclaim_bytes=41_000)
+    result = store.maintain_retention(policy=policy, incoming_bytes=10_000)
+    assert len(result["maintenance_passes"]) >= 3
+    assert result["final_projected_bytes"] <= policy.max_bytes
+    assert os.path.isfile(store.latest_version(str(target))["dest"])
+
+
+def test_move_never_dedupes_away_its_required_capture(tmp_path):
+    target = tmp_path / "move.pdf"
+    target.write_bytes(b"original" * 1000)
+    first = store.archive_file(str(target), mode="copy", retention_config=_unlimited())
+    moved = store.archive_file(
+        str(target), mode="move", dedupe=True, retention_config=_unlimited(),
+    )
+    assert not target.exists()
+    assert moved["transaction_id"] != first["transaction_id"]
+    assert os.path.isfile(moved["dest"])

@@ -1,6 +1,7 @@
 """Verified pre-authorization recovery artifacts for local file mutations."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
 import shutil
@@ -158,7 +159,6 @@ def prepare(targets, label: str, max_file_bytes: int,
         time.time_ns()
         + retention_config.min_protected_age_days * 24 * 60 * 60 * 1_000_000_000
     )
-    required_bytes = 0
     present = []
 
     for path in targets:
@@ -194,18 +194,57 @@ def prepare(targets, label: str, max_file_bytes: int,
                 return _plain_failure(
                     path, f"The file is larger than the configured {limit_mb} MB backup limit."
                 )
-            required_bytes += max(logical_size, allocated_size(path, st))
             present.append((path, _identity(st)))
         except OSError as exc:
             return _plain_failure(path, f"The file could not be read safely ({exc}).")
 
+    try:
+        with store.hook_lock():
+            return _capture_present(
+                targets, present, receipts, label, policy_revision,
+                retention_config, protected_until_ns, capture_group_id,
+            )
+    except TimeoutError:
+        return _busy_failure(present[0][0] if present else "")
+    except (OSError, ValueError, TypeError) as exc:
+        return _plain_failure(
+            present[0][0] if present else "",
+            f"The recovery copy could not be completed ({exc}).",
+        )
+    except Exception:
+        return _plain_failure(
+            present[0][0] if present else "",
+            "The recovery store reported an unexpected capture failure.",
+        )
+
+
+def _capture_present(targets, present, receipts, label, policy_revision,
+                     retention_config, protected_until_ns, capture_group_id):
+    """Reuse verified copies before admitting aggregate growth, under one lock."""
+    reused = {}
+    required_bytes = 0
+    for path, before_identity in present:
+        entry = store.archive_file(
+            path, mode="copy", dedupe=True, _reuse_only=True,
+            retention_class="mutation_preimage",
+            protected_until_ns=protected_until_ns,
+            policy_revision=policy_revision, lock_context=nullcontext(),
+        )
+        st = os.stat(path, follow_symlinks=False)
+        if _identity(st) != before_identity:
+            return _plain_failure(path, "The file changed while its recovery copy was being verified.")
+        if entry is not None:
+            reused[path] = entry
+        else:
+            required_bytes += max(int(st.st_size), allocated_size(path, st))
+
     first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
-        store.maintain_retention(
-            policy=retention_config, incoming_bytes=required_bytes,
-            lock_context=store.hook_lock(),
-        )
         if required_bytes:
+            store.maintain_retention(
+                policy=retention_config, incoming_bytes=required_bytes,
+                lock_context=nullcontext(),
+            )
             capacity_root = _nearest_existing_parent(
                 os.path.join(store.agw_home(), "archive", "probe")
             )
@@ -235,14 +274,14 @@ def prepare(targets, label: str, max_file_bytes: int,
             # re-walk per file. Dedupe keeps an unchanged file from storing a
             # second full copy: the verified newest version is refreshed and
             # its hold extended to this capture's deadline instead.
-            entry = store.archive_file(
+            entry = reused.get(path) or store.archive_file(
                 path, mode="copy", dedupe=True,
                 reason=f"verified pre-image before {label}", actor="guardrails-hook",
                 retention_class="mutation_preimage",
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 retention_config=retention_config,
-                lock_context=store.hook_lock(),
+                lock_context=nullcontext(),
                 policy_revision=policy_revision,
                 _admission_checked=True,
             )

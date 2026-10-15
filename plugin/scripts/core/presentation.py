@@ -150,10 +150,8 @@ def render_safe_next(advice: remediation.SafeNext, details: dict = None) -> str:
     """
     reason_code = advice.reason_code
     if reason_code == remediation.REASON_CAPACITY:
-        # The generic "propose something narrower" sentence is a lie here:
-        # every remaining rollback point is protected, so no narrower
-        # operation can succeed. The only doors are a human-gated prune or a
-        # larger cap, and the store package writes both into this text.
+        # Capacity maintenance already ran. Explain the shortfall and budget
+        # setting instead of routing the user through the same manual prune.
         return remediation.capacity_instruction(details)
     if reason_code == remediation.REASON_ARCHIVE:
         return (

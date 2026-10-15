@@ -85,12 +85,7 @@ CAPACITY_POLICY_SETTING = "archive_max_bytes"
 
 
 def capacity_instruction(details=None) -> str:
-    """Return the door out of a full recovery cache.
-
-    Retrying the same or a "more direct" operation can never succeed here:
-    every remaining rollback point is protected. The only moves are a
-    human-gated prune or a larger cap, so the instruction names both.
-    """
+    """Explain capacity remaining after automatic maintenance has run."""
     details = dict(details or {})
     try:
         maximum = int(details.get("maximum_bytes") or 0)
@@ -108,11 +103,11 @@ def capacity_instruction(details=None) -> str:
         sizing += "."
     return (
         "The recovery cache has reached its configured capacity and its "
-        "remaining rollback points are protected, so no new pre-image can be "
-        "stored." + sizing + " Do not "
-        "retry the same change yet. Ask the user to run `agw status` and then "
-        "`agw prune --yes-i-am-a-human` to reclaim expired pre-images, or to "
-        f"raise the cap with the {CAPACITY_ENV_OVERRIDE} environment variable "
+        "automatic cleanup could not make enough safe space for this change."
+        + sizing + " Cleanup has already run; manual pruning uses the same "
+        "protections and is not required. Inspect `agw status` for storage "
+        "usage. Increase the recovery budget with the "
+        f"{CAPACITY_ENV_OVERRIDE} environment variable "
         f"(or `{CAPACITY_POLICY_SETTING}` in the policy settings). Then retry "
         "the same change."
     )
