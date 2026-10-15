@@ -299,6 +299,7 @@ def test_unknown_destructive_action_has_no_escape_hatch(tmp_path):
     assert target.read_bytes() == b"irreplaceable original"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows truncate does not guarantee sparse allocation")
 def test_twenty_gib_original_is_not_hashed_or_copied_when_it_cannot_fit(tmp_path, monkeypatch):
     target = tmp_path / "huge.mp4"
     with target.open("wb") as handle:
