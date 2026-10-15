@@ -151,8 +151,10 @@ def render_safe_next(advice: remediation.SafeNext, details: dict = None) -> str:
     reason_code = advice.reason_code
     if reason_code == remediation.REASON_MEDIA:
         return (
-            "Clarify with the user: replace with verified recovery, save separately, "
-            "or cancel. For removal, offer reversible archive or cancel. Use the "
+            "Use an already-explicit user choice for this exact target, action and "
+            "recovery behavior without asking again. Otherwise ask and wait: replace "
+            "with verified recovery, save separately, or cancel. For removal, offer "
+            "reversible archive or cancel. Use the "
             "pending media operation and its exact continuation arguments from the "
             "refusal. Do not retry the original overwrite, infer approval from an "
             "operation ID, or turn cancellation into a new file. Permanent replacement "

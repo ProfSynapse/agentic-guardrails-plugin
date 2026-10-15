@@ -1,8 +1,9 @@
-# Media clarification
+# Media choices
 
-On `media_review_required` / `clarify-media-operation`, explain the exact target
-and ask the user to choose. Reuse an already-explicit choice for this exact
-action; otherwise stop for an answer. Do not immediately run a continuation.
+On `media_review_required` / `clarify-media-operation`, reuse an explicit user
+choice for this exact target, action and recovery behavior without asking again.
+"Replace cover.png and keep a recovery copy" already chooses replace.
+Otherwise ask once and wait. An ID alone never authorizes continuation.
 
 - Replacement: replace with recovery, save separately, or cancel.
 - Removal: archive with recovery, or cancel.
@@ -10,9 +11,9 @@ action; otherwise stop for an answer. Do not immediately run a continuation.
 - Cancel does not create a timestamped file or execute another operation.
 
 The refusal supplies an ID, staged/output paths and exact `continue_argv`.
-Explicit preparation: `agw media prepare PATH --json`; add `--staged FILE` for
+Prepare: `agw media prepare PATH --json`; add `--staged FILE` for
 an existing finished replacement, or `--operation archive` for removal.
-Preparation does not copy the original.
+This does not copy the original.
 
 After clarification, create the finished output at `staged_path` using
 create-new behavior when `supplied_stage` is empty. Otherwise preserve that

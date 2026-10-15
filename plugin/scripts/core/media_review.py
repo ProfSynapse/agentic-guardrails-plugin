@@ -132,9 +132,11 @@ def describe(record):
                                     "--action", action, "--json"] for action in actions},
         "recovery": "Replacement/removal requires verified recovery within current budgets. "
                     "No permanent-delete option. No automatic expiration of the sole recovery copy.",
-        "instruction": "Stop and clarify the desired action with the user. Do not retry the original "
-                       "overwrite or infer consent from this ID. After the user chooses replacement "
-                       "or separate output, create the finished replacement at staged_path if no "
+        "instruction": "A user choice is required, not a second confirmation. If the user already "
+                       "explicitly chose this exact target, action and recovery behavior, use that "
+                       "choice now. Otherwise ask and wait; never infer consent from this ID. "
+                       "Do not retry the original overwrite. For replacement or separate output, "
+                       "create the finished replacement at staged_path if no "
                        "supplied_stage is recorded (otherwise preserve that exact staged version), then "
                        "continue the exact operation. Cancel changes no files. Handle other targets separately.",
     }
@@ -240,8 +242,9 @@ def require_review(targets, policy_revision, *, operation="replace", staged=""):
             continue
         pending = prepare(target, policy_revision, operation=operation, staged=staged)
         raise MediaReviewRequired(
-            "Media clarification required. Nothing was changed. Ask the user to choose "
-            "a protected continuation; do not retry the original operation. "
+            "Media operation paused; nothing was changed. Continue using an already-explicit "
+            "user choice for this exact target, action and recovery behavior; otherwise ask "
+            "the user to choose. Do not retry the original operation. "
             + json.dumps(pending, ensure_ascii=False, separators=(",", ":")),
             pending,
         )

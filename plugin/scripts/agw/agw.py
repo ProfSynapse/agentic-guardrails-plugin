@@ -2235,7 +2235,7 @@ def main(argv=None):
         help="archive current version and replace with the working copy")
     add(
         "publish-file", cmd_publish_file,
-        (["--staged"], {"required": True, "help": "validated temporary output"}),
+        (["--staged"], {"required": True, "help": "finished source file; retained after publication"}),
         (["--target"], {"required": True, "help": "literal live target path"}),
         (["--expected-hash"], {
             "default": "", "help": "expected live SHA-256, or absent",
