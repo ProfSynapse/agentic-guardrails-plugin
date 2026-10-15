@@ -1,5 +1,56 @@
 # Linux validation and deployment boundaries
 
+## Keep-both and capacity-continuation fixes 2026-10-15
+
+Runtime `e552ec6` fixes the duplicate-copy and consumed-operation friction found
+below. Newly prepared keep-both operations reuse a finished supplied revision
+already in the target directory, returning its existing path with zero copies.
+Known pre-publication capacity failures enter `capacity-blocked` and permit only
+preserving alternatives using the same ID. Uncertain failures remain consumed.
+The full suite passed **2,093 tests, 58 skipped**. Tests cover actual capacity
+refusal through the publication boundary, fresh-process continuation, version
+changes, expiry, concurrency, and late failures that must not enable the shortcut.
+
+Both installed host packages matched all 82 source files. Eight fresh uncoached
+conversations (14 turns) then verified:
+
+| Workflow | Claude Code | Codex CLI |
+| --- | --- | --- |
+| Ambiguous update, then keep both | Asked before replacement; zero additional copies; original and revision retained | Same |
+| Full protected store, then keep both | Replacement refused; preserving continuation completed on the same ID; zero extra copies or replay errors | Same |
+| Explicit replace with recovery | Completed without another user choice; original archive verified | Same |
+| Cancel after request to wait | Original unchanged; no new output | Same |
+
+The capacity follow-up used two tool calls in Claude and one in Codex. Neither
+required manual pruning or a new operation. Claude still described a settings
+change as another route despite the limited operation choices; therefore the
+routine capacity error was narrowed in `af337af` to storage facts and valid
+actions. Detailed retention/configuration diagnostics remain available in status.
+That payload follow-up passed all **62 media/context tests**; it does not change
+the capacity or recovery enforcement.
+
+Both packages were then refreshed to `af337af`, again matching all 82 source
+files, and two fresh capacity conversations (four turns) completed keep-both on
+the same ID with zero extra files or replay errors. Each follow-up used one tool
+call. Codex offered the two valid actions concisely. Claude listed those actions
+but still appended advice about recovering/clearing old items or raising the cap.
+The clearing advice is unsupported for the protected copies in this fixture;
+restoration is not a way to prune them. No such cleanup was attempted. The code
+fixes the operation path, but free-form model explanations remain a limitation
+and are not a verified alternative to the returned actions. Final evidence index:
+`/var/tmp/agw-worker-20261015-sksj7w0_/flow-payload-index.json`.
+
+Both installed CLIs also exercised a sparse 20 GiB original: replacement was
+refused, keep-both completed on the same ID, no archive or extra media copy was
+created, and the original still allocated zero data blocks. Each scenario took
+under one second; this is not a render-size limit or a 20 GiB physical-copy test.
+
+Evidence: `/var/tmp/agw-worker-20261015-sksj7w0_/flow-fix-index.json` and
+`/var/tmp/agw-flow-oversized-4t6s3kr_/results.json`. Worker raw logs are in
+`~/.local/share/agw-pilot/flow-fix-tests` and the indexed natural-test directories.
+Older findings below describe the revisions tested then; the duplicate-copy and
+capacity-ID issues are superseded by these fixes. Model wording remains variable.
+
 ## Extended workflow and interruption testing 2026-10-15
 
 Ten additional uncoached conversations on installed runtime `6fa9590` exercised
