@@ -29,6 +29,7 @@ scripts/claude/pretooluse.py
 scripts/claude/sessionstart.py
 scripts/codex/__init__.py
 scripts/codex/_dispatch.py
+scripts/codex/_dispatch.cmd
 scripts/codex/adapter_common.py
 scripts/codex/applypatch.py
 scripts/codex/posttooluse.py

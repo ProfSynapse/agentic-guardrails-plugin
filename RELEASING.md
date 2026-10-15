@@ -77,13 +77,18 @@ release must bump the version.
    the documented literal `tool_input.command` normalization contract; do not
    describe it as a live-host probe.
 
-   **Hook definitions in this release.** `plugin/hooks/hooks-codex.json` is
-   unchanged from 0.5.0, so Codex installs that already trusted the 0.5.0 hooks
-   do not need to re-trust them. Codex pins the exact hook definition hash, so
-   any future matcher or command change there forces every install to re-trust
-   (`/hooks` in Codex CLI, or the desktop trust dialog) or Codex silently skips
-   the hooks and the session runs unguarded; say so at the top of the release
-   notes when that happens. The Claude `plugin/hooks/hooks.json` PreToolUse
+   **Hook definitions in this candidate have changed.** The Codex Windows
+   commands now enter `scripts/codex/_dispatch.cmd` through `cmd.exe /d /c call`.
+   Native Codex 0.162.1 runs hooks through PowerShell 5.1 on the tested machine;
+   the former inline `||` fallback fails before Python starts. The packaged
+   bootstrap probes Python 3 first and never retries a failed adapter. Execute
+   the actual manifest commands in cmd and PowerShell with a spaced Unicode
+   install path, Python-only PATH, Python Launcher, and missing Python.
+   Codex pins the exact hook definition hash, so existing installs must review
+   the changed hooks (`/hooks` in Codex CLI, or the desktop trust dialog) before
+   protection resumes. State this at the top of the next release notes.
+   Never manufacture trust hashes to make a release test pass.
+   The Claude `plugin/hooks/hooks.json` PreToolUse
    timeout rose from 15 to 120 seconds to cover the opt-in Linux owner-review
    window. Enterprise fleets shipping managed hooks must roll the updated
    definition out at the same time.

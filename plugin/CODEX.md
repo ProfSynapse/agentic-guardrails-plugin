@@ -97,6 +97,15 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    run. Approve `agentic-guardrails` in the host's hook-trust UI. Codex CLI uses
    `/hooks`; desktop builds may show a trust dialog instead. (Enterprise: ship
    managed hooks via `requirements.toml` to skip the prompt.)
+   **Upgrading to this candidate requires a new hook review.** Its Windows
+   commands now enter a packaged `cmd.exe` bootstrap, because native Codex
+   0.162.1 can run hooks through Windows PowerShell 5.1, where `||` is invalid.
+   The bootstrap probes Python 3 before dispatching and preserves hook stdin;
+   no PATH or execution-policy change is needed. Review the changed definitions
+   in `/hooks`, then start a fresh task. Installation alone does not enable them.
+   If the skill is still absent, check `/skills` for an older disabled
+   `agentic-guardrails:agentic-guardrails` setting; plugin enablement and skill
+   enablement are separate.
 3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
    Operational syntax is not duplicated into user-level prompts.
 4. **Short launcher** - invoke `agw` on every platform. The

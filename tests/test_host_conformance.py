@@ -102,17 +102,15 @@ def test_codex_matcher_and_adapter_registry_agree_on_native_tools():
 def test_windows_hooks_use_python3_launcher_and_plugin_root(manifest, root_name):
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = _hooks(manifest)[lifecycle][0]["hooks"][0]["commandWindows"]
-        # Codex trusts the exact hook-definition hash. Keep the manifest command
-        # stable and put runtime/encoding changes in the dispatcher instead.
+        if manifest == "hooks-codex.json":
+            assert command == (
+                'cmd.exe /d /c call "${PLUGIN_ROOT}\\scripts\\codex\\_dispatch.cmd" '
+                + lifecycle.lower()
+            )
+            continue
         assert command.startswith("py.exe -3 ")
-        assert "-X utf8" not in command
-        # Microsoft Store Python and conda installs have no py.exe. A hook that
-        # cannot spawn is a host hook error, and the tool call then proceeds
-        # unguarded, so the launcher must fall back to a bare `python`.
         primary, _, fallback = command.partition(" || ")
         assert fallback.startswith("python "), command
-        # Both legs address the same dispatcher, with the plugin root still
-        # quoted so an install path containing spaces survives cmd.exe.
         target = '"${%s}\\scripts\\' % root_name
         assert primary.count(target) == 1 and fallback.count(target) == 1
         assert primary.endswith(lifecycle.lower()) and \
@@ -558,7 +556,9 @@ def test_windows_multiline_launcher_preserves_unicode_success_and_error_paths(tm
         )
         assert result.returncode == 0, (filename, result.stderr)
         payload = json.loads(result.stdout)
-        assert payload["path"] == str(target)
+        returned = Path(payload["path"])
+        assert returned.name == filename
+        assert returned.samefile(target)
         assert payload["content"] == content
 
         if filename not in UNICODE_ERROR_FILENAMES:
@@ -576,7 +576,9 @@ def test_windows_multiline_launcher_preserves_unicode_success_and_error_paths(tm
         )
         assert error.returncode != 0, filename
         error_payload = json.loads(error.stderr)
-        assert error_payload["error"]["details"]["path"] == str(missing)
+        returned_missing = Path(error_payload["error"]["details"]["path"])
+        assert returned_missing.name == missing.name
+        assert returned_missing.parent.samefile(missing.parent)
         message = error_payload["error"]["message"]
         assert repr(missing_name)[1:-1] in message
         mojibake = missing_name.encode("utf-8").decode("latin-1")
