@@ -66,6 +66,7 @@ REASON_DECLINED = "approval-declined"
 REASON_PROVIDER = "approval-provider-unavailable"
 REASON_BOUNDED_DISCOVERY = "bounded-guardrails-discovery"
 REASON_CAPACITY = "reclaim-recovery-cache"
+REASON_MEDIA = "clarify-media-operation"
 _REASON_CODES = frozenset({
     REASON_ARCHIVE, REASON_WORKFLOW, REASON_DIRECT, REASON_INSPECT,
     REASON_SECRET, REASON_READ_ONLY, REASON_FILTERED_DELETE,
@@ -73,7 +74,7 @@ _REASON_CODES = frozenset({
     REASON_AUTHORIZED_COPY, REASON_CLOUD_DOCUMENT, REASON_OFFLINE,
     REASON_LAUNCHER, REASON_AGW_HELP, REASON_POLICY_HEALTH,
     REASON_REMOVE_SECRET, REASON_NARROW, REASON_DECLINED, REASON_PROVIDER,
-    REASON_BOUNDED_DISCOVERY, REASON_CAPACITY,
+    REASON_BOUNDED_DISCOVERY, REASON_CAPACITY, REASON_MEDIA,
 })
 
 # The recovery store refuses to grow. The store raises this code; the
@@ -523,6 +524,8 @@ def for_event(decision, event) -> Optional[SafeNext]:
 
 def for_events(decision, evlist) -> Optional[SafeNext]:
     """Public adapter seam; multiple events never have their argv combined."""
+    if getattr(decision, "presentation_details", {}).get("schema") == "agw.media-operation/v1":
+        return SafeNext(REASON_MEDIA, requires_user_choice=True)
     events_list = list(evlist or ())
     if len(events_list) != 1:
         if getattr(decision, "action", "") != events.DENY:

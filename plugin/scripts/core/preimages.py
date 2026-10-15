@@ -134,7 +134,8 @@ def _busy_failure(path: str) -> PreimageResult:
 def prepare(targets, label: str, max_file_bytes: int,
             max_archive_bytes: int | None = None,
             policy_revision: str = "",
-            retention_config: retention_policy.RetentionPolicy | None = None
+            retention_config: retention_policy.RetentionPolicy | None = None,
+            require_media_review: bool = False,
             ) -> PreimageResult:
     """Capture and immediately verify PRESENT artifacts and ABSENT tombstones."""
     if not policy_revision:
@@ -154,6 +155,15 @@ def prepare(targets, label: str, max_file_bytes: int,
                     f"policy is invalid ({exc})."),
         )
     max_archive_bytes = retention_config.max_bytes
+    if require_media_review:
+        from . import media_review
+        try:
+            media_review.require_review(targets, policy_revision)
+        except (media_review.MediaReviewError, OSError, ValueError, TimeoutError) as exc:
+            return PreimageResult(
+                False, reason=str(exc), error_code=getattr(exc, "error_code", "media_operation_blocked"),
+                details=getattr(exc, "details", {}),
+            )
     receipts = []
     capture_group_id = uuid.uuid4().hex
     protected_until_ns = (

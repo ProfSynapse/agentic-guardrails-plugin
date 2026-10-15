@@ -456,6 +456,16 @@ per-class usage, limits, protected bytes and potential reclaim.
 See [recovery storage classes](docs/plans/media-recovery.md) for configuration,
 legacy handling, and the future media object-storage design.
 
+Existing video, audio and raster-image writes now stop for conversational
+clarification before automatic capture. The agent receives an expiring `agw
+media` operation and asks whether to replace with recovery, save separately, or
+cancel. Removal offers reversible archive or cancellation. The CLI checks the
+original state again, enforces recovery budgets and refuses permanent fallback.
+An owned staging file can become a timestamped output without duplicating its
+bytes; existing destination names are never overwritten. Cancellation changes
+no files. An operation ID is not proof of approval. This flow adds neither a
+render-size quota nor automatic expiration of sole recovery copies.
+
 ### Activity history and recovery metadata
 
 Claude or Codex task history is the human activity log. Guardrails does not

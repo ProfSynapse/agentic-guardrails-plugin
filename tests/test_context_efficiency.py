@@ -44,7 +44,7 @@ def test_one_discoverable_skill_with_progressive_references():
     assert "office <operation> --help" in root_text
     references = sorted((skill_files[0].parent / "references").glob("*.md"))
     assert {path.name for path in references} == {
-        "diagnostics.md", "google-stubs.md", "office.md", "recovery.md",
+        "diagnostics.md", "google-stubs.md", "office.md", "recovery.md", "media.md",
         "synced-folders.md", "text-files.md", "trusted-workflows.md",
     }
     assert all(path.stat().st_size < 1_800 for path in references)

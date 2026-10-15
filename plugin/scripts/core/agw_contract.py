@@ -47,7 +47,7 @@ _OPERATIONS.update({
     for name in {
         "init", "checkout", "convert", "archive", "move", "snapshot",
         "restore", "undo", "publish", "publish-file", "unlink-link",
-        "file", "run", "run-plan", "publish-plan", "office", "workflow",
+        "file", "run", "run-plan", "publish-plan", "office", "workflow", "media",
     }
 })
 _OPERATIONS["rename"] = _spec(

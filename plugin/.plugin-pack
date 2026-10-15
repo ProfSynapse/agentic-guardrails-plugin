@@ -6,6 +6,7 @@ scripts/agw/agw.py
 scripts/agw/cli_schema.py
 scripts/agw/execution.py
 scripts/agw/file_ops.py
+scripts/agw/media_ops.py
 scripts/agw/office.py
 scripts/agw/office_opc.py
 scripts/agw/office_ooxml.py
@@ -51,6 +52,7 @@ scripts/core/linux_review.py
 scripts/core/mcpshell.py
 scripts/core/miniyaml.py
 scripts/core/mutations.py
+scripts/core/media_review.py
 scripts/core/outcomes.py
 scripts/core/pending_approvals.py
 scripts/core/policy_health.py

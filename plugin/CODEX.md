@@ -17,6 +17,14 @@ see [`../docs/HOST_PARITY.md`](../docs/HOST_PARITY.md).
 | Command discovery | CLI `--help` hierarchy | progressively scoped; no duplicated prompt catalog |
 | `agw` CLI | platform-neutral `agw` short form | same |
 
+Existing media writes now return a conversational refusal with an expiring
+`agw media` operation. The agent clarifies replace-with-recovery, save-separately,
+or cancel, then submits the corresponding continuation. This uses supported
+deny feedback; it does not send unsupported Codex `ask` output or require MCP
+forms. IDs bind file state, not human consent. The CLI independently enforces
+recoverability or a non-clobbering new output. See the packaged
+[media workflow](skills/agentic-guardrails/references/media.md).
+
 ### Strict response wire schema
 
 Codex 0.160.0 rejects unknown response fields, including fields nested inside

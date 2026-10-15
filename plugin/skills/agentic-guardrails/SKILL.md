@@ -33,6 +33,7 @@ Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 | Office work | Exact `office <operation> --help` | [Office](references/office.md) |
 | Large Office rewrite | Checkout/publish help | [Office](references/office.md) |
 | Staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
+| Existing video, audio, raster image | `media prepare`, then clarify before `media continue` | [media](references/media.md) |
 | Folder discovery | Scan/list/search help | [synced](references/synced-folders.md) |
 | Google stub | Connector/export | [Google stubs](references/google-stubs.md) |
 | Health/report | `doctor` and `status` help | [diagnostics](references/diagnostics.md) |

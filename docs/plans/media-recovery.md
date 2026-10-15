@@ -1,6 +1,7 @@
 # Recovery storage and media
 
-Status: automatic capacity fixes and storage-budget separation implemented on
+Status: automatic capacity fixes, storage-budget separation and conversational
+media continuations implemented on
 `fix/automatic-backup-capacity` (PR #62). Not yet released or installed.
 Content-addressed objects and resumable large-file capture remain future work.
 
@@ -111,6 +112,74 @@ Routine captures use advisory class counters rather than rescanning every
 artifact; invalid counters are rebuilt from authoritative records.
 
 ## Next implementation stage
+
+### Implemented conversational media continuation
+
+Existing video, audio and raster-image changes through native pre-write hooks,
+AGW file/run capture, and staged publication now stop before automatic capture.
+`agw archive` similarly stops for an exact media removal. The refusal creates a
+small pending operation, asks the agent to clarify with the user, and supplies
+exact continuation arguments. Raw removal remains blocked by the existing
+delete rules; its archive continuation reaches the same media review gate.
+Explicit snapshots and restoration retain their existing recovery semantics.
+
+`agw media prepare PATH [--staged FINISHED_FILE] [--operation replace|archive]`
+can also prepare explicitly. `agw media continue ID --action ACTION` supports
+replace/save-separately/cancel for replacement and archive/cancel for removal.
+`agw media status ID` inspects current state and recovery details. All accept
+`--json`; the agent, not the user, runs the CLI after clarification.
+
+Preparation binds original stat identity, parent-directory identities, policy
+revision and exact output paths without reading/copying original media bytes.
+An optional supplied stage is additionally hash/identity bound. Otherwise an
+absent same-directory stage path is assigned, and continuation verifies the
+completed output there. Plans expire after 24 hours; at most 256 bounded metadata
+records are retained. Preparation expires only old metadata, never media files.
+Claimed records are retained for inspection even after their deadline.
+Completed/cancelled metadata can retire earlier to admit a new operation at
+the metadata cap; associated recovery artifacts and user files are unaffected.
+Repeated preparation of the same pending state reuses its operation.
+
+Continuations are durably claimed before side effects and cannot replay after
+success, cancellation or an ambiguous execution failure. Changed originals,
+parents, policies or supplied stages fail closed. IDs do not authenticate human
+approval; agent-supplied consent flags are deliberately absent. The safety
+guarantee is recoverability/preservation, not independent proof of consent.
+
+Replacement reuses verified publication snapshots and transaction recovery.
+Explicit CLI capture can exceed the short native-hook 100 MiB ceiling, but
+never bypasses total or class budgets. A file individually too large for its
+recovery allowance is refused before reading its original bytes. There is no
+permanent-delete fallback. Separate output uses atomic no-clobber creation:
+an owned same-directory stage is promoted with link/unlink without duplicating
+its bytes; a supplied stage is copied independently and retained. Filesystems
+without the required link operation refuse owned-stage promotion. Cancellation
+does not create output or discard an already-created stage.
+
+Successful replacement retires only a verified owned stage. Supplied stages,
+cancelled stages and uncertain partial outputs remain available for inspection.
+These names are not automatically disposable. Publication can need transient
+candidate space in addition to original/stage/recovery bytes. This is not a
+render output-size limit or physical-disk reservation.
+
+The proposed seven-day media bin is **not** implemented: sole usable recovery
+copies and removal archives remain protected. Eligible redundant history is
+pruned automatically; a full store of protected originals still refuses growth.
+Adding sole-copy expiration requires a separate explicitly accepted retention
+policy and trustworthy approval path. No hidden expiration is introduced here.
+
+As with the existing publication engine, claims cover cooperating Guardrails
+operations on a functioning local filesystem. They are not a sandbox against
+malicious same-user code, non-cooperating filesystem substitution, arbitrary
+commands that evade target analysis, or power-loss durability across platforms.
+
+Official host references checked 2026-10-15:
+- [Codex hooks](https://learn.chatgpt.com/docs/hooks#pretooluse): deny and supported
+  input rewriting; hook `ask` remains unsupported and does not block a call.
+- [Claude Code hooks](https://code.claude.com/docs/en/hooks#pretooluse-decision-control):
+  deny, ask and input rewriting. This workflow uses deny feedback on both hosts.
+
+### Future object storage
 
 1. Store immutable binary objects by verified content hash with per-operation
    manifests. Reuse bytes across paths and policy revisions while keeping each

@@ -716,6 +716,8 @@ def publish_staged_batch(
         for item in operations:
             _check_operation_preconditions(item)
             item["changed"] = item["target_before"] != item["stage_hash"]
+            if item["changed"] and not dry_run:
+                file_ops.require_media_review([item["target"]], staged=item["stage"])
         candidates = _make_candidates(operations, candidate_validator)
         if dry_run:
             _cleanup_candidates(candidates.values())

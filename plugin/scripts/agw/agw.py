@@ -44,6 +44,9 @@ import converters                           # noqa: E402
 import cli_schema                           # noqa: E402
 import execution                            # noqa: E402
 import file_ops                             # noqa: E402
+import media_ops                            # noqa: E402
+from core import media_review               # noqa: E402
+from core import engine                     # noqa: E402
 import office                               # noqa: E402
 import office_tx                            # noqa: E402
 import publication                          # noqa: E402
@@ -774,6 +777,8 @@ def cmd_archive(args):
     _require_archive_store()
     results = []
     try:
+        media_review.require_review(paths, engine.load_policy(PLUGIN_ROOT).revision,
+                                    operation="archive")
         resolved_retention = retention_config.load(PLUGIN_ROOT)
         for p in paths:
             entry = store.archive_file(
@@ -789,6 +794,23 @@ def cmd_archive(args):
     if getattr(args, "json", False):
         print(json.dumps(results, ensure_ascii=False, default=str,
                          separators=(",", ":")))
+
+
+def cmd_media(args):
+    try:
+        if args.media_op == "prepare":
+            data = media_ops.prepare(args.path, operation=args.operation, staged=args.staged)
+        elif args.media_op == "continue":
+            data = media_ops.continue_operation(args.id, args.action)
+        else:
+            record = media_review.read(args.id)
+            data = {**media_review.describe(record),
+                    "result": record.get("result"), "error": record.get("error"),
+                    "failure_details": record.get("failure_details")}
+    except (media_review.MediaReviewError, file_ops.FileOperationError,
+            OSError, ValueError, KeyError, TypeError) as exc:
+        _file_err(args, exc)
+    _out(args, json.dumps(data, ensure_ascii=False, indent=2), data)
 
 
 def cmd_unlink_link(args):
@@ -2245,6 +2267,24 @@ def main(argv=None):
     add("archive", cmd_archive, (["paths"], {"nargs": "+"}),
         (["--reason"], {"default": ""}),
         help="reversible delete: move into the archive store")
+    media_parser = sub.add_parser("media", parents=[common],
+                                  help="prepare and continue protected media choices")
+    media_sub = media_parser.add_subparsers(dest="media_op", required=True)
+    media_prepare = media_sub.add_parser("prepare", parents=[common],
+                                        help="record an existing media file without copying it")
+    media_prepare.add_argument("path")
+    media_prepare.add_argument("--operation", choices=["replace", "archive"], default="replace")
+    media_prepare.add_argument("--staged", default="", help="optional existing finished replacement")
+    media_prepare.set_defaults(fn=cmd_media)
+    media_continue = media_sub.add_parser("continue", parents=[common],
+                                         help="resume after conversational clarification")
+    media_continue.add_argument("id")
+    media_continue.add_argument("--action", required=True,
+                                choices=["replace", "save-separately", "archive", "cancel"])
+    media_continue.set_defaults(fn=cmd_media)
+    media_status = media_sub.add_parser("status", parents=[common], help="inspect a pending or consumed operation")
+    media_status.add_argument("id")
+    media_status.set_defaults(fn=cmd_media)
     add(
         "unlink-link", cmd_unlink_link,
         (["path"], {"help": "literal symbolic-link or Windows junction path"}),

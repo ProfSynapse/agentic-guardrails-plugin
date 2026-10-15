@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Callable, Optional
 
-from core import engine, preimages, profiles, store
+from core import engine, media_review, preimages, profiles, store
 import execution
 import path_safety
 import retention_config
@@ -433,19 +433,36 @@ def read_text_page(
     }
 
 
+def require_media_review(targets, *, staged=""):
+    if not any(media_review.is_media(path) and os.path.lexists(path) for path in targets):
+        return
+    try:
+        media_review.require_review(
+            targets, engine.load_policy(PLUGIN_ROOT).revision, staged=staged,
+        )
+    except media_review.MediaReviewError as exc:
+        error = FileOperationError(str(exc), exc.details)
+        error.error_code = exc.error_code
+        raise error from exc
+
+
 def _snapshots(targets: list[str], operation: str, max_file_bytes: int = 0):
     policy = engine.load_policy(PLUGIN_ROOT)
     resolved_retention = retention_config.load(PLUGIN_ROOT)
-    limit = max_file_bytes or int(os.environ.get(
+    limit = max_file_bytes or media_review.capture_limit(targets) or int(os.environ.get(
         "AGW_PRESNAP_MAX_BYTES", 100 * 1024 * 1024
     ))
     result = preimages.prepare(
         targets, f"agw file {operation}", limit,
         policy_revision=policy.revision,
         retention_config=resolved_retention,
+        require_media_review=True,
     )
     if not result.ok:
-        raise FileOperationError(result.reason, {"path": result.failed_target})
+        error = FileOperationError(result.reason, {"path": result.failed_target, **result.details})
+        if result.error_code:
+            error.error_code = result.error_code
+        raise error
     return result.receipts
 
 

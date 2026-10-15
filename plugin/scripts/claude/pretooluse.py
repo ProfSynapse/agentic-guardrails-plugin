@@ -282,6 +282,7 @@ def main():
                     mutation_plan.targets, event.tool or "modification",
                     PRESNAP_MAX_BYTES, policy_revision=policy.revision,
                     retention_config=retention_config,
+                    require_media_review=True,
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason

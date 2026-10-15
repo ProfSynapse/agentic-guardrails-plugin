@@ -14,6 +14,7 @@ import sys
 import pytest
 
 import file_ops
+import media_ops
 from core import store, workflows
 
 
@@ -81,7 +82,7 @@ def _project(tmp_path, slug="alpha"):
 
 def test_parameter_root_inventories_sidecars_and_preimages_the_exact_output(tmp_path):
     renders = _project(tmp_path)
-    output = renders / "short.mp4"
+    output = renders / "bundle.txt"
     output.write_text("previous render", encoding="utf-8")
     other = _project(tmp_path, "beta")
     (other / "untouched.mp4").write_text("other project", encoding="utf-8")
@@ -108,6 +109,26 @@ def test_unmatched_change_under_the_parameter_root_fails_the_run(tmp_path):
     assert result["ok"] is False
     assert [item["path"] for item in result["unclaimed_observed_changes"]] == \
         [str(renders / "stray.txt")]
+
+
+def test_trusted_renderer_stages_before_media_replacement(tmp_path):
+    renders = _project(tmp_path)
+    output = renders / "short.mp4"
+    output.write_text("previous render", encoding="utf-8")
+    path, digest = _manifest(tmp_path)
+    workflows.trust_manifest(str(path), digest)
+    with pytest.raises(file_ops.FileOperationError) as refusal:
+        _run(tmp_path, renders, output)
+    assert refusal.value.error_code == "media_review_required"
+    assert not (renders / "frames").exists()  # Renderer did not execute.
+    plan = refusal.value.details
+    _, result = _run(tmp_path, renders, plan["staged_path"])
+    assert result["ok"] is True
+    assert output.read_text() == "previous render"
+    assert media_ops.continue_operation(plan["id"], "replace")["state"] == "completed"
+    assert output.read_text() == "video"
+    store.restore(str(output))
+    assert output.read_text() == "previous render"
 
 
 def test_parameter_root_must_stay_inside_allowed_roots(tmp_path):
