@@ -363,6 +363,7 @@ def main(approval_provider=None):
                     mutation_plan.targets, label, PRESNAP_MAX_BYTES,
                     policy_revision=policy.revision,
                     retention_config=retention_config,
+                    require_media_review=True,
                 )
                 if not receipt.ok:
                     invariant_failure = receipt.reason

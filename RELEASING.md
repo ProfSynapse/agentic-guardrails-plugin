@@ -25,12 +25,12 @@ Because (1) is set, **pushing commits without bumping `version` does nothing for
 installed users** — Claude sees the same version and keeps the cached copy. Every
 release must bump the version.
 
-## Release gate for `0.6.0`
+## Release gate for `0.7.0`
 
 1. Keep `source.ref` on `main` while validating. Never point it at
-   `v0.6.0` before that tag exists.
+   `v0.7.0` before that tag exists.
 
-2. Confirm all three version fields and the README banner read `0.6.0` and both
+2. Confirm all three version fields and the README banner read `0.7.0` and both
    refs are `main`, then run:
 
    ```bash
@@ -77,13 +77,18 @@ release must bump the version.
    the documented literal `tool_input.command` normalization contract; do not
    describe it as a live-host probe.
 
-   **Hook definitions in this release.** `plugin/hooks/hooks-codex.json` is
-   unchanged from 0.5.0, so Codex installs that already trusted the 0.5.0 hooks
-   do not need to re-trust them. Codex pins the exact hook definition hash, so
-   any future matcher or command change there forces every install to re-trust
-   (`/hooks` in Codex CLI, or the desktop trust dialog) or Codex silently skips
-   the hooks and the session runs unguarded; say so at the top of the release
-   notes when that happens. The Claude `plugin/hooks/hooks.json` PreToolUse
+   **Hook definitions in this candidate have changed.** The Codex Windows
+   commands now enter `scripts/codex/_dispatch.cmd` through `cmd.exe /d /c call`.
+   Native Codex 0.162.1 runs hooks through PowerShell 5.1 on the tested machine;
+   the former inline `||` fallback fails before Python starts. The packaged
+   bootstrap probes Python 3 first and never retries a failed adapter. Execute
+   the actual manifest commands in cmd and PowerShell with a spaced Unicode
+   install path, Python-only PATH, Python Launcher, and missing Python.
+   Codex pins the exact hook definition hash, so existing installs must review
+   the changed hooks (`/hooks` in Codex CLI, or the desktop trust dialog) before
+   protection resumes. State this at the top of the next release notes.
+   Never manufacture trust hashes to make a release test pass.
+   The Claude `plugin/hooks/hooks.json` PreToolUse
    timeout rose from 15 to 120 seconds to cover the opt-in Linux owner-review
    window. Enterprise fleets shipping managed hooks must roll the updated
    definition out at the same time.
@@ -107,8 +112,11 @@ release must bump the version.
 
    Automated tests verify the activation context, API signatures, packaged
    manifest, cleanup, button mapping, and sanitized errors. They cannot visually
-   certify an interactive Windows dialog. After code acceptance, QA must run
-   exactly one manual smoke (not during automated implementation):
+   certify an interactive Windows dialog. For releases that change the native approval dialog, after code acceptance
+   QA must run exactly one manual smoke (not during automated implementation).
+   Version 0.7.0 retains that dialog implementation; its changed conversational
+   media paths and Codex hook bootstrap have live Windows evidence in
+   `docs/WINDOWS_VALIDATION.md`. The dialog smoke command is:
 
    ```powershell
    python tests/manual_windows_approval_smoke.py --i-understand-this-opens-a-dialog
@@ -125,19 +133,21 @@ release must bump the version.
    git add plugin/.claude-plugin/plugin.json plugin/.codex-plugin/plugin.json \
      .claude-plugin/marketplace.json .agents/plugins/marketplace.json \
      tests/test_packaging.py RELEASING.md
-   git commit -m "Release Agentic Guardrails 0.6.0"
+   git commit -m "Release Agentic Guardrails 0.7.0"
    git push origin <release-branch>
    ```
 
 4. Create the immutable tag from that exact verified commit:
 
    ```bash
-   gh release create v0.6.0 --target <verified-main-commit-sha> \
-     --title "v0.6.0" --notes "..."
+   git tag -a v0.7.0 <verified-main-commit-sha> -F /path/to/release-notes.md
+   git push origin refs/tags/v0.7.0
+   gh release create v0.7.0 --verify-tag \
+     --title "v0.7.0" --notes-file /path/to/release-notes.md
    ```
 
 5. Verify the tag resolves to that commit. Only then change `source.ref` from
-   `main` to `v0.6.0` in both marketplace catalogs, rerun JSON and artifact
+   `main` to `v0.7.0` in both marketplace catalogs, rerun JSON and artifact
    conformance, and merge the catalog pointer update through a follow-up pull
    request. This tag-exists gate is mandatory.
 

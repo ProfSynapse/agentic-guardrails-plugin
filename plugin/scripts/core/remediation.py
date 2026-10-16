@@ -66,6 +66,7 @@ REASON_DECLINED = "approval-declined"
 REASON_PROVIDER = "approval-provider-unavailable"
 REASON_BOUNDED_DISCOVERY = "bounded-guardrails-discovery"
 REASON_CAPACITY = "reclaim-recovery-cache"
+REASON_MEDIA = "clarify-media-operation"
 _REASON_CODES = frozenset({
     REASON_ARCHIVE, REASON_WORKFLOW, REASON_DIRECT, REASON_INSPECT,
     REASON_SECRET, REASON_READ_ONLY, REASON_FILTERED_DELETE,
@@ -73,7 +74,7 @@ _REASON_CODES = frozenset({
     REASON_AUTHORIZED_COPY, REASON_CLOUD_DOCUMENT, REASON_OFFLINE,
     REASON_LAUNCHER, REASON_AGW_HELP, REASON_POLICY_HEALTH,
     REASON_REMOVE_SECRET, REASON_NARROW, REASON_DECLINED, REASON_PROVIDER,
-    REASON_BOUNDED_DISCOVERY, REASON_CAPACITY,
+    REASON_BOUNDED_DISCOVERY, REASON_CAPACITY, REASON_MEDIA,
 })
 
 # The recovery store refuses to grow. The store raises this code; the
@@ -85,12 +86,7 @@ CAPACITY_POLICY_SETTING = "archive_max_bytes"
 
 
 def capacity_instruction(details=None) -> str:
-    """Return the door out of a full recovery cache.
-
-    Retrying the same or a "more direct" operation can never succeed here:
-    every remaining rollback point is protected. The only moves are a
-    human-gated prune or a larger cap, so the instruction names both.
-    """
+    """Explain capacity remaining after automatic maintenance has run."""
     details = dict(details or {})
     try:
         maximum = int(details.get("maximum_bytes") or 0)
@@ -100,6 +96,21 @@ def capacity_instruction(details=None) -> str:
         required = int(details.get("required_free_bytes") or 0)
     except (TypeError, ValueError):
         required = 0
+    budget = details.get("storage_budget", "total")
+    if budget in {"media", "derived", "document_reserve"}:
+        label = {"media": "media recovery", "derived": "derived-output recovery",
+                 "document_reserve": "shared non-document recovery"}[budget]
+        setting = ("archive_" + budget + "_max_bytes" if budget != "document_reserve"
+                   else "archive_document_reserve_bytes")
+        guidance = (f"Adjust `{setting}` together with `archive_max_bytes` while preserving "
+                    "the configured document reserve." if budget != "document_reserve" else
+                    "Increase `archive_max_bytes` or explicitly reduce `archive_document_reserve_bytes`.")
+        return (f"The {label} budget cannot admit this capture. Its cap is {maximum:,} bytes "
+                f"and this change needs {required:,} more. Automatic cleanup has already run "
+                "within the affected storage class; document history and the newest usable "
+                "recovery copies remain protected. Inspect `agw status` for per-class usage. "
+                + guidance + " Manual pruning uses the same protections; it cannot remove "
+                "protected copies to make room. It is not required.")
     sizing = ""
     if maximum > 0:
         sizing = f" The cap is {maximum:,} bytes"
@@ -108,11 +119,11 @@ def capacity_instruction(details=None) -> str:
         sizing += "."
     return (
         "The recovery cache has reached its configured capacity and its "
-        "remaining rollback points are protected, so no new pre-image can be "
-        "stored." + sizing + " Do not "
-        "retry the same change yet. Ask the user to run `agw status` and then "
-        "`agw prune --yes-i-am-a-human` to reclaim expired pre-images, or to "
-        f"raise the cap with the {CAPACITY_ENV_OVERRIDE} environment variable "
+        "automatic cleanup could not make enough safe space for this change."
+        + sizing + " Cleanup has already run; manual pruning uses the same "
+        "protections and is not required. Inspect `agw status` for storage "
+        "usage. Increase the recovery budget with the "
+        f"{CAPACITY_ENV_OVERRIDE} environment variable "
         f"(or `{CAPACITY_POLICY_SETTING}` in the policy settings). Then retry "
         "the same change."
     )
@@ -514,6 +525,8 @@ def for_event(decision, event) -> Optional[SafeNext]:
 
 def for_events(decision, evlist) -> Optional[SafeNext]:
     """Public adapter seam; multiple events never have their argv combined."""
+    if getattr(decision, "presentation_details", {}).get("schema") == "agw.media-operation/v1":
+        return SafeNext(REASON_MEDIA, requires_user_choice=True)
     events_list = list(evlist or ())
     if len(events_list) != 1:
         if getattr(decision, "action", "") != events.DENY:

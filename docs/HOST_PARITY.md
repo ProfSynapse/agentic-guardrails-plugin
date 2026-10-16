@@ -32,8 +32,9 @@ Claude Code and Codex releases must both pass:
    `PYTHONPATH` fallback.
 7. SessionStart and launchers never persistently modify process, user, or
    machine PATH; Windows launcher tests use only Python and System32 on PATH.
-8. Windows hook manifests invoke `py.exe -3` with a plugin-root-qualified
-   dispatcher path. Missing Python Launcher guidance is written for people and
+8. Windows hooks probe `py.exe -3`, then `python`, with a plugin-root-qualified
+   dispatcher path. Codex enters a packaged cmd bootstrap so this also works
+   when the host launches hooks through PowerShell 5.1. Missing-Python guidance
    never proposes PATH edits or file-association execution.
 9. Final deny decisions derive structured `safe_next` only after rewrite and
    approval resolution. Claude and Codex use the same remediation seam and the

@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PLUGIN = ROOT / "plugin"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 EXPERIMENTAL_AUDIT_V2 = pytest.mark.skipif(
     os.environ.get("AGW_EXPERIMENTAL_AUDIT_V2") != "1",
     reason="experimental audit-v2 migration coverage",
@@ -348,7 +348,7 @@ def test_packed_manifest_hook_dispatches_to_packed_core_only(packed_plugin, tmp_
     hooks_name = "hooks-codex.json" if host == "codex" else "hooks.json"
     hooks = _manifest(packed_plugin / "hooks" / hooks_name)["hooks"]
     command = hooks["PreToolUse"][0]["hooks"][0]
-    expected = "scripts\\codex\\_dispatch.py" if host == "codex" else "scripts"
+    expected = "scripts\\codex\\_dispatch.cmd" if host == "codex" else "scripts"
     assert expected in command.get("commandWindows", command["command"])
     payload = {"tool_name": "PowerShell",
                "tool_input": {"command": "Remove-Item important.txt"},
@@ -363,8 +363,80 @@ def test_packed_windows_hook_uses_python3_launcher(packed_plugin, host):
     hooks = _manifest(packed_plugin / "hooks" / hooks_name)["hooks"]
     for lifecycle in ("PreToolUse", "PostToolUse", "SessionStart"):
         command = hooks[lifecycle][0]["hooks"][0]["commandWindows"]
-        assert command.startswith("py.exe -3 ")
+        assert command.startswith("cmd.exe /d /c call " if host == "codex" else "py.exe -3 ")
         assert "-X utf8" not in command
+
+
+def _windows_manifest_hook(artifact, event, shell, env, payload, cwd):
+    hooks = _manifest(artifact / "hooks/hooks-codex.json")["hooks"]
+    command = hooks[event][0]["hooks"][0]["commandWindows"].replace(
+        "${PLUGIN_ROOT}", str(artifact))
+    system32 = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32"
+    # cmd.exe needs a raw command line; list2cmdline escapes quotes for the C
+    # argv parser, not cmd's parser. PowerShell receives its command as one arg.
+    argv = (f'"{system32 / "cmd.exe"}" /d /s /c {command}' if shell == "cmd"
+            else [str(system32 / "WindowsPowerShell/v1.0/powershell.exe"),
+                  "-NoProfile", "-NonInteractive", "-Command", command])
+    return subprocess.run(argv, input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                          capture_output=True, cwd=cwd, env=env, timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Windows hook shells")
+@pytest.mark.parametrize("shell", ["cmd", "powershell"])
+@pytest.mark.parametrize("interpreter", ["python", "py", "missing"])
+@pytest.mark.parametrize("event", ["PreToolUse", "SessionStart", "PostToolUse"])
+def test_packed_codex_manifest_runs_in_windows_shells(
+        packed_plugin, tmp_path, shell, interpreter, event):
+    artifact = tmp_path / "plugin space 日本語 & test"
+    shutil.move(str(packed_plugin), artifact)
+    system32 = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32"
+    dirs = [str(system32)]
+    if interpreter == "python":
+        dirs.insert(0, str(Path(sys.executable).parent))
+    elif interpreter == "py":
+        py = shutil.which("py.exe")
+        if not py:
+            pytest.skip("Python launcher not installed")
+        dirs.insert(0, str(Path(py).parent))
+    env = dict(os.environ, PATH=os.pathsep.join(dirs),
+               AGW_HOME=str(tmp_path / "recovery"), PLUGIN_ROOT=str(artifact),
+               CODEX_HOME=str(tmp_path / "codex"), AGW_APPROVAL_PROVIDER="headless")
+    if interpreter in ("python", "missing"):
+        assert shutil.which("py.exe", path=env["PATH"]) is None
+    if interpreter == "missing":
+        assert shutil.which("python", path=env["PATH"]) is None
+    target = tmp_path / "日本語.txt"
+    target.write_text("original", encoding="utf-8")
+    payload = {"hook_event_name": event, "source": "startup", "cwd": str(tmp_path),
+               "session_id": "windows-shell-bootstrap", "tool_name": "PowerShell",
+               "tool_input": {"command": f'Remove-Item "{target}"'}, "tool_response": {}}
+    result = _windows_manifest_hook(artifact, event, shell, env, payload, tmp_path)
+    if interpreter == "missing" and event != "PreToolUse":
+        assert result.returncode != 0
+        assert b"requires Python 3" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+        output = json.loads(result.stdout.decode("utf-8")) if result.stdout.strip() else {}
+        if event == "PreToolUse":
+            assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        elif event == "SessionStart":
+            assert "agentic-guardrails is active" in output["hookSpecificOutput"]["additionalContext"]
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Windows hook shells")
+@pytest.mark.parametrize("shell", ["cmd", "powershell"])
+def test_packed_codex_bootstrap_preserves_adapter_failure_without_retry(
+        packed_plugin, tmp_path, shell):
+    dispatch = packed_plugin / "scripts/codex/_dispatch.py"
+    dispatch.write_text("import pathlib, sys\np = pathlib.Path('invocations.txt')\n"
+                        "p.open('a').write('called\\n')\nsys.exit(37)\n", encoding="utf-8")
+    system32 = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32"
+    env = dict(os.environ, PATH=os.pathsep.join((str(Path(sys.executable).parent), str(system32))))
+    result = _windows_manifest_hook(packed_plugin, "PreToolUse", shell, env, {}, tmp_path)
+    # PowerShell -Command maps a failed final native command to process exit 1.
+    assert result.returncode == (37 if shell == "cmd" else 1)
+    assert (tmp_path / "invocations.txt").read_text() == "called\n"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows hook encoding regression")
@@ -447,6 +519,8 @@ def test_packed_short_agw_rewrites_to_its_own_launcher(
 @pytest.mark.parametrize("host", ["claude", "codex"])
 def test_packed_project_keyword_search_is_ordinary_diagnostic(
         packed_plugin, tmp_path, host):
+    # Do not inherit a developer's ancestor .git/.agw marker as this project.
+    (packed_plugin.parent / ".git").mkdir()
     out = _run_dispatch(
         packed_plugin, host,
         {"tool_name": "Bash",

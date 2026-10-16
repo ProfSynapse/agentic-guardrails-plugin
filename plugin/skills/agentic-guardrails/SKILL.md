@@ -1,7 +1,7 @@
 ---
 name: agentic-guardrails
 description: >
-  Route file and Office work through Agentic Guardrails for reversible changes,
+  Use Agentic Guardrails for reversible file/Office changes,
   bounded reads/scans, synced folders, recovery, and diagnostics. Use for delete,
   overwrite, move, restore, broad scan, or Office mutation work.
 ---
@@ -14,10 +14,20 @@ to approve Guardrails hooks in the host UI and start a new task. Report the
 stable reason code `launcher_unavailable`; never scan for a launcher.
 Never use a cache path or change PATH.
 
-## Progressive discovery
+## Workflow
 
-CLI help is authoritative. Request only the narrowest unknown scope: `agw
---help`, `<verb> --help`, or `office <operation> --help`.
+1. Match the intent below and read its reference before operating. Existing
+   video, audio and raster images always use the media route, including staged
+   replacements.
+2. Reuse an explicit user choice for this target, action and recovery behavior;
+   ask only when that choice is missing or ambiguous.
+3. Run commands for the user; retain exact plan hashes.
+4. On refusal, offer only alternatives returned by the tool; do not invent
+   cleanup or configuration workarounds. Report the actual result and path.
+
+Use the selected reference's command shapes directly. Ask help only for unknown
+syntax at the exact operation (e.g. `agw file patch --help`); skip parent help.
+Reuse syntax and receipts from this conversation.
 
 Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
@@ -25,26 +35,18 @@ Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
 | Intent | Route | Reference |
 |---|---|---|
-| Remove, recover, undo, history | Relevant verb help | [recovery](references/recovery.md) |
-| Read or change text | `file <operation> --help` | [text](references/text-files.md) |
-| Dependent text changes | `file plan`, then `file apply-plan` | — |
-| Local script | `workflow match -- <command>`; else `run --help` | [workflows](references/trusted-workflows.md) |
+| Remove, recover, undo, history | `archive`, `restore`, `undo`, `history` | [recovery](references/recovery.md) |
+| Read or change text | `file read`, `file replace`, `file write`, `file patch` | [text](references/text-files.md) |
+| Dependent text changes | `file plan`, then `file apply-plan` | [text](references/text-files.md) |
+| Local script | `workflow match -- <command>`; else `run --help` | [workflows](references/trusted-workflows.md); [recovery](references/recovery.md) for `run` |
 | Single-use script plan | `run-plan create`, then `apply` | [recovery](references/recovery.md) |
 | Office work | Exact `office <operation> --help` | [Office](references/office.md) |
 | Large Office rewrite | Checkout/publish help | [Office](references/office.md) |
-| Staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
+| Other staged file or set | `publish-file` or `publish-plan` help | [recovery](references/recovery.md) |
+| Existing video, audio, raster image | `media prepare`, then `media continue` | [media](references/media.md) |
 | Folder discovery | Scan/list/search help | [synced](references/synced-folders.md) |
 | Google stub | Connector/export | [Google stubs](references/google-stubs.md) |
 | Health/report | `doctor` and `status` help | [diagnostics](references/diagnostics.md) |
-
-Exact outputs do not enumerate siblings. Observed roots detect sidecars but are
-not pre-images. Trusted parameters belong only in reviewed typed slots.
-`run --dry-run` is contract-only. Retain and apply exact plan hashes.
-
-Run plans are single-use and consumed after claim. Read-only execution requires
-real provider enforcement. Publish batches are recoverable sets with per-file
-sequential visibility. PREPARED supports inspect or finalize-observed. Rollback
-awaits a crash-resumable journal and fails without writes; roll-forward is unavailable.
 
 ## Invariants
 

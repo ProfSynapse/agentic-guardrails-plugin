@@ -27,6 +27,12 @@ ATOMICITY = "recoverable-set"
 VISIBILITY = "per-file-sequential"
 
 
+class PrepublicationCapacityError(file_ops.FileOperationError):
+    """Recovery admission failed before any target publication or journal."""
+
+    error_code = "archive_capacity_exceeded"
+
+
 CandidateValidator = Callable[[str, Mapping], object]
 ClaimValidator = Callable[[Mapping, Mapping, Mapping, str], object]
 RUN_PLAN_SCHEMA = "agw-run-plan/v1"
@@ -716,6 +722,8 @@ def publish_staged_batch(
         for item in operations:
             _check_operation_preconditions(item)
             item["changed"] = item["target_before"] != item["stage_hash"]
+            if item["changed"] and not dry_run:
+                file_ops.require_media_review([item["target"]], staged=item["stage"])
         candidates = _make_candidates(operations, candidate_validator)
         if dry_run:
             _cleanup_candidates(candidates.values())
@@ -748,8 +756,13 @@ def publish_staged_batch(
             receipts = file_ops._snapshots(
                 [item["target"] for item in changed], "publish-batch"
             ) if changed else []
-        except Exception:
+        except Exception as exc:
             _cleanup_candidates(candidates.values())
+            if isinstance(exc, file_ops.FileOperationError) \
+                    and exc.error_code == "archive_capacity_exceeded":
+                # This exception type is provenance, not a caller-supplied
+                # assertion: only the pre-publication snapshot boundary emits it.
+                raise PrepublicationCapacityError(str(exc), exc.details) from exc
             raise
         receipt_by_number = dict(zip((item["number"] for item in changed), receipts))
         prepared_id = uuid.uuid4().hex

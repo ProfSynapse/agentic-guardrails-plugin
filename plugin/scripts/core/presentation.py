@@ -149,11 +149,21 @@ def render_safe_next(advice: remediation.SafeNext, details: dict = None) -> str:
     one reason code whose instruction is sized by them.
     """
     reason_code = advice.reason_code
+    if reason_code == remediation.REASON_MEDIA:
+        return (
+            "Use an already-explicit user choice for this exact target, action and "
+            "recovery behavior without asking again. A generic update/overwrite request "
+            "does not choose recovery versus keeping both. Otherwise ask and wait: replace "
+            "with verified recovery, save separately, or cancel. For removal, offer "
+            "reversible archive or cancel. Use the "
+            "pending media operation and its exact continuation arguments from the "
+            "refusal. Do not retry the original overwrite, infer approval from an "
+            "operation ID, or turn cancellation into a new file. Permanent replacement "
+            "without recovery is unavailable."
+        )
     if reason_code == remediation.REASON_CAPACITY:
-        # The generic "propose something narrower" sentence is a lie here:
-        # every remaining rollback point is protected, so no narrower
-        # operation can succeed. The only doors are a human-gated prune or a
-        # larger cap, and the store package writes both into this text.
+        # Capacity maintenance already ran. Explain the shortfall and budget
+        # setting instead of routing the user through the same manual prune.
         return remediation.capacity_instruction(details)
     if reason_code == remediation.REASON_ARCHIVE:
         return (

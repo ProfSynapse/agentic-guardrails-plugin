@@ -103,6 +103,52 @@ def test_policy_file_watermarks_control_automatic_cli_maintenance(tmp_path):
     assert not incoming.exists()
 
 
+def test_repeated_cli_edits_cross_capacity_without_manual_pruning(tmp_path):
+    maximum = 512 * 1024
+    root = _policy_root(tmp_path, maximum=maximum)
+    source = tmp_path / "working-document.txt"
+    padding = "x" * (64 * 1024)
+    source.write_text("Revision 00\n" + padding, encoding="utf-8")
+    sizes = []
+    for revision in range(1, 25):
+        previous = source.read_bytes()
+        result = json.loads(_run(
+            root, "--json", "file", "replace", str(source),
+            "--old", f"Revision {revision - 1:02d}",
+            "--new", f"Revision {revision:02d}",
+            "--expected-hash", store.file_sha256(str(source)),
+        ).stdout)
+        assert result["changed"] == 1
+        assert source.read_text(encoding="utf-8") == f"Revision {revision:02d}\n" + padding
+        versions = store.list_versions(str(source))
+        assert any(Path(v["dest"]).read_bytes() == previous for v in versions
+                   if Path(v["dest"]).is_file())
+        sizes.append(store.archive_size_bytes())
+        assert sizes[-1] <= maximum
+    # Several pressure cycles must have occurred, without aging fixtures,
+    # weakening the default protection ages or invoking manual maintenance.
+    assert sum(after < before for before, after in zip(sizes, sizes[1:])) >= 2
+    _run(root, "--json", "restore", str(source))
+    assert source.read_text(encoding="utf-8") == "Revision 23\n" + padding
+    assert store.archive_size_bytes() <= maximum
+
+
+def test_cli_file_edit_uses_the_same_policy_cap_as_status(tmp_path):
+    root = _policy_root(tmp_path, maximum=64)
+    source = tmp_path / "protected.txt"
+    source.write_text("before" * 64, encoding="utf-8")
+    status = json.loads(_run(root, "--json", "status").stdout)
+    assert status["retention"]["max_bytes"] == 64
+    result = _run(
+        root, "--json", "file", "replace", str(source),
+        "--old", "before", "--new", "after", "--all", check=False,
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"]["code"] == "archive_capacity_exceeded"
+    assert source.read_text(encoding="utf-8") == "before" * 64
+    assert store.archive_size_bytes() == 0
+
+
 def test_file_mutation_loads_policy_pack_for_preimage_admission(tmp_path,
                                                                monkeypatch):
     root = _policy_root(tmp_path, maximum=64)

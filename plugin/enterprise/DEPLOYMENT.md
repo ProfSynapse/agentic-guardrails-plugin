@@ -102,10 +102,16 @@ the build-dir allowlist, `archive_max_bytes`).
 The store grows as it keeps pre-image snapshots. `AGW_ARCHIVE_MAX_BYTES` (or
 `settings.archive_max_bytes`) has a 4 GiB standard default; `0` explicitly means
 unlimited. Store-growing operations start automatic maintenance at 90% and
-target 80%, with each pass bounded to 256 artifacts and 1 GiB. Only authoritative
-records explicitly classified as `mutation_preimage` can expire. All points from
-the last seven days are retained; days 8–30 retain daily generations; after a
-path has been inactive for 30 days its newest usable point remains protected.
+target 80%, with up to four planning passes per operation. Each batch normally
+holds at most 256 artifacts and 1 GiB (`AGW_ARCHIVE_MAX_RECLAIM_BYTES`). One
+indivisible eligible artifact may exceed that byte budget when reclaimed alone,
+up to `AGW_ARCHIVE_MAX_BYTES`; this prevents large media from being stranded.
+Only authoritative records explicitly classified as `mutation_preimage` can
+expire. Normal retention keeps points from the last seven days; days 8–30 retain
+daily generations; after a path has been inactive for 30 days its newest usable
+point remains protected.
+At high water, if normal retention cannot restore headroom, older redundant
+preimages can yield early only behind a newer verified same-source copy.
 Move/delete archives, manual snapshots, evidence/quarantine, corrupt or
 incomplete records, and unclassified legacy records are never automatically
 pruned. If protected data prevents admission at the hard limit, the new mutation
@@ -113,11 +119,35 @@ is blocked before publication. `agw status` and `agw doctor` report the typed
 retention state and thresholds.
 
 No retention work runs at SessionStart. A store-growing mutation or preimage
-capture first performs a cheap size/admission check. Only when that projected
+capture first reuses any verified unchanged copies and admits only new bytes. Only when that projected
 size reaches the high-water mark does Guardrails run the bounded full inventory
 and pruning pass. `agw status` and `agw doctor` are read-only retention reports
 and never invoke maintenance. `agw prune` is an optional manual request for the
-same bounded maintenance policy.
+same bounded maintenance policy; it is not required after a capacity refusal.
+A hard refusal reports the byte shortfall and budget setting. PDFs and media
+receive byte-exact recovery; file extensions never make originals disposable.
+Native hooks retain their separate per-file capture size limit. See
+[recovery storage classes](../../docs/plans/media-recovery.md) for configuration
+and the remaining object-storage roadmap.
+
+The default 4 GiB total reserves 2 GiB for documents, caps media at 1.5 GiB and
+explicit derived outputs at 0.5 GiB. Documents can borrow unused space. The
+optional `archive_document_reserve_bytes`, `archive_media_max_bytes` and
+`archive_derived_max_bytes` settings (or matching `AGW_ARCHIVE_*` environment
+variables) override these amounts. Class limits together must preserve the
+document reserve; zero class cap forbids positive payload growth. An unlimited
+total disables class budgets too. Cleanup for a media/derived capture cannot
+evict document history. Protected existing copies survive a lower cap.
+
+`archive_storage_rules` is an ordered list of `{pattern, storage_class}` mappings.
+Classes are `documents`, `media`, `derived`; patterns match normalized absolute
+paths. Derived output is never inferred from a filename and never loses the
+newest-copy protection. For example, `pattern: '**/renders/**'` with
+`storage_class: derived` accounts future captures under the derived budget.
+Missing classes on old records use built-in file-type accounting; policy changes
+do not rewrite old manifests or reclassify reused copies. Directory snapshots
+count as media unless explicitly declared otherwise. Reports include metadata
+and orphan bytes as unclassified shared usage.
 
 ## 5. Requirements per machine
 

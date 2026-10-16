@@ -1,17 +1,19 @@
 # Recovery
 
-Guardrails archives removals and captures pre-images before protected writes.
-Restoration first archives any live target. Use history for ambiguous versions;
-never edit archive artifacts. Retention removes only expired pre-images.
+Removals and protected-write pre-images are archived. Restore archives the live
+target first. Never edit artifacts. Retention removes only expired pre-images.
 
-`unlink-link` records a junction/symlink and removes only that link object. It
-refuses ordinary files/directories; use `--expected-target` when known.
+Undo this conversation's change with returned `recovery.undo_argv` plus `--json`:
+`agw undo --transaction ID --json`. Use the exact ID. It checks live-state
+conflicts without a pre-read. Use history if the receipt/version is unclear.
 
-Declare exact outputs separately from observed roots. Roots detect undeclared
-sidecars after execution; they neither prevent writes nor recover unknown files.
+`unlink-link` records/removes only a link, refusing ordinary files/directories.
+Use `--expected-target` when known.
 
-A run plan is hash-bound and revalidated before its durable claim. It is then
-consumed even on failure. `stdout-read-only` requires true filesystem enforcement.
+Exact outputs scan no siblings. Observed roots only detect sidecars afterward;
+they do not prevent writes or recover unknown files. `run --dry-run` is contract-only.
+
+Run plans are hash-bound, revalidated before claim and consumed even on failure. `stdout-read-only` requires true filesystem enforcement.
 
 A publish plan is a bounded set with per-file sequential visibility. For
 PREPARED, use `publish-plan recover ID --action inspect`. `finalize-observed`

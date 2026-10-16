@@ -1,6 +1,23 @@
 # Text files
 
-Choose the operation by target state and edit shape:
+For an exact substitution, read the relevant page once, then replace using its
+`sha256` as `--expected-hash`:
+
+```sh
+agw file read PATH --start-line 1 --limit 100 --json
+agw file replace PATH --old 'old text' --new 'new text' --expected-hash SHA256 --json
+```
+
+Use literal paths and returned hashes. `replace` requires one match unless
+`--all` is requested. It checks the hash, captures recovery and verifies the
+published bytes, returning `after_hash` and `recovery`. An exact substitution
+needs no dry-run or reread to repeat these checks. Preview uncertain edits;
+inspect results when additional semantic verification is needed. For multiline or
+quote-heavy text, use `--old-file` / `--new-file` instead of inline payloads.
+
+Keep the returned `recovery.undo_argv` for a later undo; see
+[recovery](recovery.md). An explicit undo of this change can use that receipt
+directly, without rediscovering history or rereading the target first.
 
 - New file: `agw file write PATH --content-file STAGED --expected-hash absent`.
   Its parent directory must already exist. Create each missing parent with a

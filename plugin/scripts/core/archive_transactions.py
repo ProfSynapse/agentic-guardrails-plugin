@@ -566,7 +566,8 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
                    capture_group_id: str = "",
                    transaction_id: str = "",
                    recovery_source_identity=None,
-                   source_sha256: str = "") -> dict:
+                   source_sha256: str = "",
+                   storage_class: str = "") -> dict:
     """Create and commit one archive transaction.
 
     The source is never removed until a published artifact has been verified
@@ -628,6 +629,7 @@ def create_archive(home: str, src: str, dest: str, mode: str, version: int,
         "actor": actor,
         "policy_revision": policy_revision,
         "retention_class": str(retention_class or ""),
+        **({"storage_class": storage_class} if storage_class else {}),
         "protected_until_ns": max(0, int(protected_until_ns or 0)),
         "capture_group_id": str(capture_group_id or ""),
         **({"recovery_source_identity": list(recovery_source_identity)}
@@ -767,6 +769,7 @@ def entry_from_record(record: dict) -> dict:
         "actor": record.get("actor", "agent"),
         "policy_revision": record.get("policy_revision", ""),
         "retention_class": record.get("retention_class", ""),
+        **({"storage_class": record["storage_class"]} if record.get("storage_class") else {}),
         "protected_until_ns": int(record.get("protected_until_ns") or 0),
         "capture_group_id": record.get("capture_group_id", ""),
         "recovery_source_identity": record.get("recovery_source_identity"),
@@ -806,7 +809,7 @@ def entry_is_verified(home: str, entry: dict, requested_src: str = None) -> bool
             "transaction_id", "created_at_ns", "version", "mode", "artifact_kind",
             "policy_revision", "retention_class", "protected_until_ns",
             "capture_group_id", "artifact_state", "sha256", "size",
-            "recovery_source_identity",
+            "recovery_source_identity", "storage_class",
         )
         if any(entry.get(field) != record.get(field) for field in bound_fields):
             return False

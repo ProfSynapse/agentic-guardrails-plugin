@@ -10,7 +10,9 @@ adapter differs. Cowork support is planned but **not working yet**: its hooks
 don't fire there. Tracking:
 [docs/plans/0001-cowork-hook-enablement.md](docs/plans/0001-cowork-hook-enablement.md).
 
-> **Release status:** `0.6.0` is the Windows-first stable release.
+> **Release status:** `0.7.0` is the Windows-first stable release.
+> **Codex upgrade:** review and enable the changed Guardrails hooks through
+> `/hooks` (or the desktop trust dialog), then start a new task.
 > It has extensive automated and hands-on validation on Windows, which is the
 > current client deployment target. macOS and Linux support remains in preview:
 > the shared code is designed to be cross-platform, but this release has not
@@ -423,17 +425,53 @@ evolve.
   full table.
 - **Recovery-cache budget:** the standard policy is 4 GiB, with automatic
   maintenance at 90% and a target of 80%. `AGW_ARCHIVE_MAX_BYTES=0` explicitly
-  selects unlimited retention. Every mutation preimage is protected for seven
-  days; days 8–30 retain daily generations, and a path inactive for more than
-  30 days retains its newest usable point. Move/delete archives, manual
-  snapshots, evidence, corrupt records, and unclassified legacy records are
-  never automatic candidates.
+  selects unlimited retention. Normal retention keeps seven days of mutation
+  preimages, then daily generations through day 30. Under storage pressure,
+  older redundant preimages may yield earlier behind a newer verified copy.
+  The newest usable copy of each path, move/delete archives, manual snapshots,
+  evidence, corrupt records, and unclassified legacy records stay protected.
 
-Retention does not run at SessionStart. Each operation that would grow the
-recovery store performs a cheap size/admission preflight; the bounded full
-inventory and pruning pass runs only after that operation reaches the
-high-water mark. `agw status` and `agw doctor` are read-only retention reports
-and never invoke maintenance; manual `agw prune` is optional.
+Unchanged files reuse their verified newest copy before capacity admission;
+only new bytes count, including for multi-file captures. Reuse works even when
+an existing store exceeds a newly lowered cap. Copy verification, aggregate
+admission and capture share the store lock.
+
+Retention does not run at SessionStart. Operations that grow the recovery store
+check projected usage and automatically run up to four bounded planning passes
+at high water. Batches normally contain at most 256 artifacts and 1 GiB. One
+eligible artifact larger than the batch budget may be reclaimed alone, up to
+the configured store cap, so old media copies do not become permanent merely
+because they are large. All eligibility and integrity checks still apply.
+`agw status` and `agw doctor` are read-only; manual `agw prune` is optional and
+uses the same protections. If automatic cleanup cannot admit a change, the
+message reports the shortfall and budget setting instead of requiring a manual
+prune command.
+
+The 4 GiB default now reserves 2 GiB for document recovery, caps media at 1.5 GiB,
+and caps explicitly declared derived outputs at 0.5 GiB. Documents may borrow
+unused space; media cannot consume their reserve. PDFs remain documents; video,
+audio, images and mixed directory snapshots count as media. Derived outputs
+require an explicit policy rule and retain the newest-copy recovery protections.
+Cleanup stays within the class being admitted. `status` and `doctor` report
+per-class usage, limits, protected bytes and potential reclaim.
+
+See [recovery storage classes](docs/plans/media-recovery.md) for configuration,
+legacy handling, and the future media object-storage design.
+
+Existing video, audio and raster-image writes now stop for conversational
+clarification before automatic capture. The agent receives an expiring `agw
+media` operation and reuses an explicit recovery choice or asks whether to replace
+with recovery, keep both, or cancel. Removal offers reversible archive or
+cancellation. The CLI checks the
+original state again, enforces recovery budgets and refuses permanent fallback.
+An owned staging file can become a timestamped output without duplicating its
+bytes; a finished revision already beside the original is retained in place
+instead of making a third copy. Existing destination names are never overwritten.
+If recovery capacity blocks replacement before publication, the same operation
+can keep both or cancel; no manual prune or new operation is needed. Uncertain
+or interrupted writes still require inspection. Cancellation changes no files.
+An operation ID is not proof of approval. This flow adds neither a
+render-size quota nor automatic expiration of sole recovery copies.
 
 ### Activity history and recovery metadata
 

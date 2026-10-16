@@ -17,6 +17,14 @@ see [`../docs/HOST_PARITY.md`](../docs/HOST_PARITY.md).
 | Command discovery | CLI `--help` hierarchy | progressively scoped; no duplicated prompt catalog |
 | `agw` CLI | platform-neutral `agw` short form | same |
 
+Existing media writes now return a conversational refusal with an expiring
+`agw media` operation. The agent clarifies replace-with-recovery, save-separately,
+or cancel, then submits the corresponding continuation. This uses supported
+deny feedback; it does not send unsupported Codex `ask` output or require MCP
+forms. IDs bind file state, not human consent. The CLI independently enforces
+recoverability or a non-clobbering new output. See the packaged
+[media workflow](skills/agentic-guardrails/references/media.md).
+
 ### Strict response wire schema
 
 Codex 0.160.0 rejects unknown response fields, including fields nested inside
@@ -89,6 +97,15 @@ repo doubles as a Codex marketplace - just give Codex the GitHub URL:
    run. Approve `agentic-guardrails` in the host's hook-trust UI. Codex CLI uses
    `/hooks`; desktop builds may show a trust dialog instead. (Enterprise: ship
    managed hooks via `requirements.toml` to skip the prompt.)
+   **Upgrading to this candidate requires a new hook review.** Its Windows
+   commands now enter a packaged `cmd.exe` bootstrap, because native Codex
+   0.162.1 can run hooks through Windows PowerShell 5.1, where `||` is invalid.
+   The bootstrap probes Python 3 before dispatching and preserves hook stdin;
+   no PATH or execution-policy change is needed. Review the changed definitions
+   in `/hooks`, then start a fresh task. Installation alone does not enable them.
+   If the skill is still absent, check `/skills` for an older disabled
+   `agentic-guardrails:agentic-guardrails` setting; plugin enablement and skill
+   enablement are separate.
 3. **Command discovery** - use the packaged CLI's progressive `--help` hierarchy.
    Operational syntax is not duplicated into user-level prompts.
 4. **Short launcher** - invoke `agw` on every platform. The

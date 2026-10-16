@@ -131,6 +131,7 @@ so the agent self-corrects instead of fighting the rails:
 | recover a canonical manifest | `agw workflow export ID` |
 | replacing a busy synced file | `agw publish-file --staged TEMP --target LIVE --expected-hash HASH` |
 | publish several staged artifacts | `agw publish-plan create` then `agw publish-plan apply` |
+| replace existing video/audio/images | Clarify the pending `agw media` operation, then replace with recovery, save separately, or cancel |
 | inspect an exact CLI contract | `agw schema file apply-plan --json` |
 | reverse one exact mutation | `agw undo --transaction ID` |
 

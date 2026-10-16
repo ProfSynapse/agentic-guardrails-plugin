@@ -21,6 +21,7 @@ Plans expire after 30 minutes. Contract changes fail closed; use
 
 V3 parameters: enum, hash-bound enum files, regex, integers, rooted paths (an
 optional `pattern` matches the path under its root). Pass `--param name=value`.
+Trusted parameters belong only in reviewed typed slots.
 
 `limits.timeout_seconds` (1-14400) is a reviewed run time limit; otherwise 300.
 `--timeout-seconds` only shortens. Long runs: host background mode.

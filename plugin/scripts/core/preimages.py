@@ -1,6 +1,7 @@
 """Verified pre-authorization recovery artifacts for local file mutations."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import os
 import shutil
@@ -13,6 +14,7 @@ from . import recovery_contracts
 from . import remediation
 from . import retention_policy
 from . import store
+from . import recovery_storage
 
 
 @dataclass(frozen=True)
@@ -132,7 +134,8 @@ def _busy_failure(path: str) -> PreimageResult:
 def prepare(targets, label: str, max_file_bytes: int,
             max_archive_bytes: int | None = None,
             policy_revision: str = "",
-            retention_config: retention_policy.RetentionPolicy | None = None
+            retention_config: retention_policy.RetentionPolicy | None = None,
+            require_media_review: bool = False,
             ) -> PreimageResult:
     """Capture and immediately verify PRESENT artifacts and ABSENT tombstones."""
     if not policy_revision:
@@ -152,13 +155,21 @@ def prepare(targets, label: str, max_file_bytes: int,
                     f"policy is invalid ({exc})."),
         )
     max_archive_bytes = retention_config.max_bytes
+    if require_media_review:
+        from . import media_review
+        try:
+            media_review.require_review(targets, policy_revision)
+        except (media_review.MediaReviewError, OSError, ValueError, TimeoutError) as exc:
+            return PreimageResult(
+                False, reason=str(exc), error_code=getattr(exc, "error_code", "media_operation_blocked"),
+                details=getattr(exc, "details", {}),
+            )
     receipts = []
     capture_group_id = uuid.uuid4().hex
     protected_until_ns = (
         time.time_ns()
         + retention_config.min_protected_age_days * 24 * 60 * 60 * 1_000_000_000
     )
-    required_bytes = 0
     present = []
 
     for path in targets:
@@ -194,17 +205,62 @@ def prepare(targets, label: str, max_file_bytes: int,
                 return _plain_failure(
                     path, f"The file is larger than the configured {limit_mb} MB backup limit."
                 )
-            required_bytes += max(logical_size, allocated_size(path, st))
             present.append((path, _identity(st)))
         except OSError as exc:
             return _plain_failure(path, f"The file could not be read safely ({exc}).")
 
+    try:
+        with store.hook_lock():
+            return _capture_present(
+                targets, present, receipts, label, policy_revision,
+                retention_config, protected_until_ns, capture_group_id,
+            )
+    except TimeoutError:
+        return _busy_failure(present[0][0] if present else "")
+    except (OSError, ValueError, TypeError) as exc:
+        return _plain_failure(
+            present[0][0] if present else "",
+            f"The recovery copy could not be completed ({exc}).",
+        )
+    except Exception:
+        return _plain_failure(
+            present[0][0] if present else "",
+            "The recovery store reported an unexpected capture failure.",
+        )
+
+
+def _capture_present(targets, present, receipts, label, policy_revision,
+                     retention_config, protected_until_ns, capture_group_id):
+    """Reuse verified copies before admitting aggregate growth, under one lock."""
+    reused = {}
+    required_bytes = 0
+    incoming_by_class = {bucket: 0 for bucket in recovery_storage.CLASSES}
+    for path, before_identity in present:
+        entry = store.archive_file(
+            path, mode="copy", dedupe=True, _reuse_only=True,
+            retention_class="mutation_preimage",
+            protected_until_ns=protected_until_ns,
+            policy_revision=policy_revision, lock_context=nullcontext(),
+            retention_config=retention_config,
+        )
+        st = os.stat(path, follow_symlinks=False)
+        if _identity(st) != before_identity:
+            return _plain_failure(path, "The file changed while its recovery copy was being verified.")
+        if entry is not None:
+            reused[path] = entry
+        else:
+            amount = max(int(st.st_size), allocated_size(path, st))
+            required_bytes += amount
+            bucket = recovery_storage.classify(path, rules=retention_config.storage_rules)
+            incoming_by_class[bucket] += amount
+
     first_target = present[0][0] if present else (targets[0] if targets else "")
     try:
-        store.maintain_retention(
-            policy=retention_config, incoming_bytes=required_bytes,
-            lock_context=store.hook_lock(),
-        )
+        if any(path not in reused for path, _ in present):
+            store.maintain_retention(
+                policy=retention_config, incoming_bytes=required_bytes,
+                incoming_by_class=incoming_by_class, lock_context=nullcontext(),
+            )
         if required_bytes:
             capacity_root = _nearest_existing_parent(
                 os.path.join(store.agw_home(), "archive", "probe")
@@ -235,14 +291,14 @@ def prepare(targets, label: str, max_file_bytes: int,
             # re-walk per file. Dedupe keeps an unchanged file from storing a
             # second full copy: the verified newest version is refreshed and
             # its hold extended to this capture's deadline instead.
-            entry = store.archive_file(
+            entry = reused.get(path) or store.archive_file(
                 path, mode="copy", dedupe=True,
                 reason=f"verified pre-image before {label}", actor="guardrails-hook",
                 retention_class="mutation_preimage",
                 protected_until_ns=protected_until_ns,
                 capture_group_id=capture_group_id,
                 retention_config=retention_config,
-                lock_context=store.hook_lock(),
+                lock_context=nullcontext(),
                 policy_revision=policy_revision,
                 _admission_checked=True,
             )

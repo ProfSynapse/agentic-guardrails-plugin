@@ -6,8 +6,10 @@ specific, the set of modules a Read pulls in is not. Every optimization here
 is paired with a fail-closed check, because a lazy import that fails must
 still end in ASK.
 """
+import ast
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -354,8 +356,13 @@ def test_sessionstart_compiles_into_agw_home_when_bytecode_writes_are_off(
                 verbose=True, env_extra=env)
     assert read.returncode == 0
     assert _decision(read) == "defer", read.stdout
-    loaded_from = re.findall(r"# code object from '([^']+)'", read.stderr)
-    assert any(path.startswith(str(home / "pycache")) and "readfast" in path
+    # Python -v emits repr(path), so Windows separators are escaped. Decode
+    # the literal before comparing filesystem paths; keep the cache/module
+    # identity assertion rather than accepting an arbitrary loaded file.
+    loaded_from = [Path(ast.literal_eval(value)) for value in
+                   re.findall(r"# code object from (.+)", read.stderr)]
+    assert any(path.is_relative_to(home / "pycache")
+               and path.name.startswith("readfast.")
                for path in loaded_from), loaded_from[-5:]
 
 
