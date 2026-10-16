@@ -13,6 +13,12 @@ Use `agw media prepare PATH --json`; add `--staged FILE` for a finished
 replacement or `--operation archive` for removal. Preparation copies no bytes. If no supplied stage exists, create the replacement at `staged_path`
 without overwriting. Use the returned `continue_argv`.
 
+These command shapes are ready to use; preparation needs no preliminary help
+call. Successful replacement verifies published bytes and returns recovery
+receipts in `operations`. Retain their `recovery.undo_argv` for undo; read
+[recovery](recovery.md) when undoing. Additional hashing is useful only when it
+answers a remaining verification question.
+
 Keep-both reuses a finished revision already beside the original. The returned
 `separate_result` identifies that existing path; do not create a third copy.
 Other supplied stages are copied independently to the proposed output path.

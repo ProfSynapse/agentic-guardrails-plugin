@@ -145,3 +145,64 @@ release version, tag, merge or publication was performed.
 These checks do not establish a render/output quota, off-machine backup,
 cloud-placeholder parity, every host/tool surface, or arbitrary host-failure
 safety. macOS CI is not a live macOS host test.
+
+## Codex efficiency follow-up (2026-10-16)
+
+The skill router now directs the agent to command shapes in the selected
+reference instead of a help-discovery sequence. Text guidance supplies bounded
+read and hash-bound replacement commands and explains the checks the operation
+already performs. Recovery guidance reuses the exact receipt's undo command;
+media guidance explains its verified publication and recovery receipts. Extra
+previews or semantic checks remain appropriate when they answer an unresolved
+question. Runtime, enforcement, hook commands and consent rules are unchanged.
+
+Two fresh text/edit-undo conversations per variant used the same natural user
+requests, synthetic CRLF fixture and isolated recovery stores. Both variants
+ran native Codex 0.162.1 with `gpt-6.1-sol`, high reasoning and the workspace-write
+sandbox, sequentially in the existing interactive Windows session. Counts
+include instruction reads and shell calls. No CLI syntax or transaction IDs
+were supplied in the user prompts.
+
+| Variant | Edit calls | Undo calls | Edit seconds | Undo seconds |
+| --- | --- | --- | --- | --- |
+| Baseline, run 1 | 10 | 4 | 76.0 | 36.8 |
+| Baseline, run 2 | 10 | 5 | 74.1 | 45.2 |
+| Candidate, run 1 | 5 | 2 | 46.7 | 33.6 |
+| Candidate, run 2 | 4 | 2 | 40.8 | 47.6 |
+
+Across these samples, edit calls fell 55% and undo calls 56%. Mean edit time
+fell from 75.1 to 43.8 seconds; mean undo time was essentially unchanged
+(41.0 versus 40.6 seconds). These are two samples per variant, not a general
+latency guarantee. Root help appeared in one candidate edit, and both undo turns still
+reread the result; the improvement does not eliminate every redundant call.
+Both candidate runs retained exact before/after recovery bytes and restored
+the original byte-for-byte, including CRLF.
+
+Four further candidate conversations passed. Explicit image replacement used
+four calls and restore used three; full-budget replacement refusal used five,
+then same-ID keep-both used one; cancellation used three then one; ambiguous
+replacement followed by keep-both used three then one. Original/archive bytes
+and the revised source were verified. Both keep-both cases completed one
+operation and created no extra copy; cancellation resolved the prepared
+operation. Exact root file inventories for all eight valid conversations
+(six candidate, two baseline; sixteen turns) contained no unexpected files.
+
+Focused file, recovery-transaction and media tests passed **108 tests,
+1 skipped**; the skill validator passed. The existing conflict tests verify
+that hash-bound writes and targeted undo refuse changed live state, which
+supports skipping a redundant preliminary check without weakening the guard.
+
+The pilot was disabled in saved Windows settings at the start. Tests enabled
+it only with a process-scoped config override; `hooks/list` verified all three
+existing hashes trusted. A preliminary run without that override produced no
+archive and failed the harness checks; it is preserved under
+`excluded-plugin-disabled` and excluded from the comparison. No trust record,
+saved plugin enablement or security setting was changed.
+
+Evidence: `baseline-results.json`, `candidate-results.json`, their completion
+markers, per-case JSONL, instruction snapshots and the runner under
+`%LOCALAPPDATA%\agw-release-checks\20261015\efficiency-20261016`. Local mirror and
+harness: `/var/tmp/agw-codex-efficiency-20261016`. Both temporary scheduled tasks were removed, and original cached/marketplace
+instructions were restored and checked against their snapshots. Runtime hashes
+and the saved disabled pilot setting remained unchanged. The candidate guidance
+is retained in this PR and the benchmark ZIP.

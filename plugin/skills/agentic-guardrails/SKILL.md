@@ -25,8 +25,10 @@ Never use a cache path or change PATH.
 4. On refusal, offer only alternatives returned by the tool; do not invent
    cleanup or configuration workarounds. Report the actual result and path.
 
-CLI help is authoritative. Request only the narrowest unknown scope: `agw
---help`, `<verb> --help`, or `office <operation> --help`.
+Use command shapes in the selected reference directly. Consult CLI help only
+for syntax still unknown, at the exact operation (for example, `agw file patch
+--help`); do not walk through root and parent help first. Reuse syntax and
+receipts already learned in this conversation.
 
 Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
@@ -34,8 +36,8 @@ Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
 | Intent | Route | Reference |
 |---|---|---|
-| Remove, recover, undo, history | Relevant verb help | [recovery](references/recovery.md) |
-| Read or change text | `file <operation> --help` | [text](references/text-files.md) |
+| Remove, recover, undo, history | `archive`, `restore`, `undo`, `history` | [recovery](references/recovery.md) |
+| Read or change text | `file read`, `file replace`, `file write`, `file patch` | [text](references/text-files.md) |
 | Dependent text changes | `file plan`, then `file apply-plan` | [text](references/text-files.md) |
 | Local script | `workflow match -- <command>`; else `run --help` | [workflows](references/trusted-workflows.md); [recovery](references/recovery.md) for `run` |
 | Single-use script plan | `run-plan create`, then `apply` | [recovery](references/recovery.md) |

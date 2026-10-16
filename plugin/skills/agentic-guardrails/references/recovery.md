@@ -4,6 +4,19 @@ Guardrails archives removals and captures pre-images before protected writes.
 Restoration first archives any live target. Use history for ambiguous versions;
 never edit archive artifacts. Retention removes only expired pre-images.
 
+For an explicit undo of a change from this conversation, use the successful
+result's `recovery.undo_argv`, adding `--json`:
+
+```sh
+agw undo --transaction TRANSACTION_ID --json
+```
+
+Use the exact returned ID, not a guessed version or an unscoped `agw undo`.
+This targeted undo validates the recorded live state and refuses conflicts;
+it does not need a preliminary target read or history lookup. Consult history
+when the receipt is missing or the intended version is ambiguous. Inspect any
+refusal before choosing another action.
+
 `unlink-link` records a junction/symlink and removes only that link object. It
 refuses ordinary files/directories; use `--expected-target` when known.
 
