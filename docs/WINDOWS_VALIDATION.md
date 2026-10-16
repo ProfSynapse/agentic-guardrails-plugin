@@ -206,3 +206,21 @@ harness: `/var/tmp/agw-codex-efficiency-20261016`. Both temporary scheduled task
 instructions were restored and checked against their snapshots. Runtime hashes
 and the saved disabled pilot setting remained unchanged. The candidate guidance
 is retained in this PR and the benchmark ZIP.
+
+## Final release preparation (2026-10-16)
+
+CI on `2136a63` passed Windows but caught the progressive-context size gate on
+Linux/macOS. The router and text/recovery/media references were tightened to
+retain the command shapes, receipts, conflict handling and preservation rules
+within the existing budgets. The context suite passed **12 tests** afterward;
+no threshold was relaxed. The live measurements above describe the pre-trim
+wording, rather than a fresh benchmark of this editorial trim. Release manifests
+and packaging expectations now use `0.7.0`. Catalog refs stay on `main` until
+the verified release tag exists, followed by a separate pinning PR.
+
+The full Python 3.11 release suite passed **2,096 tests, 78 skipped** with the
+CI dependency versions. Windows previously omitted 41 default test modules
+from its literal shards, including the context-size check. The workflow now
+assigns all 70 default modules exactly once, adds three bounded groups, and
+reconciles that inventory before testing. Release CI must pass those added
+Windows groups before publication.

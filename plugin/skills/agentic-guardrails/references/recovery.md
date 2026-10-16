@@ -1,31 +1,19 @@
 # Recovery
 
-Guardrails archives removals and captures pre-images before protected writes.
-Restoration first archives any live target. Use history for ambiguous versions;
-never edit archive artifacts. Retention removes only expired pre-images.
+Removals and protected-write pre-images are archived. Restore archives the live
+target first. Never edit artifacts. Retention removes only expired pre-images.
 
-For an explicit undo of a change from this conversation, use the successful
-result's `recovery.undo_argv`, adding `--json`:
+Undo this conversation's change with returned `recovery.undo_argv` plus `--json`:
+`agw undo --transaction ID --json`. Use the exact ID. It checks live-state
+conflicts without a pre-read. Use history if the receipt/version is unclear.
 
-```sh
-agw undo --transaction TRANSACTION_ID --json
-```
+`unlink-link` records/removes only a link, refusing ordinary files/directories.
+Use `--expected-target` when known.
 
-Use the exact returned ID, not a guessed version or an unscoped `agw undo`.
-This targeted undo validates the recorded live state and refuses conflicts;
-it does not need a preliminary target read or history lookup. Consult history
-when the receipt is missing or the intended version is ambiguous. Inspect any
-refusal before choosing another action.
+Exact outputs scan no siblings. Observed roots only detect sidecars afterward;
+they do not prevent writes or recover unknown files. `run --dry-run` is contract-only.
 
-`unlink-link` records a junction/symlink and removes only that link object. It
-refuses ordinary files/directories; use `--expected-target` when known.
-
-Declare exact outputs separately from observed roots. Roots detect undeclared
-sidecars after execution; they neither prevent writes nor recover unknown files.
-Exact outputs do not enumerate siblings. `run --dry-run` is contract-only.
-
-A run plan is hash-bound and revalidated before its durable claim. It is then
-consumed even on failure. `stdout-read-only` requires true filesystem enforcement.
+Run plans are hash-bound, revalidated before claim and consumed even on failure. `stdout-read-only` requires true filesystem enforcement.
 
 A publish plan is a bounded set with per-file sequential visibility. For
 PREPARED, use `publish-plan recover ID --action inspect`. `finalize-observed`

@@ -32,6 +32,21 @@ jobs:
               Path(".agents/plugins/marketplace.json"),
           ):
               json.loads(path.read_text(encoding="utf-8"))
+      - name: Reconcile Windows shard coverage
+        if: runner.os == 'Windows'
+        shell: python
+        run: |
+          from collections import Counter
+          from pathlib import Path
+          import re
+          import yaml
+          steps = yaml.safe_load(Path('.github/workflows/conformance.yml').read_text())['jobs']['conformance']['steps']
+          selected = [step for step in steps if step.get('if') == "runner.os == 'Windows'" and 'python -m pytest' in step.get('run', '')]
+          counts = Counter(path for step in selected for path in re.findall(r'tests/test_[a-z0-9_]+\.py', step['run']))
+          expected = {str(path).replace('\\', '/') for path in Path('tests').glob('test_*.py')}
+          assert set(counts) == expected, {'missing': sorted(expected - set(counts)), 'unknown': sorted(set(counts) - expected)}
+          assert all(count == 1 for count in counts.values()), counts
+          print(f'{len(expected)} default modules, each in exactly one Windows shard')
       - name: Run Windows packed-artifact shard
         if: runner.os == 'Windows'
         timeout-minutes: 10
@@ -51,7 +66,7 @@ jobs:
       - name: Run Windows presentation and host-contract shard
         if: runner.os == 'Windows'
         timeout-minutes: 5
-        run: python -m pytest -q tests/test_approval_presentation.py tests/test_windows_native_approval.py tests/test_host_conformance.py tests/test_lifecycle_adapters.py
+        run: python -m pytest -q tests/test_approval_presentation.py tests/test_windows_native_approval.py tests/test_host_conformance.py tests/test_lifecycle_adapters.py tests/test_context_efficiency.py
       - name: Run Windows engine and shell shard
         if: runner.os == 'Windows'
         timeout-minutes: 8
@@ -64,6 +79,18 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 8
         run: python -m pytest -q tests/test_media_review.py tests/test_retention.py tests/test_retention_policy.py tests/test_retention_policy_propagation.py tests/test_retention_integration.py tests/test_store_retention_audit.py tests/test_file_ops.py tests/test_staged_batch_publication.py tests/test_publication_recovery_core.py tests/test_publish_validation_integration.py
+      - name: Run Windows launcher and command-contract shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_action_contracts.py tests/test_adapter_plumbing.py tests/test_agw_contract.py tests/test_cli_safety_contracts.py tests/test_clobber_coverage.py tests/test_codex_dispatch_failures.py tests/test_codex_launcher_rewrite.py tests/test_codex_wire_contract.py tests/test_hook_fast_path.py tests/test_inline_script_evidence.py tests/test_launcher_wrappers.py tests/test_powershell_ask_routing.py tests/test_powershell_corpus.py
+      - name: Run Windows recovery and workflow shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_prepared_rollback_recovery.py tests/test_recovery_storage.py tests/test_recovery_transactions.py tests/test_retention_real_fixture.py tests/test_run_plans.py tests/test_safe_next.py tests/test_store_hook_budget.py tests/test_workflow_diagnostics.py tests/test_workflow_limits.py tests/test_workflow_output_roots.py tests/test_workflow_refresh.py tests/test_workflows.py tests/test_long_run_smoke.py
+      - name: Run Windows platform and Office contract shard
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        run: python -m pytest -q tests/test_claude_linux_review.py tests/test_execution.py tests/test_gitargs.py tests/test_linux_review.py tests/test_linux_review_terminal.py tests/test_office_relationship_paths.py tests/test_office_validation.py tests/test_office_xlsm.py tests/test_office_xlsm_windows_integration.py tests/test_outcome_contracts.py tests/test_path_safety.py tests/test_policy_cache.py tests/test_policy_friction_corpus.py tests/test_profile_cache.py
       - name: Run source and packed-artifact conformance on Unix
         if: runner.os != 'Windows'
         run: python -m pytest -q

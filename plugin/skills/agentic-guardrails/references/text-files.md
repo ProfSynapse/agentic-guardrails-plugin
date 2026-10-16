@@ -8,19 +8,16 @@ agw file read PATH --start-line 1 --limit 100 --json
 agw file replace PATH --old 'old text' --new 'new text' --expected-hash SHA256 --json
 ```
 
-Use literal target paths and actual returned hashes. `replace` requires exactly
-one match unless `--all` is explicitly requested. It checks the hash, captures
-recovery, and verifies the published bytes before returning `after_hash` and
-`recovery`. A simple exact substitution needs no separate dry-run or reread
-solely to repeat those checks. Preview uncertain edits; inspect the result when
-the requested outcome needs additional semantic verification. For multiline or
+Use literal paths and returned hashes. `replace` requires one match unless
+`--all` is requested. It checks the hash, captures recovery and verifies the
+published bytes, returning `after_hash` and `recovery`. An exact substitution
+needs no dry-run or reread to repeat these checks. Preview uncertain edits;
+inspect results when additional semantic verification is needed. For multiline or
 quote-heavy text, use `--old-file` / `--new-file` instead of inline payloads.
 
 Keep the returned `recovery.undo_argv` for a later undo; see
 [recovery](recovery.md). An explicit undo of this change can use that receipt
 directly, without rediscovering history or rereading the target first.
-
-Choose the operation by target state and edit shape:
 
 - New file: `agw file write PATH --content-file STAGED --expected-hash absent`.
   Its parent directory must already exist. Create each missing parent with a

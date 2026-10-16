@@ -1,7 +1,7 @@
 ---
 name: agentic-guardrails
 description: >
-  Route file and Office work through Agentic Guardrails for reversible changes,
+  Use Agentic Guardrails for reversible file/Office changes,
   bounded reads/scans, synced folders, recovery, and diagnostics. Use for delete,
   overwrite, move, restore, broad scan, or Office mutation work.
 ---
@@ -21,14 +21,13 @@ Never use a cache path or change PATH.
    replacements.
 2. Reuse an explicit user choice for this target, action and recovery behavior;
    ask only when that choice is missing or ambiguous.
-3. Run routine commands for the user. Retain and apply exact plan hashes.
+3. Run commands for the user; retain exact plan hashes.
 4. On refusal, offer only alternatives returned by the tool; do not invent
    cleanup or configuration workarounds. Report the actual result and path.
 
-Use command shapes in the selected reference directly. Consult CLI help only
-for syntax still unknown, at the exact operation (for example, `agw file patch
---help`); do not walk through root and parent help first. Reuse syntax and
-receipts already learned in this conversation.
+Use the selected reference's command shapes directly. Ask help only for unknown
+syntax at the exact operation (e.g. `agw file patch --help`); skip parent help.
+Reuse syntax and receipts from this conversation.
 
 Prefer compact JSON, bounded reads, and file/stdin payloads on PowerShell.
 
