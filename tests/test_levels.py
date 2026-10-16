@@ -126,12 +126,25 @@ def test_read_only_chain_with_powershell_null_redirect_needs_no_preimage(tmp_pat
         "rg -n 'set-cell|publish' plugin tests 2>$null"
     )
     plan = mutations.plan([
-        ToolEvent(kind=EXEC, tool="shell_command", command=command,
+        ToolEvent(kind=EXEC, tool="PowerShell", command=command,
                   cwd=str(tmp_path))
     ], engine.clobber_targets)
     assert plan.complete is True
     assert plan.mutating is False
     assert plan.targets == []
+
+
+def test_dollar_null_redirect_without_a_pinned_powershell_dialect_fails_closed(tmp_path):
+    # `$null` is the null sink only to PowerShell. A tool the host does not pin
+    # as PowerShell runs a POSIX shell, where `2>$null` writes wherever the
+    # variable points, so the target is unidentifiable, not absent.
+    command = "rg -n 'set-cell|publish' plugin tests 2>$null"
+    plan = mutations.plan([
+        ToolEvent(kind=EXEC, tool="shell_command", command=command,
+                  cwd=str(tmp_path))
+    ], engine.clobber_targets)
+    assert plan.mutating is True
+    assert plan.complete is False
 
 
 @pytest.mark.parametrize("command", [
