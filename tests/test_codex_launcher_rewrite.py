@@ -9,6 +9,7 @@ exactly the seam a unit test of either half would have missed.
 """
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -19,6 +20,9 @@ REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 DISPATCH = os.path.join(REPO, "scripts", "codex", "_dispatch.py")
 EXPECTED_LAUNCHER = os.path.join(REPO, "bin",
                                  "agw.cmd" if os.name == "nt" else "agw")
+# Native argv/POSIX script surfaces normalize separators even on Windows;
+# the legacy Bash surface uses the native PowerShell spelling there.
+EXPECTED_POSIX_LAUNCHER = Path(EXPECTED_LAUNCHER).as_posix()
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 
@@ -83,7 +87,7 @@ def test_native_argv_agw_is_rewritten_and_allowed(tool, tmp_path, project):
     updated = _specific(out)["updatedInput"]
     # Shape is preserved: Codex execs an argv list, not a command line.
     assert isinstance(updated["command"], list)
-    assert updated["command"][0] == EXPECTED_LAUNCHER
+    assert updated["command"][0] == EXPECTED_POSIX_LAUNCHER
     assert updated["command"][1:] == ["archive", "foo.txt"]
     # Unrelated fields ride along untouched.
     assert updated["workdir"] == str(project)
@@ -102,7 +106,7 @@ def test_native_argv_wrapper_keeps_its_shape_and_rewrites_the_script(
     assert argv[:2] == ["bash", "-lc"]
     assert len(argv) == 3
     # The head is rewritten inside the script string; the wrapper stays.
-    assert EXPECTED_LAUNCHER in argv[2]
+    assert EXPECTED_POSIX_LAUNCHER in argv[2]
     assert argv[2].endswith(" archive foo.txt")
 
 
@@ -112,7 +116,7 @@ def test_native_exec_command_rewrites_cmd_not_command(tmp_path, project):
                     "session_id": "native-agw-exec"}, tmp_path, project)
     assert _decision(out) == "allow", _reason(out)
     updated = _specific(out)["updatedInput"]
-    assert EXPECTED_LAUNCHER in updated["cmd"]
+    assert EXPECTED_POSIX_LAUNCHER in updated["cmd"]
     assert updated["cmd"].endswith(" archive foo.txt")
     # Codex reads `cmd`. Writing `command` here would leave the rewrite a
     # silent no-op while the decision still said allow.
@@ -146,7 +150,7 @@ def test_native_argv_later_literal_launcher_never_reaches_path(
     assert _decision(out) == "allow", _reason(out)
     argv = _specific(out)["updatedInput"]["command"]
     assert argv[:2] == ["bash", "-lc"]
-    assert argv[2] == "true && " + EXPECTED_LAUNCHER + " archive foo.txt"
+    assert argv[2] == "true && " + EXPECTED_POSIX_LAUNCHER + " archive foo.txt"
     assert str(impostor_path) not in argv[2]
 
 

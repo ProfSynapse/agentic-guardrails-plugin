@@ -224,3 +224,12 @@ from its literal shards, including the context-size check. The workflow now
 assigns all 70 default modules exactly once, adds three bounded groups, and
 reconciles that inventory before testing. Release CI must pass those added
 Windows groups before publication.
+
+The first expanded Windows CI run exposed nine test assertions that compared
+Windows paths with POSIX-rendered launcher paths or escaped `python -v` output.
+Tests now distinguish the native PowerShell spelling from POSIX surfaces and
+decode verbose path literals before checking the exact cache/module location.
+No runtime or trust behavior changed. A direct native run exercised all 41
+added modules; the remaining failures were in these two assertion files. Their
+corrected native rerun passed **43 tests, 1 skipped** (the same focused Linux
+run passed **44 tests**). Final CI reruns the complete shard inventory.
